@@ -11,6 +11,12 @@ use super::super::components::wordmark;
 use super::super::state::TuiState;
 use super::super::style;
 
+pub enum IntroAction {
+    None,
+    ExitRequested,
+    QuitImmediately,
+}
+
 pub fn render_intro(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
     let root = Layout::default()
@@ -22,27 +28,34 @@ pub fn render_intro(frame: &mut Frame<'_>, state: &TuiState) {
     render_statusline(frame, root[1], state);
 }
 
-pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) {
+pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction {
     match event.code {
         KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
             state.should_quit = true;
+            IntroAction::QuitImmediately
         }
         KeyCode::Esc => {
             state.should_quit = true;
+            IntroAction::QuitImmediately
         }
         KeyCode::Enter => {
             let input = state.intro_input.trim();
             if input == "/exit" || input == "/quit" {
-                state.should_quit = true;
+                state.request_exit();
+                IntroAction::ExitRequested
+            } else {
+                IntroAction::None
             }
         }
         KeyCode::Backspace => {
             state.intro_input.pop();
+            IntroAction::None
         }
         KeyCode::Char(value) => {
             state.intro_input.push(value);
+            IntroAction::None
         }
-        _ => {}
+        _ => IntroAction::None,
     }
 }
 

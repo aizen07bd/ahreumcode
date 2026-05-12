@@ -16,3 +16,11 @@ pub const INTRO_HEALTH_HINT: &str = "/health";
 pub const INTRO_HEALTH_HINT_TEXT: &str = " check local model";
 pub const INTRO_COMMAND_HINT: &str = "/";
 pub const INTRO_COMMAND_HINT_TEXT: &str = " for commands";
+
+pub const SESSION_SAVED_LABEL: &str = "saved";
+pub const GOODBYE_LABEL: &str = "goodbye";
+pub const EPILOGUE_TIP_PREFIX: &str = "tip: ";
+pub const EPILOGUE_TIP_COMMAND: &str = "`ahreumcode`";
+pub const EPILOGUE_TIP_TEXT: &str = "로 다시 시작하거나 ";
+pub const EPILOGUE_TIP_SESSIONS_COMMAND: &str = "`ahreumcode sessions`";
+pub const EPILOGUE_TIP_SUFFIX: &str = "로 이전 작업을 확인하세요";
