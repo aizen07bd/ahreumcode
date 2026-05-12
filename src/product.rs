@@ -24,3 +24,7 @@ pub const EPILOGUE_TIP_COMMAND: &str = "`ahreumcode`";
 pub const EPILOGUE_TIP_TEXT: &str = "로 다시 시작하거나 ";
 pub const EPILOGUE_TIP_SESSIONS_COMMAND: &str = "`ahreumcode sessions`";
 pub const EPILOGUE_TIP_SUFFIX: &str = "로 이전 작업을 확인하세요";
+
+pub fn version_label() -> String {
+    format!("v{VERSION}")
+}

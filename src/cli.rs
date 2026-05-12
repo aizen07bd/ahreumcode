@@ -9,6 +9,7 @@ pub struct AppCommand {
 #[derive(Clone, Copy)]
 pub enum SceneCommand {
     Intro,
+    Main,
     Epilogue,
 }
 
@@ -62,6 +63,7 @@ impl AppCommand {
 fn parse_scene(value: &str) -> io::Result<SceneCommand> {
     match value {
         "intro" => Ok(SceneCommand::Intro),
+        "main" => Ok(SceneCommand::Main),
         "epilogue" => Ok(SceneCommand::Epilogue),
         _ => Err(invalid_input(&format!("unknown scene: {value}"))),
     }
@@ -71,6 +73,8 @@ fn print_help() {
     println!("AhreumCode");
     println!("  cargo run");
     println!("  cargo run -- --scene intro");
+    println!("  cargo run -- --scene main");
+    println!("  cargo run -- --scene main --smoke");
     println!("  cargo run -- --scene epilogue --smoke");
     println!("  cargo run -- --dev --scene intro");
     println!("  cargo run -- --scene intro --smoke");

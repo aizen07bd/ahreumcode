@@ -15,10 +15,12 @@ use crate::logging::{LogEvent, Logger};
 
 use super::scenes::epilogue::print_epilogue;
 use super::scenes::intro::{handle_intro_event, render_intro, IntroAction};
+use super::scenes::main::{handle_main_event, render_main};
 use super::state::{Scene, TuiState};
 
 const TUI_01_SCOPE: &str = "tui-01-intro-scene";
 const TUI_02_SCOPE: &str = "tui-02-epilogue-scene";
+const TUI_03_SCOPE: &str = "tui-03-main-scene-layout";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -27,10 +29,16 @@ const EVENT_EXIT_REQUESTED: &str = "exit_requested";
 const EVENT_SESSION_SUMMARY_CREATED: &str = "session_summary_created";
 const EVENT_EPILOGUE_RENDERED: &str = "epilogue_rendered";
 const EVENT_TERMINAL_RESTORED: &str = "terminal_restored";
+const EVENT_MAIN_SCENE_RENDERED: &str = "main_scene_rendered";
+const EVENT_LAYOUT_CALCULATED: &str = "layout_calculated";
+const EVENT_PERSONA_LAYOUT_ABSENT: &str = "persona_layout_absent";
+const EVENT_STATUSLINE_POSITIONED: &str = "statusline_positioned";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
         (SceneCommand::Intro, RunMode::Smoke) => run_intro_smoke(command),
+        (SceneCommand::Main, RunMode::Smoke) => run_main_smoke(command),
+        (SceneCommand::Main, _) => run_main_terminal(command),
         (SceneCommand::Epilogue, RunMode::Smoke) => run_epilogue_smoke(command),
         (SceneCommand::Epilogue, _) => run_epilogue_terminal(command),
         (SceneCommand::Intro, _) => run_intro_terminal(command),
@@ -53,7 +61,7 @@ fn run_intro_terminal(command: AppCommand) -> io::Result<()> {
         json!({ "run_mode": command.run_mode.as_str() }),
     ))?;
 
-    let mut app = TuiApp::new(logger, workspace);
+    let mut app = TuiApp::new(logger, workspace, command.run_mode.as_str());
     app.run(terminal.terminal_mut())?;
     terminal.restore()?;
     app.log_terminal_restored()?;
@@ -93,10 +101,49 @@ fn run_intro_smoke(command: AppCommand) -> io::Result<()> {
     Ok(())
 }
 
+fn run_main_terminal(command: AppCommand) -> io::Result<()> {
+    let workspace = current_workspace()?;
+    let logger = Logger::start()?;
+    logger.ui(LogEvent::ui(
+        TUI_03_SCOPE,
+        EVENT_APP_STARTED,
+        json!({ "run_mode": command.run_mode.as_str() }),
+    ))?;
+
+    let mut terminal = TerminalSession::enter()?;
+    logger.ui(LogEvent::ui(
+        TUI_03_SCOPE,
+        EVENT_TERMINAL_ENTERED,
+        json!({ "run_mode": command.run_mode.as_str() }),
+    ))?;
+
+    let mut app = TuiApp::new_main(logger, workspace, command.run_mode.as_str());
+    app.run(terminal.terminal_mut())?;
+    terminal.restore()
+}
+
+fn run_main_smoke(command: AppCommand) -> io::Result<()> {
+    let workspace = current_workspace()?;
+    let logger = Logger::start()?;
+    let backend = TestBackend::new(120, 32);
+    let mut terminal = Terminal::new(backend)?;
+    let state = TuiState::main(workspace);
+
+    terminal.draw(|frame| render_main(frame, &state))?;
+    log_main_scene_rendered(&logger, command.run_mode.as_str())?;
+
+    println!("tui-03 main smoke ok");
+    println!("scene=main");
+    println!("run_mode={}", command.run_mode.as_str());
+    println!("log_dir={}", logger.session_dir().display());
+
+    Ok(())
+}
+
 fn run_epilogue_terminal(command: AppCommand) -> io::Result<()> {
     let workspace = current_workspace()?;
     let logger = Logger::start()?;
-    let app = TuiApp::new_epilogue(logger, workspace);
+    let app = TuiApp::new_epilogue(logger, workspace, command.run_mode.as_str());
 
     app.log_exit_requested(command.run_mode.as_str(), "scene")?;
     app.log_session_summary_created()?;
@@ -106,7 +153,7 @@ fn run_epilogue_terminal(command: AppCommand) -> io::Result<()> {
 fn run_epilogue_smoke(command: AppCommand) -> io::Result<()> {
     let workspace = current_workspace()?;
     let logger = Logger::start()?;
-    let app = TuiApp::new_epilogue(logger, workspace);
+    let app = TuiApp::new_epilogue(logger, workspace, command.run_mode.as_str());
 
     app.log_exit_requested(command.run_mode.as_str(), "smoke")?;
     app.log_session_summary_created()?;
@@ -123,25 +170,42 @@ fn run_epilogue_smoke(command: AppCommand) -> io::Result<()> {
 struct TuiApp {
     state: TuiState,
     logger: Logger,
+    run_mode: &'static str,
     intro_render_logged: bool,
+    main_render_logged: bool,
     terminal_restore_scope: Option<&'static str>,
 }
 
 impl TuiApp {
-    fn new(logger: Logger, workspace: String) -> Self {
+    fn new(logger: Logger, workspace: String, run_mode: &'static str) -> Self {
         Self {
             state: TuiState::intro(workspace),
             logger,
+            run_mode,
             intro_render_logged: false,
+            main_render_logged: false,
             terminal_restore_scope: None,
         }
     }
 
-    fn new_epilogue(logger: Logger, workspace: String) -> Self {
+    fn new_main(logger: Logger, workspace: String, run_mode: &'static str) -> Self {
+        Self {
+            state: TuiState::main(workspace),
+            logger,
+            run_mode,
+            intro_render_logged: true,
+            main_render_logged: false,
+            terminal_restore_scope: None,
+        }
+    }
+
+    fn new_epilogue(logger: Logger, workspace: String, run_mode: &'static str) -> Self {
         Self {
             state: TuiState::epilogue(workspace),
             logger,
+            run_mode,
             intro_render_logged: true,
+            main_render_logged: true,
             terminal_restore_scope: Some(TUI_02_SCOPE),
         }
     }
@@ -158,6 +222,7 @@ impl TuiApp {
         while !self.state.should_quit {
             terminal.draw(|frame| match self.state.scene {
                 Scene::Intro => render_intro(frame, &self.state),
+                Scene::Main => render_main(frame, &self.state),
                 Scene::Epilogue => {}
             })?;
 
@@ -165,6 +230,10 @@ impl TuiApp {
                 self.logger
                     .ui(LogEvent::ui(TUI_01_SCOPE, EVENT_INTRO_RENDERED, json!({})))?;
                 self.intro_render_logged = true;
+            }
+            if matches!(self.state.scene, Scene::Main) && !self.main_render_logged {
+                log_main_scene_rendered(&self.logger, self.run_mode)?;
+                self.main_render_logged = true;
             }
 
             if event::poll(Duration::from_millis(100))? {
@@ -176,10 +245,11 @@ impl TuiApp {
                         let action = handle_intro_event(key_event, &mut self.state);
                         if matches!(action, IntroAction::ExitRequested) {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
-                            self.log_exit_requested("normal", "intro_prompt")?;
+                            self.log_exit_requested(self.run_mode, "intro_prompt")?;
                             self.log_session_summary_created()?;
                         }
                     }
+                    Scene::Main => handle_main_event(key_event, &mut self.state),
                     Scene::Epilogue => {}
                 }
             }
@@ -233,6 +303,29 @@ impl TuiApp {
             json!({ "surface": "stdout" }),
         ))
     }
+}
+
+fn log_main_scene_rendered(logger: &Logger, run_mode: &str) -> io::Result<()> {
+    logger.ui(LogEvent::ui(
+        TUI_03_SCOPE,
+        EVENT_LAYOUT_CALCULATED,
+        json!({ "run_mode": run_mode }),
+    ))?;
+    logger.ui(LogEvent::ui(
+        TUI_03_SCOPE,
+        EVENT_PERSONA_LAYOUT_ABSENT,
+        json!({ "persona": "off" }),
+    ))?;
+    logger.ui(LogEvent::ui(
+        TUI_03_SCOPE,
+        EVENT_STATUSLINE_POSITIONED,
+        json!({ "position": "bottom" }),
+    ))?;
+    logger.ui(LogEvent::ui(
+        TUI_03_SCOPE,
+        EVENT_MAIN_SCENE_RENDERED,
+        json!({ "run_mode": run_mode }),
+    ))
 }
 
 fn current_workspace() -> io::Result<String> {

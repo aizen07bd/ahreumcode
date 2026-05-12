@@ -24,6 +24,10 @@ pub fn panel() -> Style {
     Style::default().fg(Color::Rgb(210, 210, 210))
 }
 
+pub fn panel_bold() -> Style {
+    panel().add_modifier(Modifier::BOLD)
+}
+
 pub fn prompt_background() -> Style {
     Style::default().bg(Color::Rgb(38, 38, 38))
 }

@@ -3,12 +3,14 @@ use crate::product;
 #[derive(Clone, Copy)]
 pub enum Scene {
     Intro,
+    Main,
     Epilogue,
 }
 
 pub struct TuiState {
     pub scene: Scene,
     pub intro_input: String,
+    pub main_input: String,
     pub should_quit: bool,
     pub runtime_status: RuntimeStatus,
     pub epilogue_summary: Option<EpilogueSummary>,
@@ -19,10 +21,17 @@ impl TuiState {
         Self {
             scene: Scene::Intro,
             intro_input: String::new(),
+            main_input: String::new(),
             should_quit: false,
             runtime_status: RuntimeStatus::new(workspace),
             epilogue_summary: None,
         }
+    }
+
+    pub fn main(workspace: String) -> Self {
+        let mut state = Self::intro(workspace);
+        state.scene = Scene::Main;
+        state
     }
 
     pub fn epilogue(workspace: String) -> Self {

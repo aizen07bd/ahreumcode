@@ -3,11 +3,10 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
 
 use crate::product;
 
-use super::super::components::wordmark;
+use super::super::components::{statusline, wordmark};
 use super::super::state::TuiState;
 use super::super::style;
 
@@ -25,7 +24,7 @@ pub fn render_intro(frame: &mut Frame<'_>, state: &TuiState) {
         .split(area);
 
     render_intro_body(frame, root[0], state);
-    render_statusline(frame, root[1], state);
+    statusline::render_statusline(frame, root[1], &state.runtime_status);
 }
 
 pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction {
@@ -149,25 +148,6 @@ fn render_intro_hint(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, hint_area);
 }
 
-fn render_statusline(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let status = &state.runtime_status;
-    let text = format!(
-        "{} · {}/{} · {} · {} · {} · {} · {}",
-        status.mode,
-        status.provider,
-        status.model,
-        status.workspace,
-        status.context,
-        status.tokens,
-        status.web,
-        status.runtime_state
-    );
-
-    let paragraph =
-        Paragraph::new(fit_to_width(&text, area.width as usize)).style(style::statusline());
-    frame.render_widget(paragraph, area);
-}
-
 fn centered_width(area: Rect, max_width: u16) -> Rect {
     let width = area.width.min(max_width);
     let horizontal_margin = area.width.saturating_sub(width) / 2;
@@ -179,30 +159,4 @@ fn centered_width(area: Rect, max_width: u16) -> Rect {
             Constraint::Min(0),
         ])
         .split(area)[1]
-}
-
-fn fit_to_width(text: &str, width: usize) -> String {
-    if text.width() <= width {
-        return text.to_owned();
-    }
-
-    if width <= 3 {
-        return ".".repeat(width);
-    }
-
-    let target = width - 3;
-    let mut output = String::new();
-    let mut current_width = 0;
-
-    for value in text.chars() {
-        let value_width = value.to_string().width();
-        if current_width + value_width > target {
-            break;
-        }
-        current_width += value_width;
-        output.push(value);
-    }
-
-    output.push_str("...");
-    output
 }
