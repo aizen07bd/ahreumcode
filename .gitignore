@@ -1,0 +1,30 @@
+# Project planning and agent instruction files are local-only.
+docs/
+templates/
+*.md
+
+# Local AhreumCode runtime/config state.
+.ahreumcode/
+
+# Secrets and environment files.
+.env
+.env.*
+*.pem
+*.key
+*.token
+
+# Rust build output.
+target/
+
+# Editor, OS, and temporary files.
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Logs and local run artifacts.
+*.log
+tmp/
+temp/
