@@ -6,14 +6,14 @@ use ratatui::Frame;
 
 use crate::product;
 
-use super::super::components::{statusline, wordmark};
+use super::super::command::{CommandInputOutcome, CommandRegistry};
+use super::super::components::{command_surface, statusline, wordmark};
 use super::super::state::TuiState;
 use super::super::style;
+use super::prompt::handle_prompt_event;
 
-pub enum IntroAction {
-    None,
-    ExitRequested,
-    QuitImmediately,
+pub struct IntroAction {
+    pub command_outcome: CommandInputOutcome,
 }
 
 pub fn render_intro(frame: &mut Frame<'_>, state: &TuiState) {
@@ -28,38 +28,48 @@ pub fn render_intro(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction {
+    if state.command_surface.open && !event.modifiers.contains(KeyModifiers::CONTROL) {
+        let outcome =
+            handle_prompt_event(event, &mut state.intro_input, &mut state.command_surface);
+        state.apply_command_dispatch(outcome.dispatch);
+        return IntroAction {
+            command_outcome: outcome,
+        };
+    }
+
     match event.code {
         KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
             state.should_quit = true;
-            IntroAction::QuitImmediately
+            IntroAction {
+                command_outcome: CommandInputOutcome::none(),
+            }
         }
         KeyCode::Esc => {
             state.should_quit = true;
-            IntroAction::QuitImmediately
-        }
-        KeyCode::Enter => {
-            let input = state.intro_input.trim();
-            if input == "/exit" || input == "/quit" {
-                state.request_exit();
-                IntroAction::ExitRequested
-            } else {
-                IntroAction::None
+            IntroAction {
+                command_outcome: CommandInputOutcome::none(),
             }
         }
-        KeyCode::Backspace => {
-            state.intro_input.pop();
-            IntroAction::None
+        KeyCode::Enter => {
+            state.enter_main_with_prompt();
+            IntroAction {
+                command_outcome: CommandInputOutcome::none(),
+            }
         }
-        KeyCode::Char(value) => {
-            state.intro_input.push(value);
-            IntroAction::None
+        _ => {
+            let outcome =
+                handle_prompt_event(event, &mut state.intro_input, &mut state.command_surface);
+            state.apply_command_dispatch(outcome.dispatch);
+            IntroAction {
+                command_outcome: outcome,
+            }
         }
-        _ => IntroAction::None,
     }
 }
 
 fn render_intro_body(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let content_height = 17.min(area.height);
+    let command_height = if state.command_surface.open { 5 } else { 0 };
+    let content_height = (17 + command_height).min(area.height);
     let vertical_margin = area.height.saturating_sub(content_height) / 2;
     let centered = Layout::default()
         .direction(Direction::Vertical)
@@ -76,13 +86,20 @@ fn render_intro_body(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Constraint::Length(9),
             Constraint::Length(0),
             Constraint::Length(5),
+            Constraint::Length(command_height),
             Constraint::Length(2),
         ])
         .split(centered);
 
     render_logo(frame, chunks[0]);
     render_prompt_panel(frame, chunks[2], state);
-    render_intro_hint(frame, chunks[3]);
+    command_surface::render_command_surface(
+        frame,
+        centered_width(chunks[3], 84),
+        &state.command_surface,
+        &CommandRegistry::new(),
+    );
+    render_intro_hint(frame, chunks[4]);
 }
 
 fn render_logo(frame: &mut Frame<'_>, area: Rect) {

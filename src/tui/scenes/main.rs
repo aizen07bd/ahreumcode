@@ -6,35 +6,50 @@ use ratatui::Frame;
 
 use crate::product;
 
-use super::super::components::statusline;
+use super::super::command::{CommandInputOutcome, CommandRegistry};
+use super::super::components::{command_surface, statusline};
 use super::super::state::TuiState;
 use super::super::style;
+use super::prompt::handle_prompt_event;
 
 pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
-    let layout = layout_main(area);
+    let layout = layout_main(area, state.command_surface.open);
 
     render_header(frame, layout.header);
     render_workspace(frame, layout.workspace);
     render_prompt_composer(frame, layout.prompt, state);
+    command_surface::render_command_surface(
+        frame,
+        layout.command,
+        &state.command_surface,
+        &CommandRegistry::new(),
+    );
     statusline::render_statusline(frame, layout.statusline, &state.runtime_status);
 }
 
-pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) {
+pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> CommandInputOutcome {
+    if state.command_surface.open && !event.modifiers.contains(KeyModifiers::CONTROL) {
+        let outcome = handle_prompt_event(event, &mut state.main_input, &mut state.command_surface);
+        state.apply_command_dispatch(outcome.dispatch);
+        return outcome;
+    }
+
     match event.code {
         KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
             state.should_quit = true;
+            CommandInputOutcome::none()
         }
         KeyCode::Esc => {
             state.should_quit = true;
+            CommandInputOutcome::none()
         }
-        KeyCode::Backspace => {
-            state.main_input.pop();
+        _ => {
+            let outcome =
+                handle_prompt_event(event, &mut state.main_input, &mut state.command_surface);
+            state.apply_command_dispatch(outcome.dispatch);
+            outcome
         }
-        KeyCode::Char(value) => {
-            state.main_input.push(value);
-        }
-        _ => {}
     }
 }
 
@@ -42,16 +57,18 @@ struct MainLayout {
     header: Rect,
     workspace: Rect,
     prompt: Rect,
+    command: Rect,
     statusline: Rect,
 }
 
-fn layout_main(area: Rect) -> MainLayout {
+fn layout_main(area: Rect, command_open: bool) -> MainLayout {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(3),
+            Constraint::Length(command_height(area, command_open)),
             Constraint::Length(1),
         ])
         .split(area);
@@ -60,7 +77,16 @@ fn layout_main(area: Rect) -> MainLayout {
         header: root[0],
         workspace: root[1],
         prompt: root[2],
-        statusline: root[3],
+        command: root[3],
+        statusline: root[4],
+    }
+}
+
+fn command_height(area: Rect, command_open: bool) -> u16 {
+    if command_open && area.height >= 12 {
+        5
+    } else {
+        0
     }
 }
 

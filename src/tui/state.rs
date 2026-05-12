@@ -1,5 +1,7 @@
 use crate::product;
 
+use super::command::{CommandDispatch, CommandSurfaceState};
+
 #[derive(Clone, Copy)]
 pub enum Scene {
     Intro,
@@ -7,10 +9,24 @@ pub enum Scene {
     Epilogue,
 }
 
+impl Scene {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intro => "intro",
+            Self::Main => "workspace",
+            Self::Epilogue => "epilogue",
+        }
+    }
+}
+
 pub struct TuiState {
     pub scene: Scene,
     pub intro_input: String,
     pub main_input: String,
+    pub pending_prompt: Option<String>,
+    pub command_surface: CommandSurfaceState,
+    pub persona_panel: PersonaPanelState,
+    pub status_shell_open: bool,
     pub should_quit: bool,
     pub runtime_status: RuntimeStatus,
     pub epilogue_summary: Option<EpilogueSummary>,
@@ -22,6 +38,10 @@ impl TuiState {
             scene: Scene::Intro,
             intro_input: String::new(),
             main_input: String::new(),
+            pending_prompt: None,
+            command_surface: CommandSurfaceState::default(),
+            persona_panel: PersonaPanelState::Off,
+            status_shell_open: false,
             should_quit: false,
             runtime_status: RuntimeStatus::new(workspace),
             epilogue_summary: None,
@@ -45,6 +65,41 @@ impl TuiState {
         self.scene = Scene::Epilogue;
         self.should_quit = true;
     }
+
+    pub fn enter_main_with_prompt(&mut self) {
+        let prompt = self.intro_input.trim().to_owned();
+        if prompt.is_empty() {
+            return;
+        }
+
+        self.pending_prompt = Some(prompt);
+        self.intro_input.clear();
+        self.main_input.clear();
+        self.command_surface.close();
+        self.scene = Scene::Main;
+    }
+
+    pub fn apply_command_dispatch(&mut self, dispatch: CommandDispatch) {
+        match dispatch {
+            CommandDispatch::None => {}
+            CommandDispatch::ExitRequested => self.request_exit(),
+            CommandDispatch::StatusShell => {
+                self.status_shell_open = true;
+            }
+            CommandDispatch::PersonaFull => {
+                self.persona_panel = PersonaPanelState::Full;
+            }
+            CommandDispatch::PersonaOff | CommandDispatch::PersonaClose => {
+                self.persona_panel = PersonaPanelState::Off;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum PersonaPanelState {
+    Off,
+    Full,
 }
 
 pub struct RuntimeStatus {

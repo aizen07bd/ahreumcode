@@ -13,14 +13,16 @@ use serde_json::json;
 use crate::cli::{AppCommand, RunMode, SceneCommand};
 use crate::logging::{LogEvent, Logger};
 
+use super::command::{CommandDispatch, CommandInputEvent, CommandRegistry};
 use super::scenes::epilogue::print_epilogue;
-use super::scenes::intro::{handle_intro_event, render_intro, IntroAction};
+use super::scenes::intro::{handle_intro_event, render_intro};
 use super::scenes::main::{handle_main_event, render_main};
 use super::state::{Scene, TuiState};
 
 const TUI_01_SCOPE: &str = "tui-01-intro-scene";
 const TUI_02_SCOPE: &str = "tui-02-epilogue-scene";
 const TUI_03_SCOPE: &str = "tui-03-main-scene-layout";
+const TUI_04_SCOPE: &str = "tui-04-command-area-basic-actions";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -33,6 +35,10 @@ const EVENT_MAIN_SCENE_RENDERED: &str = "main_scene_rendered";
 const EVENT_LAYOUT_CALCULATED: &str = "layout_calculated";
 const EVENT_PERSONA_LAYOUT_ABSENT: &str = "persona_layout_absent";
 const EVENT_STATUSLINE_POSITIONED: &str = "statusline_positioned";
+const EVENT_COMMAND_SURFACE_OPENED: &str = "command_surface_opened";
+const EVENT_COMMAND_FILTER_CHANGED: &str = "command_filter_changed";
+const EVENT_COMMAND_SELECTED: &str = "command_selected";
+const EVENT_COMMAND_ACTION_DISPATCHED: &str = "command_action_dispatched";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
@@ -119,7 +125,9 @@ fn run_main_terminal(command: AppCommand) -> io::Result<()> {
 
     let mut app = TuiApp::new_main(logger, workspace, command.run_mode.as_str());
     app.run(terminal.terminal_mut())?;
-    terminal.restore()
+    terminal.restore()?;
+    app.log_terminal_restored()?;
+    app.print_epilogue_after_restore()
 }
 
 fn run_main_smoke(command: AppCommand) -> io::Result<()> {
@@ -243,13 +251,22 @@ impl TuiApp {
                 match self.state.scene {
                     Scene::Intro => {
                         let action = handle_intro_event(key_event, &mut self.state);
-                        if matches!(action, IntroAction::ExitRequested) {
+                        self.log_command_events(&action.command_outcome.events)?;
+                        if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "intro_prompt")?;
                             self.log_session_summary_created()?;
                         }
                     }
-                    Scene::Main => handle_main_event(key_event, &mut self.state),
+                    Scene::Main => {
+                        let outcome = handle_main_event(key_event, &mut self.state);
+                        self.log_command_events(&outcome.events)?;
+                        if outcome.dispatch == CommandDispatch::ExitRequested {
+                            self.terminal_restore_scope = Some(TUI_02_SCOPE);
+                            self.log_exit_requested(self.run_mode, "main_prompt")?;
+                            self.log_session_summary_created()?;
+                        }
+                    }
                     Scene::Epilogue => {}
                 }
             }
@@ -303,6 +320,61 @@ impl TuiApp {
             json!({ "surface": "stdout" }),
         ))
     }
+
+    fn log_command_events(&self, events: &[CommandInputEvent]) -> io::Result<()> {
+        let registry = CommandRegistry::new();
+
+        for event in events {
+            match event {
+                CommandInputEvent::SurfaceOpened => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_04_SCOPE,
+                        EVENT_COMMAND_SURFACE_OPENED,
+                        json!({ "scene": self.state.scene.as_str() }),
+                    ))?;
+                }
+                CommandInputEvent::FilterChanged { query } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_04_SCOPE,
+                        EVENT_COMMAND_FILTER_CHANGED,
+                        json!({ "query": query }),
+                    ))?;
+                }
+                CommandInputEvent::CommandSelected { command } => {
+                    let data = command_log_data(&registry, *command);
+                    self.logger
+                        .ui(LogEvent::ui(TUI_04_SCOPE, EVENT_COMMAND_SELECTED, data))?;
+                }
+                CommandInputEvent::ActionDispatched { command } => {
+                    let data = command_log_data(&registry, *command);
+                    self.logger.ui(LogEvent::ui(
+                        TUI_04_SCOPE,
+                        EVENT_COMMAND_ACTION_DISPATCHED,
+                        data,
+                    ))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn command_log_data(
+    registry: &CommandRegistry,
+    command: super::command::CommandId,
+) -> serde_json::Value {
+    let Some(metadata) = registry.command(command) else {
+        return json!({ "command": command.as_str() });
+    };
+
+    json!({
+        "command": metadata.name,
+        "group": metadata.group,
+        "presentation": metadata.presentation.as_str(),
+        "risk": metadata.risk.as_str(),
+        "availability": metadata.availability,
+    })
 }
 
 fn log_main_scene_rendered(logger: &Logger, run_mode: &str) -> io::Result<()> {
