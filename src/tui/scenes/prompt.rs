@@ -8,11 +8,12 @@ pub fn handle_prompt_event(
     event: KeyEvent,
     input: &mut String,
     surface: &mut CommandSurfaceState,
+    scene: &str,
 ) -> CommandInputOutcome {
     let registry = CommandRegistry::new();
 
     if surface.open {
-        return handle_command_event(event, input, surface, &registry);
+        return handle_command_event(event, input, surface, &registry, scene);
     }
 
     match event.code {
@@ -42,6 +43,7 @@ fn handle_command_event(
     input: &mut String,
     surface: &mut CommandSurfaceState,
     registry: &CommandRegistry,
+    scene: &str,
 ) -> CommandInputOutcome {
     match event.code {
         KeyCode::Esc => {
@@ -50,17 +52,17 @@ fn handle_command_event(
             CommandInputOutcome::none()
         }
         KeyCode::Up => {
-            let item_count = registry.filtered(&surface.query).len();
+            let item_count = registry.filtered_for(&surface.query, scene).len();
             surface.move_selection(-1, item_count);
             CommandInputOutcome::none()
         }
         KeyCode::Down => {
-            let item_count = registry.filtered(&surface.query).len();
+            let item_count = registry.filtered_for(&surface.query, scene).len();
             surface.move_selection(1, item_count);
             CommandInputOutcome::none()
         }
         KeyCode::Enter => {
-            let outcome = confirm_command(surface, registry);
+            let outcome = confirm_command(surface, registry, scene);
             if !outcome.events.is_empty() {
                 input.clear();
             }

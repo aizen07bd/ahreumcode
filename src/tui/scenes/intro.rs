@@ -29,9 +29,13 @@ pub fn render_intro(frame: &mut Frame<'_>, state: &TuiState) {
 
 pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction {
     if state.command_surface.open && !event.modifiers.contains(KeyModifiers::CONTROL) {
-        let outcome =
-            handle_prompt_event(event, &mut state.intro_input, &mut state.command_surface);
-        state.apply_command_dispatch(outcome.dispatch);
+        let outcome = handle_prompt_event(
+            event,
+            &mut state.intro_input,
+            &mut state.command_surface,
+            state.scene.as_str(),
+        );
+        let _ = state.apply_command_dispatch(outcome.dispatch);
         return IntroAction {
             command_outcome: outcome,
         };
@@ -57,9 +61,13 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
             }
         }
         _ => {
-            let outcome =
-                handle_prompt_event(event, &mut state.intro_input, &mut state.command_surface);
-            state.apply_command_dispatch(outcome.dispatch);
+            let outcome = handle_prompt_event(
+                event,
+                &mut state.intro_input,
+                &mut state.command_surface,
+                state.scene.as_str(),
+            );
+            let _ = state.apply_command_dispatch(outcome.dispatch);
             IntroAction {
                 command_outcome: outcome,
             }
@@ -98,6 +106,7 @@ fn render_intro_body(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         centered_width(chunks[3], 84),
         &state.command_surface,
         &CommandRegistry::new(),
+        state.scene.as_str(),
     );
     render_intro_hint(frame, chunks[4]);
 }

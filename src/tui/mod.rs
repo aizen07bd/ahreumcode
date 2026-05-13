@@ -1,4 +1,5 @@
 mod app;
+mod approval;
 mod command;
 mod components;
 mod scenes;

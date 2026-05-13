@@ -3,6 +3,7 @@ pub enum CommandId {
     Exit,
     Quit,
     Status,
+    Approval,
     PersonaFull,
     PersonaOff,
     PersonaClose,
@@ -14,6 +15,7 @@ impl CommandId {
             Self::Exit => "/exit",
             Self::Quit => "/quit",
             Self::Status => "/status",
+            Self::Approval => "/approval",
             Self::PersonaFull => "/persona full",
             Self::PersonaOff => "/persona off",
             Self::PersonaClose => "/persona close",
@@ -97,6 +99,16 @@ impl CommandRegistry {
                     risk: CommandRisk::Low,
                 },
                 CommandMetadata {
+                    id: CommandId::Approval,
+                    name: "/approval",
+                    aliases: &[],
+                    description: "show approval shell",
+                    group: "Permission",
+                    availability: &["workspace"],
+                    presentation: CommandPresentation::InlineAction,
+                    risk: CommandRisk::Low,
+                },
+                CommandMetadata {
                     id: CommandId::PersonaFull,
                     name: "/persona full",
                     aliases: &[],
@@ -130,10 +142,10 @@ impl CommandRegistry {
         }
     }
 
-    pub fn filtered(&self, query: &str) -> Vec<&CommandMetadata> {
+    pub fn filtered_for(&self, query: &str, scene: &str) -> Vec<&CommandMetadata> {
         self.commands
             .iter()
-            .filter(|command| command.matches(query))
+            .filter(|command| command.matches(query) && command.available_in(scene))
             .collect()
     }
 
@@ -151,6 +163,12 @@ impl CommandMetadata {
                 .aliases
                 .iter()
                 .any(|alias| alias.starts_with(&normalized))
+    }
+
+    fn available_in(&self, scene: &str) -> bool {
+        self.availability
+            .iter()
+            .any(|available| *available == scene)
     }
 }
 
@@ -219,6 +237,7 @@ pub enum CommandDispatch {
     None,
     ExitRequested,
     StatusShell,
+    ApprovalShell,
     PersonaFull,
     PersonaOff,
     PersonaClose,
@@ -241,8 +260,9 @@ impl CommandInputOutcome {
 pub fn confirm_command(
     surface: &mut CommandSurfaceState,
     registry: &CommandRegistry,
+    scene: &str,
 ) -> CommandInputOutcome {
-    let filtered = registry.filtered(&surface.query);
+    let filtered = registry.filtered_for(&surface.query, scene);
     let Some(command) = filtered.get(surface.selected) else {
         return CommandInputOutcome::none();
     };
@@ -267,6 +287,7 @@ fn dispatch_for(command: CommandId) -> CommandDispatch {
     match command {
         CommandId::Exit | CommandId::Quit => CommandDispatch::ExitRequested,
         CommandId::Status => CommandDispatch::StatusShell,
+        CommandId::Approval => CommandDispatch::ApprovalShell,
         CommandId::PersonaFull => CommandDispatch::PersonaFull,
         CommandId::PersonaOff => CommandDispatch::PersonaOff,
         CommandId::PersonaClose => CommandDispatch::PersonaClose,

@@ -11,12 +11,13 @@ pub fn render_command_surface(
     area: Rect,
     surface: &CommandSurfaceState,
     registry: &CommandRegistry,
+    scene: &str,
 ) {
     if !surface.open || area.height == 0 {
         return;
     }
 
-    let filtered = registry.filtered(&surface.query);
+    let filtered = registry.filtered_for(&surface.query, scene);
     let visible = filtered
         .iter()
         .skip(surface.scroll)

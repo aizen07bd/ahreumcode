@@ -13,6 +13,7 @@ use serde_json::json;
 use crate::cli::{AppCommand, RunMode, SceneCommand};
 use crate::logging::{LogEvent, Logger};
 
+use super::approval::ApprovalInputEvent;
 use super::command::{CommandDispatch, CommandInputEvent, CommandRegistry};
 use super::scenes::epilogue::print_epilogue;
 use super::scenes::intro::{handle_intro_event, render_intro};
@@ -23,6 +24,7 @@ const TUI_01_SCOPE: &str = "tui-01-intro-scene";
 const TUI_02_SCOPE: &str = "tui-02-epilogue-scene";
 const TUI_03_SCOPE: &str = "tui-03-main-scene-layout";
 const TUI_04_SCOPE: &str = "tui-04-command-area-basic-actions";
+const TUI_05_SCOPE: &str = "tui-05-approval-area";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -39,6 +41,9 @@ const EVENT_COMMAND_SURFACE_OPENED: &str = "command_surface_opened";
 const EVENT_COMMAND_FILTER_CHANGED: &str = "command_filter_changed";
 const EVENT_COMMAND_SELECTED: &str = "command_selected";
 const EVENT_COMMAND_ACTION_DISPATCHED: &str = "command_action_dispatched";
+const EVENT_APPROVAL_SURFACE_OPENED: &str = "approval_surface_opened";
+const EVENT_APPROVAL_OPTION_SELECTED: &str = "approval_option_selected";
+const EVENT_APPROVAL_RESULT_RECORDED: &str = "approval_result_recorded";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
@@ -259,9 +264,10 @@ impl TuiApp {
                         }
                     }
                     Scene::Main => {
-                        let outcome = handle_main_event(key_event, &mut self.state);
-                        self.log_command_events(&outcome.events)?;
-                        if outcome.dispatch == CommandDispatch::ExitRequested {
+                        let action = handle_main_event(key_event, &mut self.state);
+                        self.log_command_events(&action.command_outcome.events)?;
+                        self.log_approval_events(&action.approval_outcome.events)?;
+                        if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "main_prompt")?;
                             self.log_session_summary_created()?;
@@ -351,6 +357,36 @@ impl TuiApp {
                         TUI_04_SCOPE,
                         EVENT_COMMAND_ACTION_DISPATCHED,
                         data,
+                    ))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn log_approval_events(&self, events: &[ApprovalInputEvent]) -> io::Result<()> {
+        for event in events {
+            match event {
+                ApprovalInputEvent::SurfaceOpened => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_05_SCOPE,
+                        EVENT_APPROVAL_SURFACE_OPENED,
+                        json!({ "scene": self.state.scene.as_str() }),
+                    ))?;
+                }
+                ApprovalInputEvent::OptionSelected { option } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_05_SCOPE,
+                        EVENT_APPROVAL_OPTION_SELECTED,
+                        json!({ "option": option.as_str() }),
+                    ))?;
+                }
+                ApprovalInputEvent::ResultRecorded { result } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_05_SCOPE,
+                        EVENT_APPROVAL_RESULT_RECORDED,
+                        json!({ "result": result.as_str() }),
                     ))?;
                 }
             }

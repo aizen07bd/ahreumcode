@@ -1,5 +1,6 @@
 use crate::product;
 
+use super::approval::{open_approval_surface, ApprovalInputOutcome, ApprovalSurfaceState};
 use super::command::{CommandDispatch, CommandSurfaceState};
 
 #[derive(Clone, Copy)]
@@ -25,6 +26,8 @@ pub struct TuiState {
     pub main_input: String,
     pub pending_prompt: Option<String>,
     pub command_surface: CommandSurfaceState,
+    pub approval_surface: ApprovalSurfaceState,
+    pub workspace_entries: Vec<WorkspaceEntry>,
     pub persona_panel: PersonaPanelState,
     pub status_shell_open: bool,
     pub should_quit: bool,
@@ -40,6 +43,8 @@ impl TuiState {
             main_input: String::new(),
             pending_prompt: None,
             command_surface: CommandSurfaceState::default(),
+            approval_surface: ApprovalSurfaceState::default(),
+            workspace_entries: Vec::new(),
             persona_panel: PersonaPanelState::Off,
             status_shell_open: false,
             should_quit: false,
@@ -79,20 +84,34 @@ impl TuiState {
         self.scene = Scene::Main;
     }
 
-    pub fn apply_command_dispatch(&mut self, dispatch: CommandDispatch) {
+    pub fn apply_command_dispatch(&mut self, dispatch: CommandDispatch) -> ApprovalInputOutcome {
         match dispatch {
-            CommandDispatch::None => {}
-            CommandDispatch::ExitRequested => self.request_exit(),
+            CommandDispatch::None => ApprovalInputOutcome::none(),
+            CommandDispatch::ExitRequested => {
+                self.request_exit();
+                ApprovalInputOutcome::none()
+            }
             CommandDispatch::StatusShell => {
                 self.status_shell_open = true;
+                ApprovalInputOutcome::none()
+            }
+            CommandDispatch::ApprovalShell => {
+                self.command_surface.close();
+                open_approval_surface(&mut self.approval_surface)
             }
             CommandDispatch::PersonaFull => {
                 self.persona_panel = PersonaPanelState::Full;
+                ApprovalInputOutcome::none()
             }
             CommandDispatch::PersonaOff | CommandDispatch::PersonaClose => {
                 self.persona_panel = PersonaPanelState::Off;
+                ApprovalInputOutcome::none()
             }
         }
+    }
+
+    pub fn record_workspace_line(&mut self, text: String) {
+        self.workspace_entries.push(WorkspaceEntry { text });
     }
 }
 
@@ -100,6 +119,10 @@ impl TuiState {
 pub enum PersonaPanelState {
     Off,
     Full,
+}
+
+pub struct WorkspaceEntry {
+    pub text: String,
 }
 
 pub struct RuntimeStatus {
