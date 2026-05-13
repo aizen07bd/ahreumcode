@@ -15,6 +15,7 @@ use crate::logging::{LogEvent, Logger};
 
 use super::approval::ApprovalInputEvent;
 use super::command::{CommandDispatch, CommandInputEvent, CommandRegistry};
+use super::expanded_form::ExpandedFormEvent;
 use super::persona::{PersonaEvent, PersonaRendered};
 use super::scenes::epilogue::print_epilogue;
 use super::scenes::intro::{handle_intro_event, render_intro};
@@ -32,6 +33,7 @@ const TUI_06_SCOPE: &str = "tui-06-working-process-area";
 const TUI_07_SCOPE: &str = "tui-07-workspace-output-layout";
 const TUI_08_SCOPE: &str = "tui-08-persona-message-detail";
 const TUI_09_SCOPE: &str = "tui-09-complex-commands";
+const TUI_10_SCOPE: &str = "tui-10-modal-expanded-form";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -52,6 +54,10 @@ const EVENT_COMMAND_AVAILABILITY_CHECKED: &str = "command_availability_checked";
 const EVENT_STEPPED_PICKER_OPENED: &str = "stepped_picker_opened";
 const EVENT_STEPPED_PICKER_SELECTION_CHANGED: &str = "stepped_picker_selection_changed";
 const EVENT_STEPPED_PICKER_CONFIRMED: &str = "stepped_picker_confirmed";
+const EVENT_EXPANDED_FORM_OPENED: &str = "expanded_form_opened";
+const EVENT_EXPANDED_FORM_FIELD_CHANGED: &str = "expanded_form_field_changed";
+const EVENT_EXPANDED_FORM_SUBMITTED: &str = "expanded_form_submitted";
+const EVENT_EXPANDED_FORM_CANCELLED: &str = "expanded_form_cancelled";
 const EVENT_APPROVAL_SURFACE_OPENED: &str = "approval_surface_opened";
 const EVENT_APPROVAL_OPTION_SELECTED: &str = "approval_option_selected";
 const EVENT_APPROVAL_RESULT_RECORDED: &str = "approval_result_recorded";
@@ -303,6 +309,7 @@ impl TuiApp {
                         self.log_working_process_events(&action.working_process_events.events)?;
                         self.log_workspace_events(&action.workspace_events.events)?;
                         self.log_persona_events(&action.persona_events.events)?;
+                        self.log_expanded_form_events(&action.expanded_form_events.events)?;
                         if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "main_prompt")?;
@@ -594,6 +601,51 @@ impl TuiApp {
             EVENT_PERSONA_MESSAGE_RENDERED,
             json!({ "message_count": rendered.message_count }),
         ))
+    }
+
+    fn log_expanded_form_events(&self, events: &[ExpandedFormEvent]) -> io::Result<()> {
+        for event in events {
+            match event {
+                ExpandedFormEvent::Opened { kind } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_10_SCOPE,
+                        EVENT_EXPANDED_FORM_OPENED,
+                        json!({ "kind": kind.as_str() }),
+                    ))?;
+                }
+                ExpandedFormEvent::FieldChanged {
+                    kind,
+                    field,
+                    masked,
+                } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_10_SCOPE,
+                        EVENT_EXPANDED_FORM_FIELD_CHANGED,
+                        json!({
+                            "kind": kind.as_str(),
+                            "field": field,
+                            "masked": masked,
+                        }),
+                    ))?;
+                }
+                ExpandedFormEvent::Submitted { kind } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_10_SCOPE,
+                        EVENT_EXPANDED_FORM_SUBMITTED,
+                        json!({ "kind": kind.as_str() }),
+                    ))?;
+                }
+                ExpandedFormEvent::Cancelled { kind } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_10_SCOPE,
+                        EVENT_EXPANDED_FORM_CANCELLED,
+                        json!({ "kind": kind.as_str() }),
+                    ))?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -399,16 +399,30 @@ impl SteppedPickerState {
                     action: CommandDispatch::ModePilot,
                 },
             ],
-            CommandId::Provider => vec![SteppedPickerOption {
-                label: "LM Studio (current)",
-                detail: "OpenAI-compatible local endpoint",
-                action: CommandDispatch::ProviderLmStudio,
-            }],
-            CommandId::Model => vec![SteppedPickerOption {
-                label: "google/gemma-4-e4b (current)",
-                detail: "LM Studio local model",
-                action: CommandDispatch::ModelGemma,
-            }],
+            CommandId::Provider => vec![
+                SteppedPickerOption {
+                    label: "LM Studio (current)",
+                    detail: "OpenAI-compatible local endpoint",
+                    action: CommandDispatch::ProviderLmStudio,
+                },
+                SteppedPickerOption {
+                    label: "add local provider",
+                    detail: "open expanded form",
+                    action: CommandDispatch::OpenLocalProviderForm,
+                },
+            ],
+            CommandId::Model => vec![
+                SteppedPickerOption {
+                    label: "google/gemma-4-e4b (current)",
+                    detail: "LM Studio local model",
+                    action: CommandDispatch::ModelGemma,
+                },
+                SteppedPickerOption {
+                    label: "add local model",
+                    detail: "open expanded form",
+                    action: CommandDispatch::OpenLocalModelForm,
+                },
+            ],
             CommandId::Persona => vec![
                 SteppedPickerOption {
                     label: "full",
@@ -429,8 +443,8 @@ impl SteppedPickerState {
             CommandId::DocsInit => vec![
                 SteppedPickerOption {
                     label: "prepare",
-                    detail: "expanded setup opens in tui-10",
-                    action: CommandDispatch::DocsInitPrepare,
+                    detail: "open expanded form",
+                    action: CommandDispatch::OpenDocsInitForm,
                 },
                 SteppedPickerOption {
                     label: "cancel",
@@ -441,8 +455,8 @@ impl SteppedPickerState {
             CommandId::Init => vec![
                 SteppedPickerOption {
                     label: "prepare",
-                    detail: "expanded setup opens in tui-10",
-                    action: CommandDispatch::InitPrepare,
+                    detail: "open expanded form",
+                    action: CommandDispatch::OpenInitForm,
                 },
                 SteppedPickerOption {
                     label: "cancel",
@@ -507,8 +521,10 @@ pub enum CommandDispatch {
     ModePilot,
     ProviderLmStudio,
     ModelGemma,
-    DocsInitPrepare,
-    InitPrepare,
+    OpenLocalProviderForm,
+    OpenLocalModelForm,
+    OpenDocsInitForm,
+    OpenInitForm,
     PersonaFull,
     PersonaOff,
     PersonaClose,

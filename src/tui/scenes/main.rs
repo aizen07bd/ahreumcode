@@ -9,8 +9,10 @@ use crate::product;
 use super::super::approval::ApprovalInputOutcome;
 use super::super::command::{CommandInputOutcome, CommandRegistry};
 use super::super::components::{
-    approval_surface, command_surface, persona, statusline, working_process, workspace,
+    approval_surface, command_surface, expanded_form, persona, statusline, working_process,
+    workspace,
 };
+use super::super::expanded_form::ExpandedFormEvents;
 use super::super::persona::{PersonaEvents, MIN_PERSONA_PANEL_WIDTH, MIN_PERSONA_TERMINAL_WIDTH};
 use super::super::state::TuiState;
 use super::super::style;
@@ -25,6 +27,7 @@ pub struct MainAction {
     pub working_process_events: WorkingProcessEvents,
     pub workspace_events: WorkspaceEvents,
     pub persona_events: PersonaEvents,
+    pub expanded_form_events: ExpandedFormEvents,
 }
 
 pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
@@ -49,6 +52,7 @@ pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
         state.scene.as_str(),
     );
     statusline::render_statusline(frame, layout.statusline, &state.runtime_status);
+    expanded_form::render_expanded_form(frame, expanded_form_area(area), &state.expanded_form);
 }
 
 pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
@@ -60,7 +64,12 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             working_process_events: runtime_outcome.working_process_events,
             workspace_events: runtime_outcome.workspace_events,
             persona_events: PersonaEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
         };
+    }
+
+    if state.expanded_form.open && !event.modifiers.contains(KeyModifiers::CONTROL) {
+        return handle_expanded_form_event(event, state);
     }
 
     if state.approval_surface.open && !event.modifiers.contains(KeyModifiers::CONTROL) {
@@ -75,6 +84,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             working_process_events: WorkingProcessEvents::none(),
             workspace_events,
             persona_events: PersonaEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
         };
     }
 
@@ -94,6 +104,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             working_process_events: WorkingProcessEvents::none(),
             workspace_events: dispatch_outcome.workspace_events,
             persona_events: dispatch_outcome.persona_events,
+            expanded_form_events: dispatch_outcome.expanded_form_events,
         };
     }
 
@@ -117,6 +128,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
                     working_process_events: prompt_outcome.working_process_events,
                     workspace_events: prompt_outcome.workspace_events,
                     persona_events: PersonaEvents::none(),
+                    expanded_form_events: ExpandedFormEvents::none(),
                 }
             }
         }
@@ -126,6 +138,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             working_process_events: WorkingProcessEvents::none(),
             workspace_events: state.scroll_workspace(-1),
             persona_events: PersonaEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
         },
         KeyCode::Down => MainAction {
             command_outcome: CommandInputOutcome::none(),
@@ -133,6 +146,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             working_process_events: WorkingProcessEvents::none(),
             workspace_events: state.scroll_workspace(1),
             persona_events: PersonaEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
         },
         _ => {
             let command_outcome = handle_prompt_event(
@@ -150,8 +164,45 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
                 working_process_events: WorkingProcessEvents::none(),
                 workspace_events: dispatch_outcome.workspace_events,
                 persona_events: dispatch_outcome.persona_events,
+                expanded_form_events: dispatch_outcome.expanded_form_events,
             }
         }
+    }
+}
+
+fn handle_expanded_form_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
+    let outcome = match event.code {
+        KeyCode::Esc => state.cancel_expanded_form(),
+        KeyCode::Tab => {
+            state.focus_next_expanded_form_field();
+            super::super::state::ExpandedFormOutcome {
+                workspace_events: WorkspaceEvents::none(),
+                expanded_form_events: ExpandedFormEvents::none(),
+            }
+        }
+        KeyCode::BackTab => {
+            state.focus_previous_expanded_form_field();
+            super::super::state::ExpandedFormOutcome {
+                workspace_events: WorkspaceEvents::none(),
+                expanded_form_events: ExpandedFormEvents::none(),
+            }
+        }
+        KeyCode::Enter => state.submit_expanded_form(),
+        KeyCode::Backspace => state.backspace_expanded_form(),
+        KeyCode::Char(value) => state.update_expanded_form_char(value),
+        _ => super::super::state::ExpandedFormOutcome {
+            workspace_events: WorkspaceEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
+        },
+    };
+
+    MainAction {
+        command_outcome: CommandInputOutcome::none(),
+        approval_outcome: ApprovalInputOutcome::none(),
+        working_process_events: WorkingProcessEvents::none(),
+        workspace_events: outcome.workspace_events,
+        persona_events: PersonaEvents::none(),
+        expanded_form_events: outcome.expanded_form_events,
     }
 }
 
@@ -163,6 +214,7 @@ impl MainAction {
             working_process_events: WorkingProcessEvents::none(),
             workspace_events: WorkspaceEvents::none(),
             persona_events: PersonaEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
         }
     }
 }
@@ -290,4 +342,29 @@ fn current_terminal_width() -> u16 {
     crossterm::terminal::size()
         .map(|(width, _)| width)
         .unwrap_or(MIN_PERSONA_TERMINAL_WIDTH)
+}
+
+fn expanded_form_area(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(4).min(88);
+    let height = area.height.saturating_sub(4).min(12);
+    let horizontal_margin = area.width.saturating_sub(width) / 2;
+    let vertical_margin = area.height.saturating_sub(height) / 2;
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(vertical_margin),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(horizontal_margin),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(rows[1])[1]
 }

@@ -2,6 +2,9 @@ use crate::product;
 
 use super::approval::{open_approval_surface, ApprovalInputOutcome, ApprovalSurfaceState};
 use super::command::{CommandDispatch, CommandSurfaceState};
+use super::expanded_form::{
+    ExpandedFormEvents, ExpandedFormKind, ExpandedFormState, ExpandedFormSubmit,
+};
 use super::persona::{
     PersonaBuffer, PersonaEvent, PersonaEvents, PersonaMessage, PersonaRendered,
     MIN_PERSONA_TERMINAL_WIDTH,
@@ -35,6 +38,7 @@ pub struct TuiState {
     pub pending_prompt: Option<String>,
     pub command_surface: CommandSurfaceState,
     pub approval_surface: ApprovalSurfaceState,
+    pub expanded_form: ExpandedFormState,
     pub working_process: WorkingProcessState,
     pub workspace: WorkspaceBuffer,
     pub persona_panel: PersonaPanelState,
@@ -54,6 +58,7 @@ impl TuiState {
             pending_prompt: None,
             command_surface: CommandSurfaceState::default(),
             approval_surface: ApprovalSurfaceState::default(),
+            expanded_form: ExpandedFormState::default(),
             working_process: WorkingProcessState::default(),
             workspace: WorkspaceBuffer::default(),
             persona_panel: PersonaPanelState::Off,
@@ -118,6 +123,7 @@ impl TuiState {
                     approval_outcome: open_approval_surface(&mut self.approval_surface),
                     workspace_events: WorkspaceEvents::none(),
                     persona_events: PersonaEvents::none(),
+                    expanded_form_events: ExpandedFormEvents::none(),
                 }
             }
             CommandDispatch::ModeGuide => self.set_mode("Guide"),
@@ -125,14 +131,18 @@ impl TuiState {
             CommandDispatch::ModePilot => self.set_mode("Pilot"),
             CommandDispatch::ProviderLmStudio => self.set_provider(product::DEFAULT_PROVIDER),
             CommandDispatch::ModelGemma => self.set_model(product::DEFAULT_MODEL),
-            CommandDispatch::DocsInitPrepare => self.prepare_deferred_command(
-                "/docs-init",
-                "문서 템플릿 설정은 expanded form 단계에서 실행됩니다.",
-            ),
-            CommandDispatch::InitPrepare => self.prepare_deferred_command(
-                "/init",
-                "AGENTS.md 설정은 expanded form 단계에서 실행됩니다.",
-            ),
+            CommandDispatch::OpenLocalProviderForm => {
+                self.open_expanded_form(ExpandedFormKind::LocalProvider)
+            }
+            CommandDispatch::OpenLocalModelForm => {
+                self.open_expanded_form(ExpandedFormKind::LocalModel)
+            }
+            CommandDispatch::OpenDocsInitForm => {
+                self.open_expanded_form(ExpandedFormKind::DocsInit)
+            }
+            CommandDispatch::OpenInitForm => {
+                self.open_expanded_form(ExpandedFormKind::InitInstructions)
+            }
             CommandDispatch::PersonaFull => self.open_persona_full(terminal_width),
             CommandDispatch::PersonaOff | CommandDispatch::PersonaClose => self.close_persona(),
         }
@@ -178,8 +188,67 @@ impl TuiState {
         self.workspace.take_render_event()
     }
 
+    pub fn cancel_expanded_form(&mut self) -> ExpandedFormOutcome {
+        ExpandedFormOutcome {
+            workspace_events: WorkspaceEvents::none(),
+            expanded_form_events: self.expanded_form.cancel(),
+        }
+    }
+
+    pub fn focus_next_expanded_form_field(&mut self) {
+        self.expanded_form.focus_next();
+    }
+
+    pub fn focus_previous_expanded_form_field(&mut self) {
+        self.expanded_form.focus_previous();
+    }
+
+    pub fn update_expanded_form_char(&mut self, value: char) -> ExpandedFormOutcome {
+        ExpandedFormOutcome {
+            workspace_events: WorkspaceEvents::none(),
+            expanded_form_events: self.expanded_form.push_char(value),
+        }
+    }
+
+    pub fn backspace_expanded_form(&mut self) -> ExpandedFormOutcome {
+        ExpandedFormOutcome {
+            workspace_events: WorkspaceEvents::none(),
+            expanded_form_events: self.expanded_form.backspace(),
+        }
+    }
+
+    pub fn submit_expanded_form(&mut self) -> ExpandedFormOutcome {
+        let ExpandedFormSubmit {
+            submitted,
+            events,
+            notice,
+        } = self.expanded_form.submit();
+        let workspace_events = if submitted {
+            notice
+                .map(|value| self.workspace.push_system_notice(value))
+                .unwrap_or_else(WorkspaceEvents::none)
+        } else {
+            WorkspaceEvents::none()
+        };
+
+        ExpandedFormOutcome {
+            workspace_events,
+            expanded_form_events: events,
+        }
+    }
+
     pub fn take_persona_render_event(&mut self) -> Option<PersonaRendered> {
         self.persona.take_render_event()
+    }
+
+    fn open_expanded_form(&mut self, kind: ExpandedFormKind) -> CommandDispatchOutcome {
+        self.command_surface.close();
+        CommandDispatchOutcome {
+            approval_outcome: ApprovalInputOutcome::none(),
+            workspace_events: WorkspaceEvents::none(),
+            persona_events: PersonaEvents::none(),
+            expanded_form_events: self.expanded_form.open(kind),
+        }
     }
 
     fn open_persona_full(&mut self, terminal_width: u16) -> CommandDispatchOutcome {
@@ -195,6 +264,7 @@ impl TuiState {
                     width: terminal_width,
                     min_width: MIN_PERSONA_TERMINAL_WIDTH,
                 }),
+                expanded_form_events: ExpandedFormEvents::none(),
             };
         }
 
@@ -207,6 +277,7 @@ impl TuiState {
             approval_outcome: ApprovalInputOutcome::none(),
             workspace_events: WorkspaceEvents::none(),
             persona_events: PersonaEvents::single(PersonaEvent::PanelOpened),
+            expanded_form_events: ExpandedFormEvents::none(),
         }
     }
 
@@ -220,6 +291,7 @@ impl TuiState {
             approval_outcome: ApprovalInputOutcome::none(),
             workspace_events: WorkspaceEvents::none(),
             persona_events: PersonaEvents::single(PersonaEvent::PanelClosed),
+            expanded_form_events: ExpandedFormEvents::none(),
         }
     }
 
@@ -231,6 +303,7 @@ impl TuiState {
                 .workspace
                 .push_system_notice(format!("mode set to {mode}")),
             persona_events: PersonaEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
         }
     }
 
@@ -242,6 +315,7 @@ impl TuiState {
                 .workspace
                 .push_system_notice(format!("provider set to {provider}")),
             persona_events: PersonaEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
         }
     }
 
@@ -253,20 +327,7 @@ impl TuiState {
                 .workspace
                 .push_system_notice(format!("model set to {model}")),
             persona_events: PersonaEvents::none(),
-        }
-    }
-
-    fn prepare_deferred_command(
-        &mut self,
-        command: &'static str,
-        message: &'static str,
-    ) -> CommandDispatchOutcome {
-        CommandDispatchOutcome {
-            approval_outcome: ApprovalInputOutcome::none(),
-            workspace_events: self
-                .workspace
-                .push_system_notice(format!("{command}: {message}")),
-            persona_events: PersonaEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
         }
     }
 
@@ -276,6 +337,7 @@ impl TuiState {
         self.main_input.clear();
         self.command_surface.close();
         self.approval_surface.close();
+        self.expanded_form.cancel();
         let working_process_events = self.working_process.start();
         workspace_events.extend(
             self.workspace
@@ -372,10 +434,16 @@ pub struct WorkingRuntimeOutcome {
     pub workspace_events: WorkspaceEvents,
 }
 
+pub struct ExpandedFormOutcome {
+    pub workspace_events: WorkspaceEvents,
+    pub expanded_form_events: ExpandedFormEvents,
+}
+
 pub struct CommandDispatchOutcome {
     pub approval_outcome: ApprovalInputOutcome,
     pub workspace_events: WorkspaceEvents,
     pub persona_events: PersonaEvents,
+    pub expanded_form_events: ExpandedFormEvents,
 }
 
 impl CommandDispatchOutcome {
@@ -384,6 +452,7 @@ impl CommandDispatchOutcome {
             approval_outcome: ApprovalInputOutcome::none(),
             workspace_events: WorkspaceEvents::none(),
             persona_events: PersonaEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
         }
     }
 }

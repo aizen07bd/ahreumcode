@@ -2,6 +2,7 @@ mod app;
 mod approval;
 mod command;
 mod components;
+mod expanded_form;
 mod persona;
 mod scenes;
 mod state;
