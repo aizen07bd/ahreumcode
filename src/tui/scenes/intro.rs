@@ -8,6 +8,7 @@ use crate::product;
 
 use super::super::command::{CommandInputOutcome, CommandRegistry};
 use super::super::components::{command_surface, statusline, wordmark};
+use super::super::persona::MIN_PERSONA_TERMINAL_WIDTH;
 use super::super::state::TuiState;
 use super::super::style;
 use super::super::working_process::WorkingProcessEvents;
@@ -39,7 +40,7 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
             &mut state.command_surface,
             state.scene.as_str(),
         );
-        let _ = state.apply_command_dispatch(outcome.dispatch);
+        let _ = state.apply_command_dispatch(outcome.dispatch, current_terminal_width());
         return IntroAction {
             command_outcome: outcome,
             working_process_events: WorkingProcessEvents::none(),
@@ -79,7 +80,7 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
                 &mut state.command_surface,
                 state.scene.as_str(),
             );
-            let _ = state.apply_command_dispatch(outcome.dispatch);
+            let _ = state.apply_command_dispatch(outcome.dispatch, current_terminal_width());
             IntroAction {
                 command_outcome: outcome,
                 working_process_events: WorkingProcessEvents::none(),
@@ -199,4 +200,10 @@ fn centered_width(area: Rect, max_width: u16) -> Rect {
             Constraint::Min(0),
         ])
         .split(area)[1]
+}
+
+fn current_terminal_width() -> u16 {
+    crossterm::terminal::size()
+        .map(|(width, _)| width)
+        .unwrap_or(MIN_PERSONA_TERMINAL_WIDTH)
 }

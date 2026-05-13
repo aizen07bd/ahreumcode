@@ -26,6 +26,9 @@ pub enum WorkspaceItem {
     ManagerMessage {
         text: String,
     },
+    SystemNotice {
+        text: String,
+    },
     ActivityOutput {
         group: ActivityGroup,
         summary: String,
@@ -50,6 +53,7 @@ impl WorkspaceItem {
         match self {
             Self::UserPrompt { .. } => "user_prompt",
             Self::ManagerMessage { .. } => "manager_message",
+            Self::SystemNotice { .. } => "system_notice",
             Self::ActivityOutput { .. } => "activity_output",
             Self::EvidenceBlock { .. } => "evidence",
             Self::DiffSummary { .. } => "diff_summary",
@@ -61,6 +65,7 @@ impl WorkspaceItem {
         match self {
             Self::UserPrompt { .. } => 3,
             Self::ManagerMessage { .. } => 1,
+            Self::SystemNotice { .. } => 1,
             Self::ActivityOutput { .. } => 1,
             Self::EvidenceBlock { .. } => 2,
             Self::DiffSummary { expanded, .. } => {
@@ -93,6 +98,10 @@ impl WorkspaceBuffer {
 
     pub fn push_manager_message(&mut self, text: impl Into<String>) -> WorkspaceEvents {
         self.push_output(WorkspaceItem::ManagerMessage { text: text.into() })
+    }
+
+    pub fn push_system_notice(&mut self, text: impl Into<String>) -> WorkspaceEvents {
+        self.push_output(WorkspaceItem::SystemNotice { text: text.into() })
     }
 
     pub fn push_work_output(

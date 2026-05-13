@@ -15,6 +15,7 @@ use crate::logging::{LogEvent, Logger};
 
 use super::approval::ApprovalInputEvent;
 use super::command::{CommandDispatch, CommandInputEvent, CommandRegistry};
+use super::persona::{PersonaEvent, PersonaRendered};
 use super::scenes::epilogue::print_epilogue;
 use super::scenes::intro::{handle_intro_event, render_intro};
 use super::scenes::main::{handle_main_event, render_main};
@@ -29,6 +30,7 @@ const TUI_04_SCOPE: &str = "tui-04-command-area-basic-actions";
 const TUI_05_SCOPE: &str = "tui-05-approval-area";
 const TUI_06_SCOPE: &str = "tui-06-working-process-area";
 const TUI_07_SCOPE: &str = "tui-07-workspace-output-layout";
+const TUI_08_SCOPE: &str = "tui-08-persona-message-detail";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -56,6 +58,10 @@ const EVENT_WORKSPACE_PROMPT_BLOCK_ADDED: &str = "workspace_prompt_block_added";
 const EVENT_WORKSPACE_OUTPUT_ADDED: &str = "workspace_output_added";
 const EVENT_WORKSPACE_SCROLL_CHANGED: &str = "workspace_scroll_changed";
 const EVENT_WORKSPACE_RENDERED: &str = "workspace_rendered";
+const EVENT_PERSONA_PANEL_OPENED: &str = "persona_panel_opened";
+const EVENT_PERSONA_PANEL_CLOSED: &str = "persona_panel_closed";
+const EVENT_PERSONA_MESSAGE_RENDERED: &str = "persona_message_rendered";
+const EVENT_PERSONA_WIDTH_REJECTED: &str = "persona_width_rejected";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
@@ -267,6 +273,7 @@ impl TuiApp {
                 self.main_render_logged = true;
             }
             self.log_workspace_render_if_pending()?;
+            self.log_persona_render_if_pending()?;
 
             if event::poll(Duration::from_millis(100))? {
                 let Event::Key(key_event) = event::read()? else {
@@ -290,6 +297,7 @@ impl TuiApp {
                         self.log_approval_events(&action.approval_outcome.events)?;
                         self.log_working_process_events(&action.working_process_events.events)?;
                         self.log_workspace_events(&action.workspace_events.events)?;
+                        self.log_persona_events(&action.persona_events.events)?;
                         if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "main_prompt")?;
@@ -498,6 +506,52 @@ impl TuiApp {
             TUI_07_SCOPE,
             EVENT_WORKSPACE_RENDERED,
             json!({ "item_count": rendered.item_count, "scroll": rendered.scroll }),
+        ))
+    }
+
+    fn log_persona_events(&self, events: &[PersonaEvent]) -> io::Result<()> {
+        for event in events {
+            match event {
+                PersonaEvent::PanelOpened => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_08_SCOPE,
+                        EVENT_PERSONA_PANEL_OPENED,
+                        json!({ "scene": self.state.scene.as_str() }),
+                    ))?;
+                }
+                PersonaEvent::PanelClosed => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_08_SCOPE,
+                        EVENT_PERSONA_PANEL_CLOSED,
+                        json!({ "scene": self.state.scene.as_str() }),
+                    ))?;
+                }
+                PersonaEvent::WidthRejected { width, min_width } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_08_SCOPE,
+                        EVENT_PERSONA_WIDTH_REJECTED,
+                        json!({ "width": width, "min_width": min_width }),
+                    ))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn log_persona_render_if_pending(&mut self) -> io::Result<()> {
+        let Some(rendered) = self.state.take_persona_render_event() else {
+            return Ok(());
+        };
+
+        self.log_persona_message_rendered(rendered)
+    }
+
+    fn log_persona_message_rendered(&self, rendered: PersonaRendered) -> io::Result<()> {
+        self.logger.ui(LogEvent::ui(
+            TUI_08_SCOPE,
+            EVENT_PERSONA_MESSAGE_RENDERED,
+            json!({ "message_count": rendered.message_count }),
         ))
     }
 }

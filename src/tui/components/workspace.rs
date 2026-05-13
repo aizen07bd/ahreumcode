@@ -31,6 +31,12 @@ fn workspace_lines(workspace: &WorkspaceBuffer, width: u16) -> Vec<Line<'static>
                     Span::styled(text.clone(), style::panel()),
                 ]));
             }
+            WorkspaceItem::SystemNotice { text } => {
+                lines.push(Line::from(vec![
+                    Span::styled("[system] ", style::muted()),
+                    Span::styled(text.clone(), style::panel()),
+                ]));
+            }
             WorkspaceItem::ActivityOutput { group, summary } => {
                 lines.push(Line::from(vec![
                     Span::styled(group.label(), style::cyan()),

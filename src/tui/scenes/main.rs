@@ -9,8 +9,9 @@ use crate::product;
 use super::super::approval::ApprovalInputOutcome;
 use super::super::command::{CommandInputOutcome, CommandRegistry};
 use super::super::components::{
-    approval_surface, command_surface, statusline, working_process, workspace,
+    approval_surface, command_surface, persona, statusline, working_process, workspace,
 };
+use super::super::persona::{PersonaEvents, MIN_PERSONA_PANEL_WIDTH, MIN_PERSONA_TERMINAL_WIDTH};
 use super::super::state::TuiState;
 use super::super::style;
 use super::super::working_process::WorkingProcessEvents;
@@ -23,6 +24,7 @@ pub struct MainAction {
     pub approval_outcome: ApprovalInputOutcome,
     pub working_process_events: WorkingProcessEvents,
     pub workspace_events: WorkspaceEvents,
+    pub persona_events: PersonaEvents,
 }
 
 pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
@@ -35,7 +37,7 @@ pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
     );
 
     render_header(frame, layout.header);
-    render_workspace(frame, layout.workspace, state);
+    render_body(frame, layout.workspace, state);
     working_process::render_working_process(frame, layout.working_process, &state.working_process);
     render_prompt_composer(frame, layout.prompt, state);
     approval_surface::render_approval_surface(frame, layout.approval, &state.approval_surface);
@@ -57,6 +59,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             approval_outcome: ApprovalInputOutcome::none(),
             working_process_events: runtime_outcome.working_process_events,
             workspace_events: runtime_outcome.workspace_events,
+            persona_events: PersonaEvents::none(),
         };
     }
 
@@ -71,6 +74,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             approval_outcome,
             working_process_events: WorkingProcessEvents::none(),
             workspace_events,
+            persona_events: PersonaEvents::none(),
         };
     }
 
@@ -81,12 +85,14 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             &mut state.command_surface,
             state.scene.as_str(),
         );
-        let approval_outcome = state.apply_command_dispatch(command_outcome.dispatch);
+        let dispatch_outcome =
+            state.apply_command_dispatch(command_outcome.dispatch, current_terminal_width());
         return MainAction {
             command_outcome,
-            approval_outcome,
+            approval_outcome: dispatch_outcome.approval_outcome,
             working_process_events: WorkingProcessEvents::none(),
-            workspace_events: WorkspaceEvents::none(),
+            workspace_events: dispatch_outcome.workspace_events,
+            persona_events: dispatch_outcome.persona_events,
         };
     }
 
@@ -109,6 +115,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
                     approval_outcome: ApprovalInputOutcome::none(),
                     working_process_events: prompt_outcome.working_process_events,
                     workspace_events: prompt_outcome.workspace_events,
+                    persona_events: PersonaEvents::none(),
                 }
             }
         }
@@ -117,12 +124,14 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             approval_outcome: ApprovalInputOutcome::none(),
             working_process_events: WorkingProcessEvents::none(),
             workspace_events: state.scroll_workspace(-1),
+            persona_events: PersonaEvents::none(),
         },
         KeyCode::Down => MainAction {
             command_outcome: CommandInputOutcome::none(),
             approval_outcome: ApprovalInputOutcome::none(),
             working_process_events: WorkingProcessEvents::none(),
             workspace_events: state.scroll_workspace(1),
+            persona_events: PersonaEvents::none(),
         },
         _ => {
             let command_outcome = handle_prompt_event(
@@ -131,12 +140,14 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
                 &mut state.command_surface,
                 state.scene.as_str(),
             );
-            let approval_outcome = state.apply_command_dispatch(command_outcome.dispatch);
+            let dispatch_outcome =
+                state.apply_command_dispatch(command_outcome.dispatch, current_terminal_width());
             MainAction {
                 command_outcome,
-                approval_outcome,
+                approval_outcome: dispatch_outcome.approval_outcome,
                 working_process_events: WorkingProcessEvents::none(),
-                workspace_events: WorkspaceEvents::none(),
+                workspace_events: dispatch_outcome.workspace_events,
+                persona_events: dispatch_outcome.persona_events,
             }
         }
     }
@@ -149,6 +160,7 @@ impl MainAction {
             approval_outcome: ApprovalInputOutcome::none(),
             working_process_events: WorkingProcessEvents::none(),
             workspace_events: WorkspaceEvents::none(),
+            persona_events: PersonaEvents::none(),
         }
     }
 }
@@ -235,8 +247,20 @@ fn render_header(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(divider, rows[1]);
 }
 
-fn render_workspace(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    workspace::render_workspace_items(frame, area, &state.workspace);
+fn render_body(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    if !state.persona_panel.is_full() {
+        workspace::render_workspace_items(frame, area, &state.workspace);
+        return;
+    }
+
+    let panel_width = persona_panel_width(area.width);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(panel_width)])
+        .split(area);
+
+    workspace::render_workspace_items(frame, body[0], &state.workspace);
+    persona::render_persona_panel(frame, body[1], &state.persona);
 }
 
 fn render_prompt_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -253,4 +277,15 @@ fn render_prompt_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .block(Block::default().style(style::prompt_background()))
         .style(style::prompt_background());
     frame.render_widget(paragraph, area);
+}
+
+fn persona_panel_width(total_width: u16) -> u16 {
+    let candidate = (total_width / 4).max(MIN_PERSONA_PANEL_WIDTH);
+    candidate.min(total_width.saturating_sub(1))
+}
+
+fn current_terminal_width() -> u16 {
+    crossterm::terminal::size()
+        .map(|(width, _)| width)
+        .unwrap_or(MIN_PERSONA_TERMINAL_WIDTH)
 }

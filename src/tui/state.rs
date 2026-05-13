@@ -2,6 +2,10 @@ use crate::product;
 
 use super::approval::{open_approval_surface, ApprovalInputOutcome, ApprovalSurfaceState};
 use super::command::{CommandDispatch, CommandSurfaceState};
+use super::persona::{
+    PersonaBuffer, PersonaEvent, PersonaEvents, PersonaMessage, PersonaRendered,
+    MIN_PERSONA_TERMINAL_WIDTH,
+};
 use super::working_process::{
     WorkingFinishReason, WorkingProcessEvent, WorkingProcessEvents, WorkingProcessState,
 };
@@ -34,6 +38,7 @@ pub struct TuiState {
     pub working_process: WorkingProcessState,
     pub workspace: WorkspaceBuffer,
     pub persona_panel: PersonaPanelState,
+    pub persona: PersonaBuffer,
     pub status_shell_open: bool,
     pub should_quit: bool,
     pub runtime_status: RuntimeStatus,
@@ -52,6 +57,7 @@ impl TuiState {
             working_process: WorkingProcessState::default(),
             workspace: WorkspaceBuffer::default(),
             persona_panel: PersonaPanelState::Off,
+            persona: PersonaBuffer::default(),
             status_shell_open: false,
             should_quit: false,
             runtime_status: RuntimeStatus::new(workspace),
@@ -91,29 +97,31 @@ impl TuiState {
         self.start_working_process_for_prompt()
     }
 
-    pub fn apply_command_dispatch(&mut self, dispatch: CommandDispatch) -> ApprovalInputOutcome {
+    pub fn apply_command_dispatch(
+        &mut self,
+        dispatch: CommandDispatch,
+        terminal_width: u16,
+    ) -> CommandDispatchOutcome {
         match dispatch {
-            CommandDispatch::None => ApprovalInputOutcome::none(),
+            CommandDispatch::None => CommandDispatchOutcome::none(),
             CommandDispatch::ExitRequested => {
                 self.request_exit();
-                ApprovalInputOutcome::none()
+                CommandDispatchOutcome::none()
             }
             CommandDispatch::StatusShell => {
                 self.status_shell_open = true;
-                ApprovalInputOutcome::none()
+                CommandDispatchOutcome::none()
             }
             CommandDispatch::ApprovalShell => {
                 self.command_surface.close();
-                open_approval_surface(&mut self.approval_surface)
+                CommandDispatchOutcome {
+                    approval_outcome: open_approval_surface(&mut self.approval_surface),
+                    workspace_events: WorkspaceEvents::none(),
+                    persona_events: PersonaEvents::none(),
+                }
             }
-            CommandDispatch::PersonaFull => {
-                self.persona_panel = PersonaPanelState::Full;
-                ApprovalInputOutcome::none()
-            }
-            CommandDispatch::PersonaOff | CommandDispatch::PersonaClose => {
-                self.persona_panel = PersonaPanelState::Off;
-                ApprovalInputOutcome::none()
-            }
+            CommandDispatch::PersonaFull => self.open_persona_full(terminal_width),
+            CommandDispatch::PersonaOff | CommandDispatch::PersonaClose => self.close_persona(),
         }
     }
 
@@ -157,6 +165,51 @@ impl TuiState {
         self.workspace.take_render_event()
     }
 
+    pub fn take_persona_render_event(&mut self) -> Option<PersonaRendered> {
+        self.persona.take_render_event()
+    }
+
+    fn open_persona_full(&mut self, terminal_width: u16) -> CommandDispatchOutcome {
+        if terminal_width < MIN_PERSONA_TERMINAL_WIDTH {
+            let workspace_events = self.workspace.push_system_notice(format!(
+                "페르소나 메시지는 터미널 가로폭 {} 이상에서만 동작합니다.",
+                MIN_PERSONA_TERMINAL_WIDTH
+            ));
+            return CommandDispatchOutcome {
+                approval_outcome: ApprovalInputOutcome::none(),
+                workspace_events,
+                persona_events: PersonaEvents::single(PersonaEvent::WidthRejected {
+                    width: terminal_width,
+                    min_width: MIN_PERSONA_TERMINAL_WIDTH,
+                }),
+            };
+        }
+
+        if self.persona_panel == PersonaPanelState::Full {
+            return CommandDispatchOutcome::none();
+        }
+
+        self.persona_panel = PersonaPanelState::Full;
+        CommandDispatchOutcome {
+            approval_outcome: ApprovalInputOutcome::none(),
+            workspace_events: WorkspaceEvents::none(),
+            persona_events: PersonaEvents::single(PersonaEvent::PanelOpened),
+        }
+    }
+
+    fn close_persona(&mut self) -> CommandDispatchOutcome {
+        if self.persona_panel == PersonaPanelState::Off {
+            return CommandDispatchOutcome::none();
+        }
+
+        self.persona_panel = PersonaPanelState::Off;
+        CommandDispatchOutcome {
+            approval_outcome: ApprovalInputOutcome::none(),
+            workspace_events: WorkspaceEvents::none(),
+            persona_events: PersonaEvents::single(PersonaEvent::PanelClosed),
+        }
+    }
+
     fn start_working_process_for_prompt(&mut self) -> PromptSubmitOutcome {
         let prompt = self.pending_prompt.clone().unwrap_or_default();
         let mut workspace_events = self.workspace.push_user_prompt(prompt);
@@ -168,6 +221,11 @@ impl TuiState {
             self.workspace
                 .push_manager_message("요청을 작업 흐름으로 정리했습니다."),
         );
+        if self.persona_panel == PersonaPanelState::Full {
+            self.persona.push_message(PersonaMessage::team_lead(
+                "요청을 확인했습니다. 작업 흐름은 왼쪽 기록과 분리해서 지켜보겠습니다.",
+            ));
+        }
 
         PromptSubmitOutcome {
             working_process_events,
@@ -229,6 +287,12 @@ pub enum PersonaPanelState {
     Full,
 }
 
+impl PersonaPanelState {
+    pub fn is_full(self) -> bool {
+        self == Self::Full
+    }
+}
+
 pub struct PromptSubmitOutcome {
     pub working_process_events: WorkingProcessEvents,
     pub workspace_events: WorkspaceEvents,
@@ -246,6 +310,22 @@ impl PromptSubmitOutcome {
 pub struct WorkingRuntimeOutcome {
     pub working_process_events: WorkingProcessEvents,
     pub workspace_events: WorkspaceEvents,
+}
+
+pub struct CommandDispatchOutcome {
+    pub approval_outcome: ApprovalInputOutcome,
+    pub workspace_events: WorkspaceEvents,
+    pub persona_events: PersonaEvents,
+}
+
+impl CommandDispatchOutcome {
+    pub fn none() -> Self {
+        Self {
+            approval_outcome: ApprovalInputOutcome::none(),
+            workspace_events: WorkspaceEvents::none(),
+            persona_events: PersonaEvents::none(),
+        }
+    }
 }
 
 pub struct RuntimeStatus {
