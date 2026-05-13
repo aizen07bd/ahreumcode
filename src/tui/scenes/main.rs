@@ -84,6 +84,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             &mut state.main_input,
             &mut state.command_surface,
             state.scene.as_str(),
+            state.working_process.is_active(),
         );
         let dispatch_outcome =
             state.apply_command_dispatch(command_outcome.dispatch, current_terminal_width());
@@ -139,6 +140,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
                 &mut state.main_input,
                 &mut state.command_surface,
                 state.scene.as_str(),
+                state.working_process.is_active(),
             );
             let dispatch_outcome =
                 state.apply_command_dispatch(command_outcome.dispatch, current_terminal_width());

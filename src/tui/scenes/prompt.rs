@@ -9,11 +9,12 @@ pub fn handle_prompt_event(
     input: &mut String,
     surface: &mut CommandSurfaceState,
     scene: &str,
+    runtime_busy: bool,
 ) -> CommandInputOutcome {
     let registry = CommandRegistry::new();
 
     if surface.open {
-        return handle_command_event(event, input, surface, &registry, scene);
+        return handle_command_event(event, input, surface, &registry, scene, runtime_busy);
     }
 
     match event.code {
@@ -44,7 +45,12 @@ fn handle_command_event(
     surface: &mut CommandSurfaceState,
     registry: &CommandRegistry,
     scene: &str,
+    runtime_busy: bool,
 ) -> CommandInputOutcome {
+    if surface.stepped_picker.is_some() {
+        return handle_stepped_picker_event(event, input, surface);
+    }
+
     match event.code {
         KeyCode::Esc => {
             surface.close();
@@ -62,7 +68,7 @@ fn handle_command_event(
             CommandInputOutcome::none()
         }
         KeyCode::Enter => {
-            let outcome = confirm_command(surface, registry, scene);
+            let outcome = confirm_command(surface, registry, scene, runtime_busy);
             if !outcome.events.is_empty() {
                 input.clear();
             }
@@ -79,6 +85,57 @@ fn handle_command_event(
         KeyCode::Char(value) => {
             input.push(value);
             update_query(input, surface)
+        }
+        _ => CommandInputOutcome::none(),
+    }
+}
+
+fn handle_stepped_picker_event(
+    event: KeyEvent,
+    input: &mut String,
+    surface: &mut CommandSurfaceState,
+) -> CommandInputOutcome {
+    match event.code {
+        KeyCode::Esc | KeyCode::Backspace => {
+            surface.back_picker_step();
+            CommandInputOutcome::none()
+        }
+        KeyCode::Up => {
+            let Some(selected) = surface.move_picker_selection(-1) else {
+                return CommandInputOutcome::none();
+            };
+            let Some(picker) = surface.stepped_picker.as_ref() else {
+                return CommandInputOutcome::none();
+            };
+            CommandInputOutcome {
+                events: vec![CommandInputEvent::SteppedPickerSelectionChanged {
+                    command: picker.command(),
+                    selected,
+                }],
+                dispatch: super::super::command::CommandDispatch::None,
+            }
+        }
+        KeyCode::Down => {
+            let Some(selected) = surface.move_picker_selection(1) else {
+                return CommandInputOutcome::none();
+            };
+            let Some(picker) = surface.stepped_picker.as_ref() else {
+                return CommandInputOutcome::none();
+            };
+            CommandInputOutcome {
+                events: vec![CommandInputEvent::SteppedPickerSelectionChanged {
+                    command: picker.command(),
+                    selected,
+                }],
+                dispatch: super::super::command::CommandDispatch::None,
+            }
+        }
+        KeyCode::Enter => {
+            let outcome = super::super::command::confirm_picker_selection(surface);
+            if !outcome.events.is_empty() {
+                input.clear();
+            }
+            outcome
         }
         _ => CommandInputOutcome::none(),
     }

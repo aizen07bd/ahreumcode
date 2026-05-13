@@ -31,6 +31,7 @@ const TUI_05_SCOPE: &str = "tui-05-approval-area";
 const TUI_06_SCOPE: &str = "tui-06-working-process-area";
 const TUI_07_SCOPE: &str = "tui-07-workspace-output-layout";
 const TUI_08_SCOPE: &str = "tui-08-persona-message-detail";
+const TUI_09_SCOPE: &str = "tui-09-complex-commands";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -47,6 +48,10 @@ const EVENT_COMMAND_SURFACE_OPENED: &str = "command_surface_opened";
 const EVENT_COMMAND_FILTER_CHANGED: &str = "command_filter_changed";
 const EVENT_COMMAND_SELECTED: &str = "command_selected";
 const EVENT_COMMAND_ACTION_DISPATCHED: &str = "command_action_dispatched";
+const EVENT_COMMAND_AVAILABILITY_CHECKED: &str = "command_availability_checked";
+const EVENT_STEPPED_PICKER_OPENED: &str = "stepped_picker_opened";
+const EVENT_STEPPED_PICKER_SELECTION_CHANGED: &str = "stepped_picker_selection_changed";
+const EVENT_STEPPED_PICKER_CONFIRMED: &str = "stepped_picker_confirmed";
 const EVENT_APPROVAL_SURFACE_OPENED: &str = "approval_surface_opened";
 const EVENT_APPROVAL_OPTION_SELECTED: &str = "approval_option_selected";
 const EVENT_APPROVAL_RESULT_RECORDED: &str = "approval_result_recorded";
@@ -388,6 +393,42 @@ impl TuiApp {
                         TUI_04_SCOPE,
                         EVENT_COMMAND_ACTION_DISPATCHED,
                         data,
+                    ))?;
+                }
+                CommandInputEvent::CommandAvailabilityChecked {
+                    command,
+                    allowed,
+                    reason,
+                } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_09_SCOPE,
+                        EVENT_COMMAND_AVAILABILITY_CHECKED,
+                        json!({
+                            "command": command.as_str(),
+                            "allowed": allowed,
+                            "reason": reason,
+                        }),
+                    ))?;
+                }
+                CommandInputEvent::SteppedPickerOpened { command, step } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_09_SCOPE,
+                        EVENT_STEPPED_PICKER_OPENED,
+                        json!({ "command": command.as_str(), "step": step }),
+                    ))?;
+                }
+                CommandInputEvent::SteppedPickerSelectionChanged { command, selected } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_09_SCOPE,
+                        EVENT_STEPPED_PICKER_SELECTION_CHANGED,
+                        json!({ "command": command.as_str(), "selected": selected }),
+                    ))?;
+                }
+                CommandInputEvent::SteppedPickerConfirmed { command, selected } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_09_SCOPE,
+                        EVENT_STEPPED_PICKER_CONFIRMED,
+                        json!({ "command": command.as_str(), "selected": selected }),
                     ))?;
                 }
             }

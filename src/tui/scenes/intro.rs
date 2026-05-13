@@ -39,6 +39,7 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
             &mut state.intro_input,
             &mut state.command_surface,
             state.scene.as_str(),
+            false,
         );
         let _ = state.apply_command_dispatch(outcome.dispatch, current_terminal_width());
         return IntroAction {
@@ -79,6 +80,7 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
                 &mut state.intro_input,
                 &mut state.command_surface,
                 state.scene.as_str(),
+                false,
             );
             let _ = state.apply_command_dispatch(outcome.dispatch, current_terminal_width());
             IntroAction {

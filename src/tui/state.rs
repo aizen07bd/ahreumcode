@@ -120,6 +120,19 @@ impl TuiState {
                     persona_events: PersonaEvents::none(),
                 }
             }
+            CommandDispatch::ModeGuide => self.set_mode("Guide"),
+            CommandDispatch::ModeCrew => self.set_mode("Crew"),
+            CommandDispatch::ModePilot => self.set_mode("Pilot"),
+            CommandDispatch::ProviderLmStudio => self.set_provider(product::DEFAULT_PROVIDER),
+            CommandDispatch::ModelGemma => self.set_model(product::DEFAULT_MODEL),
+            CommandDispatch::DocsInitPrepare => self.prepare_deferred_command(
+                "/docs-init",
+                "문서 템플릿 설정은 expanded form 단계에서 실행됩니다.",
+            ),
+            CommandDispatch::InitPrepare => self.prepare_deferred_command(
+                "/init",
+                "AGENTS.md 설정은 expanded form 단계에서 실행됩니다.",
+            ),
             CommandDispatch::PersonaFull => self.open_persona_full(terminal_width),
             CommandDispatch::PersonaOff | CommandDispatch::PersonaClose => self.close_persona(),
         }
@@ -207,6 +220,53 @@ impl TuiState {
             approval_outcome: ApprovalInputOutcome::none(),
             workspace_events: WorkspaceEvents::none(),
             persona_events: PersonaEvents::single(PersonaEvent::PanelClosed),
+        }
+    }
+
+    fn set_mode(&mut self, mode: &'static str) -> CommandDispatchOutcome {
+        self.runtime_status.mode = mode;
+        CommandDispatchOutcome {
+            approval_outcome: ApprovalInputOutcome::none(),
+            workspace_events: self
+                .workspace
+                .push_system_notice(format!("mode set to {mode}")),
+            persona_events: PersonaEvents::none(),
+        }
+    }
+
+    fn set_provider(&mut self, provider: &'static str) -> CommandDispatchOutcome {
+        self.runtime_status.provider = provider;
+        CommandDispatchOutcome {
+            approval_outcome: ApprovalInputOutcome::none(),
+            workspace_events: self
+                .workspace
+                .push_system_notice(format!("provider set to {provider}")),
+            persona_events: PersonaEvents::none(),
+        }
+    }
+
+    fn set_model(&mut self, model: &'static str) -> CommandDispatchOutcome {
+        self.runtime_status.model = model;
+        CommandDispatchOutcome {
+            approval_outcome: ApprovalInputOutcome::none(),
+            workspace_events: self
+                .workspace
+                .push_system_notice(format!("model set to {model}")),
+            persona_events: PersonaEvents::none(),
+        }
+    }
+
+    fn prepare_deferred_command(
+        &mut self,
+        command: &'static str,
+        message: &'static str,
+    ) -> CommandDispatchOutcome {
+        CommandDispatchOutcome {
+            approval_outcome: ApprovalInputOutcome::none(),
+            workspace_events: self
+                .workspace
+                .push_system_notice(format!("{command}: {message}")),
+            persona_events: PersonaEvents::none(),
         }
     }
 
