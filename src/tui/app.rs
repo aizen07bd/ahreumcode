@@ -20,6 +20,7 @@ use super::scenes::intro::{handle_intro_event, render_intro};
 use super::scenes::main::{handle_main_event, render_main};
 use super::state::{Scene, TuiState};
 use super::working_process::WorkingProcessEvent;
+use super::workspace::{WorkspaceEvent, WorkspaceRendered};
 
 const TUI_01_SCOPE: &str = "tui-01-intro-scene";
 const TUI_02_SCOPE: &str = "tui-02-epilogue-scene";
@@ -27,6 +28,7 @@ const TUI_03_SCOPE: &str = "tui-03-main-scene-layout";
 const TUI_04_SCOPE: &str = "tui-04-command-area-basic-actions";
 const TUI_05_SCOPE: &str = "tui-05-approval-area";
 const TUI_06_SCOPE: &str = "tui-06-working-process-area";
+const TUI_07_SCOPE: &str = "tui-07-workspace-output-layout";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -50,6 +52,10 @@ const EVENT_WORKING_PROCESS_STARTED: &str = "working_process_started";
 const EVENT_WORKING_PHASE_CHANGED: &str = "working_phase_changed";
 const EVENT_WORKING_PROCESS_CANCEL_HINT_RENDERED: &str = "working_process_cancel_hint_rendered";
 const EVENT_WORKING_PROCESS_FINISHED: &str = "working_process_finished";
+const EVENT_WORKSPACE_PROMPT_BLOCK_ADDED: &str = "workspace_prompt_block_added";
+const EVENT_WORKSPACE_OUTPUT_ADDED: &str = "workspace_output_added";
+const EVENT_WORKSPACE_SCROLL_CHANGED: &str = "workspace_scroll_changed";
+const EVENT_WORKSPACE_RENDERED: &str = "workspace_rendered";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
@@ -240,8 +246,9 @@ impl TuiApp {
 
         while !self.state.should_quit {
             if matches!(self.state.scene, Scene::Main) {
-                let working_events = self.state.tick_working_process();
-                self.log_working_process_events(&working_events.events)?;
+                let runtime_outcome = self.state.tick_working_process();
+                self.log_working_process_events(&runtime_outcome.working_process_events.events)?;
+                self.log_workspace_events(&runtime_outcome.workspace_events.events)?;
             }
 
             terminal.draw(|frame| match self.state.scene {
@@ -259,6 +266,7 @@ impl TuiApp {
                 log_main_scene_rendered(&self.logger, self.run_mode)?;
                 self.main_render_logged = true;
             }
+            self.log_workspace_render_if_pending()?;
 
             if event::poll(Duration::from_millis(100))? {
                 let Event::Key(key_event) = event::read()? else {
@@ -269,6 +277,7 @@ impl TuiApp {
                         let action = handle_intro_event(key_event, &mut self.state);
                         self.log_command_events(&action.command_outcome.events)?;
                         self.log_working_process_events(&action.working_process_events.events)?;
+                        self.log_workspace_events(&action.workspace_events.events)?;
                         if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "intro_prompt")?;
@@ -280,6 +289,7 @@ impl TuiApp {
                         self.log_command_events(&action.command_outcome.events)?;
                         self.log_approval_events(&action.approval_outcome.events)?;
                         self.log_working_process_events(&action.working_process_events.events)?;
+                        self.log_workspace_events(&action.workspace_events.events)?;
                         if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "main_prompt")?;
@@ -443,6 +453,52 @@ impl TuiApp {
         }
 
         Ok(())
+    }
+
+    fn log_workspace_events(&self, events: &[WorkspaceEvent]) -> io::Result<()> {
+        for event in events {
+            match event {
+                WorkspaceEvent::PromptBlockAdded => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_07_SCOPE,
+                        EVENT_WORKSPACE_PROMPT_BLOCK_ADDED,
+                        json!({ "scene": self.state.scene.as_str() }),
+                    ))?;
+                }
+                WorkspaceEvent::OutputAdded { item_type } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_07_SCOPE,
+                        EVENT_WORKSPACE_OUTPUT_ADDED,
+                        json!({ "item_type": item_type }),
+                    ))?;
+                }
+                WorkspaceEvent::ScrollChanged { scroll } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_07_SCOPE,
+                        EVENT_WORKSPACE_SCROLL_CHANGED,
+                        json!({ "scroll": scroll }),
+                    ))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn log_workspace_render_if_pending(&mut self) -> io::Result<()> {
+        let Some(rendered) = self.state.take_workspace_render_event() else {
+            return Ok(());
+        };
+
+        self.log_workspace_rendered(rendered)
+    }
+
+    fn log_workspace_rendered(&self, rendered: WorkspaceRendered) -> io::Result<()> {
+        self.logger.ui(LogEvent::ui(
+            TUI_07_SCOPE,
+            EVENT_WORKSPACE_RENDERED,
+            json!({ "item_count": rendered.item_count, "scroll": rendered.scroll }),
+        ))
     }
 }
 

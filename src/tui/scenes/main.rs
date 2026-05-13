@@ -8,10 +8,13 @@ use crate::product;
 
 use super::super::approval::ApprovalInputOutcome;
 use super::super::command::{CommandInputOutcome, CommandRegistry};
-use super::super::components::{approval_surface, command_surface, statusline, working_process};
+use super::super::components::{
+    approval_surface, command_surface, statusline, working_process, workspace,
+};
 use super::super::state::TuiState;
 use super::super::style;
 use super::super::working_process::WorkingProcessEvents;
+use super::super::workspace::WorkspaceEvents;
 use super::approval::handle_approval_event;
 use super::prompt::handle_prompt_event;
 
@@ -19,6 +22,7 @@ pub struct MainAction {
     pub command_outcome: CommandInputOutcome,
     pub approval_outcome: ApprovalInputOutcome,
     pub working_process_events: WorkingProcessEvents,
+    pub workspace_events: WorkspaceEvents,
 }
 
 pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
@@ -47,22 +51,26 @@ pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
 
 pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
     if state.working_process.is_active() && matches!(event.code, KeyCode::Esc) {
+        let runtime_outcome = state.cancel_working_process();
         return MainAction {
             command_outcome: CommandInputOutcome::none(),
             approval_outcome: ApprovalInputOutcome::none(),
-            working_process_events: state.cancel_working_process(),
+            working_process_events: runtime_outcome.working_process_events,
+            workspace_events: runtime_outcome.workspace_events,
         };
     }
 
     if state.approval_surface.open && !event.modifiers.contains(KeyModifiers::CONTROL) {
         let approval_outcome = handle_approval_event(event, &mut state.approval_surface);
+        let mut workspace_events = WorkspaceEvents::none();
         if let Some(workspace_line) = &approval_outcome.workspace_line {
-            state.record_workspace_line(workspace_line.clone());
+            workspace_events.extend(state.record_workspace_line(workspace_line.clone()));
         }
         return MainAction {
             command_outcome: CommandInputOutcome::none(),
             approval_outcome,
             working_process_events: WorkingProcessEvents::none(),
+            workspace_events,
         };
     }
 
@@ -78,6 +86,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             command_outcome,
             approval_outcome,
             working_process_events: WorkingProcessEvents::none(),
+            workspace_events: WorkspaceEvents::none(),
         };
     }
 
@@ -94,13 +103,27 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             if state.main_input.trim().is_empty() {
                 MainAction::none()
             } else {
+                let prompt_outcome = state.start_working_process();
                 MainAction {
                     command_outcome: CommandInputOutcome::none(),
                     approval_outcome: ApprovalInputOutcome::none(),
-                    working_process_events: state.start_working_process(),
+                    working_process_events: prompt_outcome.working_process_events,
+                    workspace_events: prompt_outcome.workspace_events,
                 }
             }
         }
+        KeyCode::Up => MainAction {
+            command_outcome: CommandInputOutcome::none(),
+            approval_outcome: ApprovalInputOutcome::none(),
+            working_process_events: WorkingProcessEvents::none(),
+            workspace_events: state.scroll_workspace(-1),
+        },
+        KeyCode::Down => MainAction {
+            command_outcome: CommandInputOutcome::none(),
+            approval_outcome: ApprovalInputOutcome::none(),
+            working_process_events: WorkingProcessEvents::none(),
+            workspace_events: state.scroll_workspace(1),
+        },
         _ => {
             let command_outcome = handle_prompt_event(
                 event,
@@ -113,6 +136,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
                 command_outcome,
                 approval_outcome,
                 working_process_events: WorkingProcessEvents::none(),
+                workspace_events: WorkspaceEvents::none(),
             }
         }
     }
@@ -124,6 +148,7 @@ impl MainAction {
             command_outcome: CommandInputOutcome::none(),
             approval_outcome: ApprovalInputOutcome::none(),
             working_process_events: WorkingProcessEvents::none(),
+            workspace_events: WorkspaceEvents::none(),
         }
     }
 }
@@ -211,14 +236,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_workspace(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let lines = state
-        .workspace_entries
-        .iter()
-        .map(|entry| Line::from(vec![Span::styled(entry.text.as_str(), style::panel())]))
-        .collect::<Vec<_>>();
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, area);
+    workspace::render_workspace_items(frame, area, &state.workspace);
 }
 
 fn render_prompt_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {

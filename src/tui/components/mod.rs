@@ -3,3 +3,4 @@ pub mod command_surface;
 pub mod statusline;
 pub mod wordmark;
 pub mod working_process;
+pub mod workspace;

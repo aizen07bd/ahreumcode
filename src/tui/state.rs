@@ -2,7 +2,10 @@ use crate::product;
 
 use super::approval::{open_approval_surface, ApprovalInputOutcome, ApprovalSurfaceState};
 use super::command::{CommandDispatch, CommandSurfaceState};
-use super::working_process::{WorkingProcessEvents, WorkingProcessState};
+use super::working_process::{
+    WorkingFinishReason, WorkingProcessEvent, WorkingProcessEvents, WorkingProcessState,
+};
+use super::workspace::{ActivityGroup, WorkspaceBuffer, WorkspaceEvents, WorkspaceRendered};
 
 #[derive(Clone, Copy)]
 pub enum Scene {
@@ -29,7 +32,7 @@ pub struct TuiState {
     pub command_surface: CommandSurfaceState,
     pub approval_surface: ApprovalSurfaceState,
     pub working_process: WorkingProcessState,
-    pub workspace_entries: Vec<WorkspaceEntry>,
+    pub workspace: WorkspaceBuffer,
     pub persona_panel: PersonaPanelState,
     pub status_shell_open: bool,
     pub should_quit: bool,
@@ -47,7 +50,7 @@ impl TuiState {
             command_surface: CommandSurfaceState::default(),
             approval_surface: ApprovalSurfaceState::default(),
             working_process: WorkingProcessState::default(),
-            workspace_entries: Vec::new(),
+            workspace: WorkspaceBuffer::default(),
             persona_panel: PersonaPanelState::Off,
             status_shell_open: false,
             should_quit: false,
@@ -74,10 +77,10 @@ impl TuiState {
         self.should_quit = true;
     }
 
-    pub fn enter_main_with_prompt(&mut self) -> WorkingProcessEvents {
+    pub fn enter_main_with_prompt(&mut self) -> PromptSubmitOutcome {
         let prompt = self.intro_input.trim().to_owned();
         if prompt.is_empty() {
-            return WorkingProcessEvents::none();
+            return PromptSubmitOutcome::none();
         }
 
         self.pending_prompt = Some(prompt);
@@ -85,7 +88,7 @@ impl TuiState {
         self.main_input.clear();
         self.command_surface.close();
         self.scene = Scene::Main;
-        self.working_process.start()
+        self.start_working_process_for_prompt()
     }
 
     pub fn apply_command_dispatch(&mut self, dispatch: CommandDispatch) -> ApprovalInputOutcome {
@@ -114,33 +117,109 @@ impl TuiState {
         }
     }
 
-    pub fn record_workspace_line(&mut self, text: String) {
-        self.workspace_entries.push(WorkspaceEntry { text });
+    pub fn record_workspace_line(&mut self, text: String) -> WorkspaceEvents {
+        self.workspace.push_result(text)
     }
 
-    pub fn start_working_process(&mut self) -> WorkingProcessEvents {
+    pub fn start_working_process(&mut self) -> PromptSubmitOutcome {
+        let prompt = self.main_input.trim().to_owned();
+        if prompt.is_empty() {
+            return PromptSubmitOutcome::none();
+        }
+
+        self.pending_prompt = Some(prompt);
+        self.start_working_process_for_prompt()
+    }
+
+    pub fn tick_working_process(&mut self) -> WorkingRuntimeOutcome {
+        let working_process_events = self.working_process.tick();
+        let workspace_events = self.record_working_workspace_items(&working_process_events);
+        WorkingRuntimeOutcome {
+            working_process_events,
+            workspace_events,
+        }
+    }
+
+    pub fn cancel_working_process(&mut self) -> WorkingRuntimeOutcome {
+        let working_process_events = self.working_process.cancel();
+        let workspace_events = self.record_working_workspace_items(&working_process_events);
+        WorkingRuntimeOutcome {
+            working_process_events,
+            workspace_events,
+        }
+    }
+
+    pub fn scroll_workspace(&mut self, delta: isize) -> WorkspaceEvents {
+        self.workspace.scroll(delta)
+    }
+
+    pub fn take_workspace_render_event(&mut self) -> Option<WorkspaceRendered> {
+        self.workspace.take_render_event()
+    }
+
+    fn start_working_process_for_prompt(&mut self) -> PromptSubmitOutcome {
+        let prompt = self.pending_prompt.clone().unwrap_or_default();
+        let mut workspace_events = self.workspace.push_user_prompt(prompt);
         self.main_input.clear();
         self.command_surface.close();
         self.approval_surface.close();
-        self.working_process.start()
-    }
+        let working_process_events = self.working_process.start();
+        workspace_events.extend(
+            self.workspace
+                .push_manager_message("요청을 작업 흐름으로 정리했습니다."),
+        );
 
-    pub fn tick_working_process(&mut self) -> WorkingProcessEvents {
-        let events = self.working_process.tick();
-        self.record_working_workspace_line(&events);
-        events
-    }
-
-    pub fn cancel_working_process(&mut self) -> WorkingProcessEvents {
-        let events = self.working_process.cancel();
-        self.record_working_workspace_line(&events);
-        events
-    }
-
-    fn record_working_workspace_line(&mut self, events: &WorkingProcessEvents) {
-        if let Some(workspace_line) = &events.workspace_line {
-            self.record_workspace_line(workspace_line.clone());
+        PromptSubmitOutcome {
+            working_process_events,
+            workspace_events,
         }
+    }
+
+    fn record_working_workspace_items(&mut self, events: &WorkingProcessEvents) -> WorkspaceEvents {
+        let mut workspace_events = WorkspaceEvents::none();
+        let finish_reason = events.events.iter().find_map(|event| match event {
+            WorkingProcessEvent::Finished { reason } => Some(*reason),
+            _ => None,
+        });
+
+        if finish_reason == Some(WorkingFinishReason::Completed) {
+            // tui-07 workspace render sample only.
+            // Remove this auto-injection block when LLM/tool events are connected.
+            workspace_events.extend(
+                self.workspace
+                    .push_work_output(ActivityGroup::Explore, "evidence block shell ready"),
+            );
+            workspace_events.extend(
+                self.workspace
+                    .push_work_output(ActivityGroup::Change, "diff summary shell ready"),
+            );
+            workspace_events.extend(
+                self.workspace
+                    .push_work_output(ActivityGroup::Execute, "execution output row shell ready"),
+            );
+            workspace_events.extend(self.workspace.push_work_output(
+                ActivityGroup::Configure,
+                "configuration output row shell ready",
+            ));
+            workspace_events.extend(
+                self.workspace
+                    .push_work_output(ActivityGroup::Ask, "response layout shell prepared"),
+            );
+            workspace_events.extend(self.workspace.push_evidence(
+                "read/search evidence shell",
+                "tool evidence will appear here after tool integration",
+            ));
+            workspace_events.extend(self.workspace.push_diff_summary(
+                "workspace/change-summary-shell",
+                0,
+                0,
+            ));
+        }
+
+        if let Some(workspace_line) = &events.workspace_line {
+            workspace_events.extend(self.workspace.push_result(workspace_line.clone()));
+        }
+        workspace_events
     }
 }
 
@@ -150,8 +229,23 @@ pub enum PersonaPanelState {
     Full,
 }
 
-pub struct WorkspaceEntry {
-    pub text: String,
+pub struct PromptSubmitOutcome {
+    pub working_process_events: WorkingProcessEvents,
+    pub workspace_events: WorkspaceEvents,
+}
+
+impl PromptSubmitOutcome {
+    pub fn none() -> Self {
+        Self {
+            working_process_events: WorkingProcessEvents::none(),
+            workspace_events: WorkspaceEvents::none(),
+        }
+    }
+}
+
+pub struct WorkingRuntimeOutcome {
+    pub working_process_events: WorkingProcessEvents,
+    pub workspace_events: WorkspaceEvents,
 }
 
 pub struct RuntimeStatus {

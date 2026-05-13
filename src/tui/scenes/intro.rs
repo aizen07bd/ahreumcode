@@ -11,11 +11,13 @@ use super::super::components::{command_surface, statusline, wordmark};
 use super::super::state::TuiState;
 use super::super::style;
 use super::super::working_process::WorkingProcessEvents;
+use super::super::workspace::WorkspaceEvents;
 use super::prompt::handle_prompt_event;
 
 pub struct IntroAction {
     pub command_outcome: CommandInputOutcome,
     pub working_process_events: WorkingProcessEvents,
+    pub workspace_events: WorkspaceEvents,
 }
 
 pub fn render_intro(frame: &mut Frame<'_>, state: &TuiState) {
@@ -41,6 +43,7 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
         return IntroAction {
             command_outcome: outcome,
             working_process_events: WorkingProcessEvents::none(),
+            workspace_events: WorkspaceEvents::none(),
         };
     }
 
@@ -50,6 +53,7 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
             IntroAction {
                 command_outcome: CommandInputOutcome::none(),
                 working_process_events: WorkingProcessEvents::none(),
+                workspace_events: WorkspaceEvents::none(),
             }
         }
         KeyCode::Esc => {
@@ -57,13 +61,15 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
             IntroAction {
                 command_outcome: CommandInputOutcome::none(),
                 working_process_events: WorkingProcessEvents::none(),
+                workspace_events: WorkspaceEvents::none(),
             }
         }
         KeyCode::Enter => {
-            let working_process_events = state.enter_main_with_prompt();
+            let prompt_outcome = state.enter_main_with_prompt();
             IntroAction {
                 command_outcome: CommandInputOutcome::none(),
-                working_process_events,
+                working_process_events: prompt_outcome.working_process_events,
+                workspace_events: prompt_outcome.workspace_events,
             }
         }
         _ => {
@@ -77,6 +83,7 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
             IntroAction {
                 command_outcome: outcome,
                 working_process_events: WorkingProcessEvents::none(),
+                workspace_events: WorkspaceEvents::none(),
             }
         }
     }
