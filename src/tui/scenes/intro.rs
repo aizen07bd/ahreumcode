@@ -10,10 +10,12 @@ use super::super::command::{CommandInputOutcome, CommandRegistry};
 use super::super::components::{command_surface, statusline, wordmark};
 use super::super::state::TuiState;
 use super::super::style;
+use super::super::working_process::WorkingProcessEvents;
 use super::prompt::handle_prompt_event;
 
 pub struct IntroAction {
     pub command_outcome: CommandInputOutcome,
+    pub working_process_events: WorkingProcessEvents,
 }
 
 pub fn render_intro(frame: &mut Frame<'_>, state: &TuiState) {
@@ -38,6 +40,7 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
         let _ = state.apply_command_dispatch(outcome.dispatch);
         return IntroAction {
             command_outcome: outcome,
+            working_process_events: WorkingProcessEvents::none(),
         };
     }
 
@@ -46,18 +49,21 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
             state.should_quit = true;
             IntroAction {
                 command_outcome: CommandInputOutcome::none(),
+                working_process_events: WorkingProcessEvents::none(),
             }
         }
         KeyCode::Esc => {
             state.should_quit = true;
             IntroAction {
                 command_outcome: CommandInputOutcome::none(),
+                working_process_events: WorkingProcessEvents::none(),
             }
         }
         KeyCode::Enter => {
-            state.enter_main_with_prompt();
+            let working_process_events = state.enter_main_with_prompt();
             IntroAction {
                 command_outcome: CommandInputOutcome::none(),
+                working_process_events,
             }
         }
         _ => {
@@ -70,6 +76,7 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
             let _ = state.apply_command_dispatch(outcome.dispatch);
             IntroAction {
                 command_outcome: outcome,
+                working_process_events: WorkingProcessEvents::none(),
             }
         }
     }

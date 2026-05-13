@@ -8,15 +8,17 @@ use crate::product;
 
 use super::super::approval::ApprovalInputOutcome;
 use super::super::command::{CommandInputOutcome, CommandRegistry};
-use super::super::components::{approval_surface, command_surface, statusline};
+use super::super::components::{approval_surface, command_surface, statusline, working_process};
 use super::super::state::TuiState;
 use super::super::style;
+use super::super::working_process::WorkingProcessEvents;
 use super::approval::handle_approval_event;
 use super::prompt::handle_prompt_event;
 
 pub struct MainAction {
     pub command_outcome: CommandInputOutcome,
     pub approval_outcome: ApprovalInputOutcome,
+    pub working_process_events: WorkingProcessEvents,
 }
 
 pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
@@ -25,10 +27,12 @@ pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
         area,
         state.command_surface.open,
         state.approval_surface.open,
+        state.working_process.is_active(),
     );
 
     render_header(frame, layout.header);
     render_workspace(frame, layout.workspace, state);
+    working_process::render_working_process(frame, layout.working_process, &state.working_process);
     render_prompt_composer(frame, layout.prompt, state);
     approval_surface::render_approval_surface(frame, layout.approval, &state.approval_surface);
     command_surface::render_command_surface(
@@ -42,6 +46,14 @@ pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
+    if state.working_process.is_active() && matches!(event.code, KeyCode::Esc) {
+        return MainAction {
+            command_outcome: CommandInputOutcome::none(),
+            approval_outcome: ApprovalInputOutcome::none(),
+            working_process_events: state.cancel_working_process(),
+        };
+    }
+
     if state.approval_surface.open && !event.modifiers.contains(KeyModifiers::CONTROL) {
         let approval_outcome = handle_approval_event(event, &mut state.approval_surface);
         if let Some(workspace_line) = &approval_outcome.workspace_line {
@@ -50,6 +62,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
         return MainAction {
             command_outcome: CommandInputOutcome::none(),
             approval_outcome,
+            working_process_events: WorkingProcessEvents::none(),
         };
     }
 
@@ -64,6 +77,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
         return MainAction {
             command_outcome,
             approval_outcome,
+            working_process_events: WorkingProcessEvents::none(),
         };
     }
 
@@ -76,6 +90,17 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             state.should_quit = true;
             MainAction::none()
         }
+        KeyCode::Enter => {
+            if state.main_input.trim().is_empty() {
+                MainAction::none()
+            } else {
+                MainAction {
+                    command_outcome: CommandInputOutcome::none(),
+                    approval_outcome: ApprovalInputOutcome::none(),
+                    working_process_events: state.start_working_process(),
+                }
+            }
+        }
         _ => {
             let command_outcome = handle_prompt_event(
                 event,
@@ -87,6 +112,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             MainAction {
                 command_outcome,
                 approval_outcome,
+                working_process_events: WorkingProcessEvents::none(),
             }
         }
     }
@@ -97,6 +123,7 @@ impl MainAction {
         Self {
             command_outcome: CommandInputOutcome::none(),
             approval_outcome: ApprovalInputOutcome::none(),
+            working_process_events: WorkingProcessEvents::none(),
         }
     }
 }
@@ -104,18 +131,25 @@ impl MainAction {
 struct MainLayout {
     header: Rect,
     workspace: Rect,
+    working_process: Rect,
     prompt: Rect,
     approval: Rect,
     command: Rect,
     statusline: Rect,
 }
 
-fn layout_main(area: Rect, command_open: bool, approval_open: bool) -> MainLayout {
+fn layout_main(
+    area: Rect,
+    command_open: bool,
+    approval_open: bool,
+    working_process_open: bool,
+) -> MainLayout {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
+            Constraint::Length(working_process_height(area, working_process_open)),
             Constraint::Length(3),
             Constraint::Length(approval_height(area, approval_open)),
             Constraint::Length(command_height(area, command_open)),
@@ -126,10 +160,19 @@ fn layout_main(area: Rect, command_open: bool, approval_open: bool) -> MainLayou
     MainLayout {
         header: root[0],
         workspace: root[1],
-        prompt: root[2],
-        approval: root[3],
-        command: root[4],
-        statusline: root[5],
+        working_process: root[2],
+        prompt: root[3],
+        approval: root[4],
+        command: root[5],
+        statusline: root[6],
+    }
+}
+
+fn working_process_height(area: Rect, working_process_open: bool) -> u16 {
+    if working_process_open && area.height >= 10 {
+        2
+    } else {
+        0
     }
 }
 

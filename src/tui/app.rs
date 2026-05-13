@@ -19,12 +19,14 @@ use super::scenes::epilogue::print_epilogue;
 use super::scenes::intro::{handle_intro_event, render_intro};
 use super::scenes::main::{handle_main_event, render_main};
 use super::state::{Scene, TuiState};
+use super::working_process::WorkingProcessEvent;
 
 const TUI_01_SCOPE: &str = "tui-01-intro-scene";
 const TUI_02_SCOPE: &str = "tui-02-epilogue-scene";
 const TUI_03_SCOPE: &str = "tui-03-main-scene-layout";
 const TUI_04_SCOPE: &str = "tui-04-command-area-basic-actions";
 const TUI_05_SCOPE: &str = "tui-05-approval-area";
+const TUI_06_SCOPE: &str = "tui-06-working-process-area";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -44,6 +46,10 @@ const EVENT_COMMAND_ACTION_DISPATCHED: &str = "command_action_dispatched";
 const EVENT_APPROVAL_SURFACE_OPENED: &str = "approval_surface_opened";
 const EVENT_APPROVAL_OPTION_SELECTED: &str = "approval_option_selected";
 const EVENT_APPROVAL_RESULT_RECORDED: &str = "approval_result_recorded";
+const EVENT_WORKING_PROCESS_STARTED: &str = "working_process_started";
+const EVENT_WORKING_PHASE_CHANGED: &str = "working_phase_changed";
+const EVENT_WORKING_PROCESS_CANCEL_HINT_RENDERED: &str = "working_process_cancel_hint_rendered";
+const EVENT_WORKING_PROCESS_FINISHED: &str = "working_process_finished";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
@@ -233,6 +239,11 @@ impl TuiApp {
         }
 
         while !self.state.should_quit {
+            if matches!(self.state.scene, Scene::Main) {
+                let working_events = self.state.tick_working_process();
+                self.log_working_process_events(&working_events.events)?;
+            }
+
             terminal.draw(|frame| match self.state.scene {
                 Scene::Intro => render_intro(frame, &self.state),
                 Scene::Main => render_main(frame, &self.state),
@@ -257,6 +268,7 @@ impl TuiApp {
                     Scene::Intro => {
                         let action = handle_intro_event(key_event, &mut self.state);
                         self.log_command_events(&action.command_outcome.events)?;
+                        self.log_working_process_events(&action.working_process_events.events)?;
                         if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "intro_prompt")?;
@@ -267,6 +279,7 @@ impl TuiApp {
                         let action = handle_main_event(key_event, &mut self.state);
                         self.log_command_events(&action.command_outcome.events)?;
                         self.log_approval_events(&action.approval_outcome.events)?;
+                        self.log_working_process_events(&action.working_process_events.events)?;
                         if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "main_prompt")?;
@@ -387,6 +400,43 @@ impl TuiApp {
                         TUI_05_SCOPE,
                         EVENT_APPROVAL_RESULT_RECORDED,
                         json!({ "result": result.as_str() }),
+                    ))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn log_working_process_events(&self, events: &[WorkingProcessEvent]) -> io::Result<()> {
+        for event in events {
+            match event {
+                WorkingProcessEvent::Started => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_06_SCOPE,
+                        EVENT_WORKING_PROCESS_STARTED,
+                        json!({ "scene": self.state.scene.as_str() }),
+                    ))?;
+                }
+                WorkingProcessEvent::PhaseChanged { phase } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_06_SCOPE,
+                        EVENT_WORKING_PHASE_CHANGED,
+                        json!({ "phase": phase.label(), "step": phase.number() }),
+                    ))?;
+                }
+                WorkingProcessEvent::CancelHintRendered => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_06_SCOPE,
+                        EVENT_WORKING_PROCESS_CANCEL_HINT_RENDERED,
+                        json!({ "hint": "esc 취소" }),
+                    ))?;
+                }
+                WorkingProcessEvent::Finished { reason } => {
+                    self.logger.ui(LogEvent::ui(
+                        TUI_06_SCOPE,
+                        EVENT_WORKING_PROCESS_FINISHED,
+                        json!({ "reason": reason.as_str() }),
                     ))?;
                 }
             }

@@ -2,6 +2,7 @@ use crate::product;
 
 use super::approval::{open_approval_surface, ApprovalInputOutcome, ApprovalSurfaceState};
 use super::command::{CommandDispatch, CommandSurfaceState};
+use super::working_process::{WorkingProcessEvents, WorkingProcessState};
 
 #[derive(Clone, Copy)]
 pub enum Scene {
@@ -27,6 +28,7 @@ pub struct TuiState {
     pub pending_prompt: Option<String>,
     pub command_surface: CommandSurfaceState,
     pub approval_surface: ApprovalSurfaceState,
+    pub working_process: WorkingProcessState,
     pub workspace_entries: Vec<WorkspaceEntry>,
     pub persona_panel: PersonaPanelState,
     pub status_shell_open: bool,
@@ -44,6 +46,7 @@ impl TuiState {
             pending_prompt: None,
             command_surface: CommandSurfaceState::default(),
             approval_surface: ApprovalSurfaceState::default(),
+            working_process: WorkingProcessState::default(),
             workspace_entries: Vec::new(),
             persona_panel: PersonaPanelState::Off,
             status_shell_open: false,
@@ -71,10 +74,10 @@ impl TuiState {
         self.should_quit = true;
     }
 
-    pub fn enter_main_with_prompt(&mut self) {
+    pub fn enter_main_with_prompt(&mut self) -> WorkingProcessEvents {
         let prompt = self.intro_input.trim().to_owned();
         if prompt.is_empty() {
-            return;
+            return WorkingProcessEvents::none();
         }
 
         self.pending_prompt = Some(prompt);
@@ -82,6 +85,7 @@ impl TuiState {
         self.main_input.clear();
         self.command_surface.close();
         self.scene = Scene::Main;
+        self.working_process.start()
     }
 
     pub fn apply_command_dispatch(&mut self, dispatch: CommandDispatch) -> ApprovalInputOutcome {
@@ -112,6 +116,31 @@ impl TuiState {
 
     pub fn record_workspace_line(&mut self, text: String) {
         self.workspace_entries.push(WorkspaceEntry { text });
+    }
+
+    pub fn start_working_process(&mut self) -> WorkingProcessEvents {
+        self.main_input.clear();
+        self.command_surface.close();
+        self.approval_surface.close();
+        self.working_process.start()
+    }
+
+    pub fn tick_working_process(&mut self) -> WorkingProcessEvents {
+        let events = self.working_process.tick();
+        self.record_working_workspace_line(&events);
+        events
+    }
+
+    pub fn cancel_working_process(&mut self) -> WorkingProcessEvents {
+        let events = self.working_process.cancel();
+        self.record_working_workspace_line(&events);
+        events
+    }
+
+    fn record_working_workspace_line(&mut self, events: &WorkingProcessEvents) {
+        if let Some(workspace_line) = &events.workspace_line {
+            self.record_workspace_line(workspace_line.clone());
+        }
     }
 }
 
