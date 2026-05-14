@@ -220,7 +220,7 @@ fn run_intro_smoke(command: AppCommand) -> io::Result<()> {
     println!("tui-01 intro smoke ok");
     println!("scene=intro");
     println!("run_mode={}", command.run_mode.as_str());
-    println!("log_dir={}", logger.session_dir().display());
+    println!("log_bucket={}", logger.log_bucket_dir().display());
 
     Ok(())
 }
@@ -283,7 +283,7 @@ fn run_main_smoke(command: AppCommand) -> io::Result<()> {
     println!("tui-03 main smoke ok");
     println!("scene=main");
     println!("run_mode={}", command.run_mode.as_str());
-    println!("log_dir={}", logger.session_dir().display());
+    println!("log_bucket={}", logger.log_bucket_dir().display());
 
     Ok(())
 }
@@ -334,7 +334,7 @@ fn run_epilogue_smoke(command: AppCommand) -> io::Result<()> {
     println!("tui-02 epilogue smoke ok");
     println!("scene=epilogue");
     println!("run_mode={}", command.run_mode.as_str());
-    println!("log_dir={}", app.logger.session_dir().display());
+    println!("log_bucket={}", app.logger.log_bucket_dir().display());
 
     Ok(())
 }
@@ -1104,7 +1104,12 @@ impl TuiApp {
         self.log_message_recorded(&active.history, &repair_message)?;
         self.log_repair_request_started(&active, &repair_request)?;
 
-        let request_messages = active.history.for_request(None);
+        let request_messages = active
+            .history
+            .for_request(None)
+            .into_iter()
+            .filter(|message| message.role != LlmMessageRole::Assistant)
+            .collect();
         let (sender, receiver) = mpsc::channel();
         let config = self.runtime_config.clone();
         thread::spawn(move || {

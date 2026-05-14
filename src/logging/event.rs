@@ -44,7 +44,7 @@ impl LogEvent {
     }
 }
 
-fn local_timestamp() -> String {
+pub(crate) fn local_timestamp() -> String {
     OffsetDateTime::now_local()
         .unwrap_or_else(|_| OffsetDateTime::now_utc())
         .format(&Rfc3339)
