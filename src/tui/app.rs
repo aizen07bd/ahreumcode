@@ -1,4 +1,5 @@
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossterm::event::{self, Event};
@@ -11,6 +12,8 @@ use ratatui::Terminal;
 use serde_json::json;
 
 use crate::cli::{AppCommand, RunMode, SceneCommand};
+use crate::config::{ConfigLoadOutcome, ConfigLoadSource, RuntimeConfig};
+use crate::llm::{LlmHealthReport, LlmHealthStatus, LlmProviderFactory};
 use crate::logging::{LogEvent, Logger};
 
 use super::approval::ApprovalInputEvent;
@@ -22,7 +25,7 @@ use super::scenes::intro::{handle_intro_event, render_intro};
 use super::scenes::main::{handle_main_event, render_main};
 use super::state::{Scene, TuiState};
 use super::working_process::WorkingProcessEvent;
-use super::workspace::{WorkspaceEvent, WorkspaceRendered};
+use super::workspace::{WorkspaceEvent, WorkspaceEvents, WorkspaceRendered};
 
 const TUI_01_SCOPE: &str = "tui-01-intro-scene";
 const TUI_02_SCOPE: &str = "tui-02-epilogue-scene";
@@ -34,6 +37,8 @@ const TUI_07_SCOPE: &str = "tui-07-workspace-output-layout";
 const TUI_08_SCOPE: &str = "tui-08-persona-message-detail";
 const TUI_09_SCOPE: &str = "tui-09-complex-commands";
 const TUI_10_SCOPE: &str = "tui-10-modal-expanded-form";
+const LLM_01_SCOPE: &str = "llm-01-config-runtime";
+const LLM_02_SCOPE: &str = "llm-02-provider-connection";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -73,6 +78,14 @@ const EVENT_PERSONA_PANEL_OPENED: &str = "persona_panel_opened";
 const EVENT_PERSONA_PANEL_CLOSED: &str = "persona_panel_closed";
 const EVENT_PERSONA_MESSAGE_RENDERED: &str = "persona_message_rendered";
 const EVENT_PERSONA_WIDTH_REJECTED: &str = "persona_width_rejected";
+const EVENT_CONFIG_LOAD_STARTED: &str = "config_load_started";
+const EVENT_CONFIG_LOADED: &str = "config_loaded";
+const EVENT_CONFIG_DEFAULT_APPLIED: &str = "config_default_applied";
+const EVENT_CONFIG_LOAD_FAILED: &str = "config_load_failed";
+const EVENT_LLM_HEALTH_CHECK_STARTED: &str = "llm_health_check_started";
+const EVENT_LLM_HEALTH_CHECK_SUCCEEDED: &str = "llm_health_check_succeeded";
+const EVENT_LLM_HEALTH_CHECK_FAILED: &str = "llm_health_check_failed";
+const EVENT_LLM_LATENCY_RECORDED: &str = "llm_latency_recorded";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
@@ -86,8 +99,10 @@ pub fn run_app(command: AppCommand) -> io::Result<()> {
 }
 
 fn run_intro_terminal(command: AppCommand) -> io::Result<()> {
-    let workspace = current_workspace()?;
+    let project_root = current_workspace_path()?;
+    let workspace = workspace_display(&project_root);
     let logger = Logger::start()?;
+    let config_outcome = load_runtime_config(&logger, &project_root)?;
     logger.ui(LogEvent::ui(
         TUI_01_SCOPE,
         EVENT_APP_STARTED,
@@ -101,7 +116,17 @@ fn run_intro_terminal(command: AppCommand) -> io::Result<()> {
         json!({ "run_mode": command.run_mode.as_str() }),
     ))?;
 
-    let mut app = TuiApp::new(logger, workspace, command.run_mode.as_str());
+    let mut app = TuiApp::new(
+        logger,
+        workspace,
+        &config_outcome.config,
+        config_outcome.source,
+        config_outcome
+            .warning
+            .as_ref()
+            .map(|warning| warning.message.as_str()),
+        command.run_mode.as_str(),
+    );
     app.run(terminal.terminal_mut())?;
     terminal.restore()?;
     app.log_terminal_restored()?;
@@ -109,8 +134,10 @@ fn run_intro_terminal(command: AppCommand) -> io::Result<()> {
 }
 
 fn run_intro_smoke(command: AppCommand) -> io::Result<()> {
-    let workspace = current_workspace()?;
+    let project_root = current_workspace_path()?;
+    let workspace = workspace_display(&project_root);
     let logger = Logger::start()?;
+    let config_outcome = load_runtime_config(&logger, &project_root)?;
     logger.ui(LogEvent::ui(
         TUI_01_SCOPE,
         EVENT_APP_STARTED,
@@ -119,7 +146,15 @@ fn run_intro_smoke(command: AppCommand) -> io::Result<()> {
 
     let backend = TestBackend::new(120, 30);
     let mut terminal = Terminal::new(backend)?;
-    let state = TuiState::intro(workspace);
+    let state = TuiState::intro(
+        workspace,
+        &config_outcome.config,
+        config_outcome.source,
+        config_outcome
+            .warning
+            .as_ref()
+            .map(|warning| warning.message.as_str()),
+    );
 
     logger.ui(LogEvent::ui(
         TUI_01_SCOPE,
@@ -142,8 +177,10 @@ fn run_intro_smoke(command: AppCommand) -> io::Result<()> {
 }
 
 fn run_main_terminal(command: AppCommand) -> io::Result<()> {
-    let workspace = current_workspace()?;
+    let project_root = current_workspace_path()?;
+    let workspace = workspace_display(&project_root);
     let logger = Logger::start()?;
+    let config_outcome = load_runtime_config(&logger, &project_root)?;
     logger.ui(LogEvent::ui(
         TUI_03_SCOPE,
         EVENT_APP_STARTED,
@@ -157,7 +194,17 @@ fn run_main_terminal(command: AppCommand) -> io::Result<()> {
         json!({ "run_mode": command.run_mode.as_str() }),
     ))?;
 
-    let mut app = TuiApp::new_main(logger, workspace, command.run_mode.as_str());
+    let mut app = TuiApp::new_main(
+        logger,
+        workspace,
+        &config_outcome.config,
+        config_outcome.source,
+        config_outcome
+            .warning
+            .as_ref()
+            .map(|warning| warning.message.as_str()),
+        command.run_mode.as_str(),
+    );
     app.run(terminal.terminal_mut())?;
     terminal.restore()?;
     app.log_terminal_restored()?;
@@ -165,11 +212,21 @@ fn run_main_terminal(command: AppCommand) -> io::Result<()> {
 }
 
 fn run_main_smoke(command: AppCommand) -> io::Result<()> {
-    let workspace = current_workspace()?;
+    let project_root = current_workspace_path()?;
+    let workspace = workspace_display(&project_root);
     let logger = Logger::start()?;
+    let config_outcome = load_runtime_config(&logger, &project_root)?;
     let backend = TestBackend::new(120, 32);
     let mut terminal = Terminal::new(backend)?;
-    let state = TuiState::main(workspace);
+    let state = TuiState::main(
+        workspace,
+        &config_outcome.config,
+        config_outcome.source,
+        config_outcome
+            .warning
+            .as_ref()
+            .map(|warning| warning.message.as_str()),
+    );
 
     terminal.draw(|frame| render_main(frame, &state))?;
     log_main_scene_rendered(&logger, command.run_mode.as_str())?;
@@ -183,9 +240,21 @@ fn run_main_smoke(command: AppCommand) -> io::Result<()> {
 }
 
 fn run_epilogue_terminal(command: AppCommand) -> io::Result<()> {
-    let workspace = current_workspace()?;
+    let project_root = current_workspace_path()?;
+    let workspace = workspace_display(&project_root);
     let logger = Logger::start()?;
-    let app = TuiApp::new_epilogue(logger, workspace, command.run_mode.as_str());
+    let config_outcome = load_runtime_config(&logger, &project_root)?;
+    let app = TuiApp::new_epilogue(
+        logger,
+        workspace,
+        &config_outcome.config,
+        config_outcome.source,
+        config_outcome
+            .warning
+            .as_ref()
+            .map(|warning| warning.message.as_str()),
+        command.run_mode.as_str(),
+    );
 
     app.log_exit_requested(command.run_mode.as_str(), "scene")?;
     app.log_session_summary_created()?;
@@ -193,9 +262,21 @@ fn run_epilogue_terminal(command: AppCommand) -> io::Result<()> {
 }
 
 fn run_epilogue_smoke(command: AppCommand) -> io::Result<()> {
-    let workspace = current_workspace()?;
+    let project_root = current_workspace_path()?;
+    let workspace = workspace_display(&project_root);
     let logger = Logger::start()?;
-    let app = TuiApp::new_epilogue(logger, workspace, command.run_mode.as_str());
+    let config_outcome = load_runtime_config(&logger, &project_root)?;
+    let app = TuiApp::new_epilogue(
+        logger,
+        workspace,
+        &config_outcome.config,
+        config_outcome.source,
+        config_outcome
+            .warning
+            .as_ref()
+            .map(|warning| warning.message.as_str()),
+        command.run_mode.as_str(),
+    );
 
     app.log_exit_requested(command.run_mode.as_str(), "smoke")?;
     app.log_session_summary_created()?;
@@ -212,6 +293,7 @@ fn run_epilogue_smoke(command: AppCommand) -> io::Result<()> {
 struct TuiApp {
     state: TuiState,
     logger: Logger,
+    runtime_config: RuntimeConfig,
     run_mode: &'static str,
     intro_render_logged: bool,
     main_render_logged: bool,
@@ -219,10 +301,18 @@ struct TuiApp {
 }
 
 impl TuiApp {
-    fn new(logger: Logger, workspace: String, run_mode: &'static str) -> Self {
+    fn new(
+        logger: Logger,
+        workspace: String,
+        config: &RuntimeConfig,
+        config_source: ConfigLoadSource,
+        config_warning: Option<&str>,
+        run_mode: &'static str,
+    ) -> Self {
         Self {
-            state: TuiState::intro(workspace),
+            state: TuiState::intro(workspace, config, config_source, config_warning),
             logger,
+            runtime_config: config.clone(),
             run_mode,
             intro_render_logged: false,
             main_render_logged: false,
@@ -230,10 +320,18 @@ impl TuiApp {
         }
     }
 
-    fn new_main(logger: Logger, workspace: String, run_mode: &'static str) -> Self {
+    fn new_main(
+        logger: Logger,
+        workspace: String,
+        config: &RuntimeConfig,
+        config_source: ConfigLoadSource,
+        config_warning: Option<&str>,
+        run_mode: &'static str,
+    ) -> Self {
         Self {
-            state: TuiState::main(workspace),
+            state: TuiState::main(workspace, config, config_source, config_warning),
             logger,
+            runtime_config: config.clone(),
             run_mode,
             intro_render_logged: true,
             main_render_logged: false,
@@ -241,10 +339,18 @@ impl TuiApp {
         }
     }
 
-    fn new_epilogue(logger: Logger, workspace: String, run_mode: &'static str) -> Self {
+    fn new_epilogue(
+        logger: Logger,
+        workspace: String,
+        config: &RuntimeConfig,
+        config_source: ConfigLoadSource,
+        config_warning: Option<&str>,
+        run_mode: &'static str,
+    ) -> Self {
         Self {
-            state: TuiState::epilogue(workspace),
+            state: TuiState::epilogue(workspace, config, config_source, config_warning),
             logger,
+            runtime_config: config.clone(),
             run_mode,
             intro_render_logged: true,
             main_render_logged: true,
@@ -296,6 +402,7 @@ impl TuiApp {
                         self.log_command_events(&action.command_outcome.events)?;
                         self.log_working_process_events(&action.working_process_events.events)?;
                         self.log_workspace_events(&action.workspace_events.events)?;
+                        self.handle_runtime_dispatch(action.command_outcome.dispatch)?;
                         if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "intro_prompt")?;
@@ -310,6 +417,7 @@ impl TuiApp {
                         self.log_workspace_events(&action.workspace_events.events)?;
                         self.log_persona_events(&action.persona_events.events)?;
                         self.log_expanded_form_events(&action.expanded_form_events.events)?;
+                        self.handle_runtime_dispatch(action.command_outcome.dispatch)?;
                         if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "main_prompt")?;
@@ -322,6 +430,133 @@ impl TuiApp {
         }
 
         Ok(())
+    }
+
+    fn handle_runtime_dispatch(&mut self, dispatch: CommandDispatch) -> io::Result<()> {
+        match dispatch {
+            CommandDispatch::HealthCheck => self.run_health_check(),
+            _ => Ok(()),
+        }
+    }
+
+    fn run_health_check(&mut self) -> io::Result<()> {
+        self.state.enter_main_for_runtime_output();
+        self.log_health_check_started()?;
+
+        let provider = LlmProviderFactory::from_config(&self.runtime_config);
+        let report = provider.health_check();
+
+        self.log_health_latency(&report)?;
+        match &report.status {
+            LlmHealthStatus::Succeeded { .. } => self.log_health_check_succeeded(&report)?,
+            LlmHealthStatus::Failed(_) => self.log_health_check_failed(&report)?,
+        }
+
+        let events = self.record_health_report(&report);
+        self.log_workspace_events(&events.events)
+    }
+
+    fn record_health_report(&mut self, report: &LlmHealthReport) -> WorkspaceEvents {
+        match &report.status {
+            LlmHealthStatus::Succeeded { available_models } => {
+                let mut events = self.state.record_system_notice("health ok");
+                events.extend(self.state.record_system_notice(format!(
+                    "provider {} | model {}",
+                    report.provider, report.model
+                )));
+                events.extend(self.state.record_system_notice(format!(
+                    "latency {} ms | models {} | endpoint {}",
+                    report.latency_ms, available_models, report.models_url
+                )));
+                events
+            }
+            LlmHealthStatus::Failed(failure) => {
+                let mut events = self
+                    .state
+                    .record_system_notice(format!("health failed: {}", failure.kind.as_str()));
+                events.extend(self.state.record_system_notice(format!(
+                    "provider {} | model {}",
+                    report.provider, report.model
+                )));
+                events.extend(
+                    self.state
+                        .record_system_notice(format!("endpoint {}", report.models_url)),
+                );
+                events.extend(
+                    self.state
+                        .record_system_notice(format!("message {}", failure.message)),
+                );
+                events
+            }
+        }
+    }
+
+    fn log_health_check_started(&self) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_02_SCOPE,
+            EVENT_LLM_HEALTH_CHECK_STARTED,
+            json!({
+                "provider": &self.runtime_config.provider.active,
+                "provider_type": self.runtime_config.provider.provider_type.as_str(),
+                "base_url": &self.runtime_config.provider.base_url,
+                "model": &self.runtime_config.provider.model,
+                "timeout_ms": self.runtime_config.limits.command_timeout_ms,
+            }),
+        ))
+    }
+
+    fn log_health_latency(&self, report: &LlmHealthReport) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_02_SCOPE,
+            EVENT_LLM_LATENCY_RECORDED,
+            json!({
+                "provider": &report.provider,
+                "model": &report.model,
+                "endpoint": &report.models_url,
+                "latency_ms": report.latency_ms,
+            }),
+        ))
+    }
+
+    fn log_health_check_succeeded(&self, report: &LlmHealthReport) -> io::Result<()> {
+        let LlmHealthStatus::Succeeded { available_models } = &report.status else {
+            return Ok(());
+        };
+
+        self.logger.llm(LogEvent::ui(
+            LLM_02_SCOPE,
+            EVENT_LLM_HEALTH_CHECK_SUCCEEDED,
+            json!({
+                "provider": &report.provider,
+                "base_url": &report.base_url,
+                "model": &report.model,
+                "endpoint": &report.models_url,
+                "latency_ms": report.latency_ms,
+                "available_models": available_models,
+            }),
+        ))
+    }
+
+    fn log_health_check_failed(&self, report: &LlmHealthReport) -> io::Result<()> {
+        let LlmHealthStatus::Failed(failure) = &report.status else {
+            return Ok(());
+        };
+
+        self.logger.llm(LogEvent::ui(
+            LLM_02_SCOPE,
+            EVENT_LLM_HEALTH_CHECK_FAILED,
+            json!({
+                "provider": &report.provider,
+                "base_url": &report.base_url,
+                "model": &report.model,
+                "endpoint": &report.models_url,
+                "latency_ms": report.latency_ms,
+                "failure_kind": failure.kind.as_str(),
+                "http_status": failure.http_status,
+                "message": &failure.message,
+                "recoverable": true,
+            }),
+        ))
     }
 
     fn log_exit_requested(&self, run_mode: &str, source: &str) -> io::Result<()> {
@@ -689,8 +924,114 @@ fn log_main_scene_rendered(logger: &Logger, run_mode: &str) -> io::Result<()> {
     ))
 }
 
-fn current_workspace() -> io::Result<String> {
-    Ok(std::env::current_dir()?.display().to_string())
+fn load_runtime_config(logger: &Logger, project_root: &Path) -> io::Result<ConfigLoadOutcome> {
+    let config_path = project_root.join(crate::config::CONFIG_RELATIVE_PATH);
+    logger.llm(LogEvent::ui(
+        LLM_01_SCOPE,
+        EVENT_CONFIG_LOAD_STARTED,
+        json!({ "path": config_path.display().to_string() }),
+    ))?;
+
+    match RuntimeConfig::load(project_root) {
+        Ok(outcome) => {
+            if matches!(
+                outcome.source,
+                ConfigLoadSource::DefaultCreated | ConfigLoadSource::DefaultApplied
+            ) {
+                logger.llm(LogEvent::ui(
+                    LLM_01_SCOPE,
+                    EVENT_CONFIG_DEFAULT_APPLIED,
+                    json!({
+                        "path": outcome.config.config_path.display().to_string(),
+                        "created": outcome.warning.is_none(),
+                    }),
+                ))?;
+            }
+            if let Some(warning) = &outcome.warning {
+                logger.llm(LogEvent::ui(
+                    LLM_01_SCOPE,
+                    EVENT_CONFIG_LOAD_FAILED,
+                    json!({
+                        "path": outcome.config.config_path.display().to_string(),
+                        "recoverable": true,
+                        "message": &warning.message,
+                    }),
+                ))?;
+            }
+            log_config_loaded(logger, &outcome.config, outcome.source)?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            logger.llm(LogEvent::ui(
+                LLM_01_SCOPE,
+                EVENT_CONFIG_LOAD_FAILED,
+                json!({
+                    "path": config_path.display().to_string(),
+                    "recoverable": true,
+                    "message": error.message(),
+                }),
+            ))?;
+            logger.llm(LogEvent::ui(
+                LLM_01_SCOPE,
+                EVENT_CONFIG_DEFAULT_APPLIED,
+                json!({
+                    "path": config_path.display().to_string(),
+                    "created": false,
+                    "reason": "load_failed",
+                }),
+            ))?;
+            let config = RuntimeConfig::default_local(config_path);
+            log_config_loaded(logger, &config, ConfigLoadSource::DefaultApplied)?;
+
+            Ok(ConfigLoadOutcome {
+                config,
+                source: ConfigLoadSource::DefaultApplied,
+                warning: Some(crate::config::ConfigWarning {
+                    message: error.message(),
+                }),
+            })
+        }
+    }
+}
+
+fn log_config_loaded(
+    logger: &Logger,
+    config: &RuntimeConfig,
+    source: ConfigLoadSource,
+) -> io::Result<()> {
+    logger.llm(LogEvent::ui(
+        LLM_01_SCOPE,
+        EVENT_CONFIG_LOADED,
+        json!({
+            "path": config.config_path.display().to_string(),
+            "source": source.as_str(),
+            "provider": &config.provider.active,
+            "provider_type": config.provider.provider_type.as_str(),
+            "base_url": &config.provider.base_url,
+            "model": &config.provider.model,
+            "context_tokens": config.provider.context_tokens,
+            "api_key_env_configured": config.provider.api_key_env.is_some(),
+            "workspace_root": &config.workspace.root,
+            "mode": &config.mode.default,
+            "persona_default": &config.persona.default,
+            "persona_min_terminal_width": config.persona.min_terminal_width,
+            "max_model_turns": config.limits.max_model_turns,
+            "max_tool_calls": config.limits.max_tool_calls,
+            "max_same_tool_repeats": config.limits.max_same_tool_repeats,
+            "read_max_lines": config.limits.read_max_lines,
+            "search_max_results": config.limits.search_max_results,
+            "command_timeout_ms": config.limits.command_timeout_ms,
+            "web_enabled": config.web.enabled,
+        }),
+    ))
+}
+
+fn current_workspace_path() -> io::Result<PathBuf> {
+    std::env::current_dir()
+}
+
+fn workspace_display(path: &Path) -> String {
+    path.display().to_string()
 }
 
 struct TerminalSession {

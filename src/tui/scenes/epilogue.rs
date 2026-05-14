@@ -77,10 +77,10 @@ pub fn write_epilogue(writer: &mut impl Write, summary: &EpilogueSummary) -> io:
         writer,
         &[
             Segment::muted("model: "),
-            Segment::panel(summary.model),
+            Segment::panel(summary.model.as_str()),
             Segment::panel("   "),
             Segment::muted("mode: "),
-            Segment::panel(summary.mode),
+            Segment::panel(summary.mode.as_str()),
         ],
     )?;
     write_row(

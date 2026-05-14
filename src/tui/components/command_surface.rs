@@ -3,7 +3,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
-use super::super::command::{CommandRegistry, CommandSurfaceState, COMMAND_VISIBLE_ROWS};
+use super::super::command::{
+    CommandRegistry, CommandRuntimeLabels, CommandSurfaceState, COMMAND_VISIBLE_ROWS,
+};
 use super::super::style;
 
 pub fn render_command_surface(
@@ -12,13 +14,14 @@ pub fn render_command_surface(
     surface: &CommandSurfaceState,
     registry: &CommandRegistry,
     scene: &str,
+    runtime_labels: CommandRuntimeLabels<'_>,
 ) {
     if !surface.open || area.height == 0 {
         return;
     }
 
     if surface.stepped_picker.is_some() {
-        render_stepped_picker(frame, area, surface);
+        render_stepped_picker(frame, area, surface, runtime_labels);
         return;
     }
 
@@ -62,14 +65,19 @@ pub fn render_command_surface(
     frame.render_widget(paragraph, area);
 }
 
-fn render_stepped_picker(frame: &mut Frame<'_>, area: Rect, surface: &CommandSurfaceState) {
+fn render_stepped_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    surface: &CommandSurfaceState,
+    runtime_labels: CommandRuntimeLabels<'_>,
+) {
     let title = surface.step_title().unwrap_or("Select Option");
     let selected = surface
         .stepped_picker
         .as_ref()
         .map(|picker| picker.selected())
         .unwrap_or(0);
-    let options = surface.step_options();
+    let options = surface.step_options_for(runtime_labels);
 
     let mut lines = vec![Line::from(vec![
         Span::styled(title, style::panel_bold()),
@@ -96,9 +104,9 @@ fn render_stepped_picker(frame: &mut Frame<'_>, area: Rect, surface: &CommandSur
 
         lines.push(Line::from(vec![
             Span::styled(marker, detail_style),
-            Span::styled(option.label, label_style),
+            Span::styled(option.label.clone(), label_style),
             Span::raw("  "),
-            Span::styled(option.detail, detail_style),
+            Span::styled(option.detail.clone(), detail_style),
         ]));
     }
 

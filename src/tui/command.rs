@@ -1,8 +1,11 @@
+use crate::config;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandId {
     Exit,
     Quit,
     Status,
+    Health,
     Approval,
     Mode,
     Provider,
@@ -21,6 +24,7 @@ impl CommandId {
             Self::Exit => "/exit",
             Self::Quit => "/quit",
             Self::Status => "/status",
+            Self::Health => "/health",
             Self::Approval => "/approval",
             Self::Mode => "/mode",
             Self::Provider => "/provider",
@@ -108,6 +112,16 @@ impl CommandRegistry {
                     aliases: &[],
                     description: "show status shell",
                     group: "Session",
+                    availability: &["intro", "workspace"],
+                    presentation: CommandPresentation::InlineAction,
+                    risk: CommandRisk::Low,
+                },
+                CommandMetadata {
+                    id: CommandId::Health,
+                    name: "/health",
+                    aliases: &[],
+                    description: "check local LLM endpoint",
+                    group: "Runtime",
                     availability: &["intro", "workspace"],
                     presentation: CommandPresentation::InlineAction,
                     risk: CommandRisk::Low,
@@ -312,16 +326,16 @@ impl CommandSurfaceState {
         self.stepped_picker.as_ref().map(SteppedPickerState::title)
     }
 
-    pub fn step_options(&self) -> Vec<SteppedPickerOption> {
+    pub fn step_options_for(&self, labels: CommandRuntimeLabels<'_>) -> Vec<SteppedPickerOption> {
         self.stepped_picker
             .as_ref()
-            .map(SteppedPickerState::options)
+            .map(|picker| picker.options(labels))
             .unwrap_or_default()
     }
 
     pub fn move_picker_selection(&mut self, delta: isize) -> Option<usize> {
         let picker = self.stepped_picker.as_mut()?;
-        let item_count = picker.options().len();
+        let item_count = picker.option_count();
         picker.move_selection(delta, item_count);
         Some(picker.selected)
     }
@@ -341,9 +355,27 @@ impl CommandSurfaceState {
 pub const COMMAND_VISIBLE_ROWS: usize = 5;
 
 #[derive(Clone, Copy)]
+pub struct CommandRuntimeLabels<'a> {
+    pub mode: &'a str,
+    pub provider_display: &'a str,
+    pub model: &'a str,
+    pub base_url: &'a str,
+}
+
+impl<'a> Default for CommandRuntimeLabels<'a> {
+    fn default() -> Self {
+        Self {
+            mode: config::DEFAULT_MODE,
+            provider_display: config::DEFAULT_PROVIDER_DISPLAY,
+            model: config::DEFAULT_MODEL,
+            base_url: config::DEFAULT_BASE_URL,
+        }
+    }
+}
+
 pub struct SteppedPickerOption {
-    pub label: &'static str,
-    pub detail: &'static str,
+    pub label: String,
+    pub detail: String,
     pub action: CommandDispatch,
 }
 
@@ -371,6 +403,7 @@ impl SteppedPickerState {
     pub fn title(&self) -> &'static str {
         match self.command {
             CommandId::Mode => "Select Mode",
+            CommandId::Health => "Health Check",
             CommandId::Provider => "Select Provider",
             CommandId::Model => "Select Model",
             CommandId::Persona => "Select Persona",
@@ -380,91 +413,80 @@ impl SteppedPickerState {
         }
     }
 
-    pub fn options(&self) -> Vec<SteppedPickerOption> {
+    pub fn options(&self, labels: CommandRuntimeLabels<'_>) -> Vec<SteppedPickerOption> {
         match self.command {
             CommandId::Mode => vec![
-                SteppedPickerOption {
-                    label: "Guide",
-                    detail: "ask before mutation",
-                    action: CommandDispatch::ModeGuide,
-                },
-                SteppedPickerOption {
-                    label: "Crew (current)",
-                    detail: "balanced approval flow",
-                    action: CommandDispatch::ModeCrew,
-                },
-                SteppedPickerOption {
-                    label: "Pilot",
-                    detail: "faster trusted flow",
-                    action: CommandDispatch::ModePilot,
-                },
+                option(
+                    current_label("Guide", labels.mode),
+                    "ask before mutation",
+                    CommandDispatch::ModeGuide,
+                ),
+                option(
+                    current_label("Crew", labels.mode),
+                    "balanced approval flow",
+                    CommandDispatch::ModeCrew,
+                ),
+                option(
+                    current_label("Pilot", labels.mode),
+                    "faster trusted flow",
+                    CommandDispatch::ModePilot,
+                ),
             ],
             CommandId::Provider => vec![
-                SteppedPickerOption {
-                    label: "LM Studio (current)",
-                    detail: "OpenAI-compatible local endpoint",
-                    action: CommandDispatch::ProviderLmStudio,
-                },
-                SteppedPickerOption {
-                    label: "add local provider",
-                    detail: "open expanded form",
-                    action: CommandDispatch::OpenLocalProviderForm,
-                },
+                option(
+                    format!("{} (current)", labels.provider_display),
+                    labels.base_url.to_owned(),
+                    CommandDispatch::ProviderLmStudio,
+                ),
+                option(
+                    "add local provider",
+                    "open expanded form",
+                    CommandDispatch::OpenLocalProviderForm,
+                ),
             ],
             CommandId::Model => vec![
-                SteppedPickerOption {
-                    label: "google/gemma-4-e4b (current)",
-                    detail: "LM Studio local model",
-                    action: CommandDispatch::ModelGemma,
-                },
-                SteppedPickerOption {
-                    label: "add local model",
-                    detail: "open expanded form",
-                    action: CommandDispatch::OpenLocalModelForm,
-                },
+                option(
+                    format!("{} (current)", labels.model),
+                    format!("{} local model", labels.provider_display),
+                    CommandDispatch::ModelGemma,
+                ),
+                option(
+                    "add local model",
+                    "open expanded form",
+                    CommandDispatch::OpenLocalModelForm,
+                ),
             ],
             CommandId::Persona => vec![
-                SteppedPickerOption {
-                    label: "full",
-                    detail: "open right messenger",
-                    action: CommandDispatch::PersonaFull,
-                },
-                SteppedPickerOption {
-                    label: "off",
-                    detail: "remove right messenger",
-                    action: CommandDispatch::PersonaOff,
-                },
-                SteppedPickerOption {
-                    label: "close",
-                    detail: "same as off",
-                    action: CommandDispatch::PersonaClose,
-                },
+                option("full", "open right messenger", CommandDispatch::PersonaFull),
+                option("off", "remove right messenger", CommandDispatch::PersonaOff),
+                option("close", "same as off", CommandDispatch::PersonaClose),
             ],
             CommandId::DocsInit => vec![
-                SteppedPickerOption {
-                    label: "prepare",
-                    detail: "open expanded form",
-                    action: CommandDispatch::OpenDocsInitForm,
-                },
-                SteppedPickerOption {
-                    label: "cancel",
-                    detail: "return to prompt",
-                    action: CommandDispatch::None,
-                },
+                option(
+                    "prepare",
+                    "open expanded form",
+                    CommandDispatch::OpenDocsInitForm,
+                ),
+                option("cancel", "return to prompt", CommandDispatch::None),
             ],
             CommandId::Init => vec![
-                SteppedPickerOption {
-                    label: "prepare",
-                    detail: "open expanded form",
-                    action: CommandDispatch::OpenInitForm,
-                },
-                SteppedPickerOption {
-                    label: "cancel",
-                    detail: "return to prompt",
-                    action: CommandDispatch::None,
-                },
+                option(
+                    "prepare",
+                    "open expanded form",
+                    CommandDispatch::OpenInitForm,
+                ),
+                option("cancel", "return to prompt", CommandDispatch::None),
             ],
             _ => Vec::new(),
+        }
+    }
+
+    fn option_count(&self) -> usize {
+        match self.command {
+            CommandId::Mode => 3,
+            CommandId::Provider | CommandId::Model | CommandId::DocsInit | CommandId::Init => 2,
+            CommandId::Persona => 3,
+            _ => 0,
         }
     }
 
@@ -477,6 +499,26 @@ impl SteppedPickerState {
         let current = self.selected as isize;
         let max = item_count as isize - 1;
         self.selected = (current + delta).clamp(0, max) as usize;
+    }
+}
+
+fn option(
+    label: impl Into<String>,
+    detail: impl Into<String>,
+    action: CommandDispatch,
+) -> SteppedPickerOption {
+    SteppedPickerOption {
+        label: label.into(),
+        detail: detail.into(),
+        action,
+    }
+}
+
+fn current_label(label: &str, current: &str) -> String {
+    if label == current {
+        format!("{label} (current)")
+    } else {
+        label.to_owned()
     }
 }
 
@@ -515,6 +557,7 @@ pub enum CommandDispatch {
     None,
     ExitRequested,
     StatusShell,
+    HealthCheck,
     ApprovalShell,
     ModeGuide,
     ModeCrew,
@@ -612,7 +655,7 @@ pub fn confirm_picker_selection(surface: &mut CommandSurfaceState) -> CommandInp
 
     let command = picker.command();
     let selected = picker.selected();
-    let options = picker.options();
+    let options = picker.options(CommandRuntimeLabels::default());
     let dispatch = options
         .get(selected)
         .map(|option| option.action)
@@ -632,6 +675,7 @@ fn dispatch_for(command: CommandId) -> CommandDispatch {
     match command {
         CommandId::Exit | CommandId::Quit => CommandDispatch::ExitRequested,
         CommandId::Status => CommandDispatch::StatusShell,
+        CommandId::Health => CommandDispatch::HealthCheck,
         CommandId::Approval => CommandDispatch::ApprovalShell,
         CommandId::Mode
         | CommandId::Provider

@@ -41,6 +41,10 @@ impl Logger {
         self.append_jsonl("ui.jsonl", &event.to_json(&self.session_id))
     }
 
+    pub fn llm(&self, event: LogEvent) -> io::Result<()> {
+        self.append_jsonl("llm.jsonl", &event.to_json(&self.session_id))
+    }
+
     pub fn session_dir(&self) -> &Path {
         &self.session_dir
     }

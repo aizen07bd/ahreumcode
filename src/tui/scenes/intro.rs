@@ -124,6 +124,7 @@ fn render_intro_body(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         &state.command_surface,
         &CommandRegistry::new(),
         state.scene.as_str(),
+        state.runtime_status.command_labels(),
     );
     render_intro_hint(frame, chunks[4]);
 }
@@ -156,11 +157,14 @@ fn render_prompt_panel(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Line::from(""),
         Line::from(vec![
             Span::styled("  Mode: ", style::panel()),
-            Span::styled(product::DEFAULT_MODE, style::cyan()),
+            Span::styled(state.runtime_status.mode.clone(), style::cyan()),
             Span::raw("     "),
-            Span::styled(product::DEFAULT_PROVIDER_DISPLAY, style::panel()),
+            Span::styled(
+                state.runtime_status.provider_display.clone(),
+                style::panel(),
+            ),
             Span::styled(" / ", style::muted()),
-            Span::styled(product::DEFAULT_MODEL, style::panel()),
+            Span::styled(state.runtime_status.model.clone(), style::panel()),
         ]),
         Line::from(""),
     ];

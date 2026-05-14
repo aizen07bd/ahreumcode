@@ -50,6 +50,7 @@ pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
         &state.command_surface,
         &CommandRegistry::new(),
         state.scene.as_str(),
+        state.runtime_status.command_labels(),
     );
     statusline::render_statusline(frame, layout.statusline, &state.runtime_status);
     expanded_form::render_expanded_form(frame, expanded_form_area(area), &state.expanded_form);

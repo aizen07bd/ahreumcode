@@ -1,5 +1,7 @@
 mod app;
 mod cli;
+mod config;
+mod llm;
 mod logging;
 mod product;
 mod tui;

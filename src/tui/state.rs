@@ -1,7 +1,10 @@
-use crate::product;
+use crate::{
+    config::{ConfigLoadSource, RuntimeConfig},
+    product,
+};
 
 use super::approval::{open_approval_surface, ApprovalInputOutcome, ApprovalSurfaceState};
-use super::command::{CommandDispatch, CommandSurfaceState};
+use super::command::{CommandDispatch, CommandRuntimeLabels, CommandSurfaceState};
 use super::expanded_form::{
     ExpandedFormEvents, ExpandedFormKind, ExpandedFormState, ExpandedFormSubmit,
 };
@@ -50,7 +53,12 @@ pub struct TuiState {
 }
 
 impl TuiState {
-    pub fn intro(workspace: String) -> Self {
+    pub fn intro(
+        workspace: String,
+        config: &RuntimeConfig,
+        config_source: ConfigLoadSource,
+        config_warning: Option<&str>,
+    ) -> Self {
         Self {
             scene: Scene::Intro,
             intro_input: String::new(),
@@ -65,19 +73,29 @@ impl TuiState {
             persona: PersonaBuffer::default(),
             status_shell_open: false,
             should_quit: false,
-            runtime_status: RuntimeStatus::new(workspace),
+            runtime_status: RuntimeStatus::new(workspace, config, config_source, config_warning),
             epilogue_summary: None,
         }
     }
 
-    pub fn main(workspace: String) -> Self {
-        let mut state = Self::intro(workspace);
+    pub fn main(
+        workspace: String,
+        config: &RuntimeConfig,
+        config_source: ConfigLoadSource,
+        config_warning: Option<&str>,
+    ) -> Self {
+        let mut state = Self::intro(workspace, config, config_source, config_warning);
         state.scene = Scene::Main;
         state
     }
 
-    pub fn epilogue(workspace: String) -> Self {
-        let mut state = Self::intro(workspace);
+    pub fn epilogue(
+        workspace: String,
+        config: &RuntimeConfig,
+        config_source: ConfigLoadSource,
+        config_warning: Option<&str>,
+    ) -> Self {
+        let mut state = Self::intro(workspace, config, config_source, config_warning);
         state.request_exit();
         state
     }
@@ -109,13 +127,19 @@ impl TuiState {
     ) -> CommandDispatchOutcome {
         match dispatch {
             CommandDispatch::None => CommandDispatchOutcome::none(),
+            CommandDispatch::HealthCheck => CommandDispatchOutcome::none(),
             CommandDispatch::ExitRequested => {
                 self.request_exit();
                 CommandDispatchOutcome::none()
             }
             CommandDispatch::StatusShell => {
                 self.status_shell_open = true;
-                CommandDispatchOutcome::none()
+                CommandDispatchOutcome {
+                    approval_outcome: ApprovalInputOutcome::none(),
+                    workspace_events: self.push_status_summary(),
+                    persona_events: PersonaEvents::none(),
+                    expanded_form_events: ExpandedFormEvents::none(),
+                }
             }
             CommandDispatch::ApprovalShell => {
                 self.command_surface.close();
@@ -150,6 +174,21 @@ impl TuiState {
 
     pub fn record_workspace_line(&mut self, text: String) -> WorkspaceEvents {
         self.workspace.push_result(text)
+    }
+
+    pub fn record_system_notice(&mut self, text: impl Into<String>) -> WorkspaceEvents {
+        self.workspace.push_system_notice(text)
+    }
+
+    pub fn enter_main_for_runtime_output(&mut self) {
+        if matches!(self.scene, Scene::Intro) {
+            self.scene = Scene::Main;
+            self.intro_input.clear();
+            self.main_input.clear();
+        }
+        self.command_surface.close();
+        self.approval_surface.close();
+        self.expanded_form.cancel();
     }
 
     pub fn start_working_process(&mut self) -> PromptSubmitOutcome {
@@ -296,7 +335,7 @@ impl TuiState {
     }
 
     fn set_mode(&mut self, mode: &'static str) -> CommandDispatchOutcome {
-        self.runtime_status.mode = mode;
+        self.runtime_status.mode = mode.to_owned();
         CommandDispatchOutcome {
             approval_outcome: ApprovalInputOutcome::none(),
             workspace_events: self
@@ -308,7 +347,8 @@ impl TuiState {
     }
 
     fn set_provider(&mut self, provider: &'static str) -> CommandDispatchOutcome {
-        self.runtime_status.provider = provider;
+        self.runtime_status.provider = provider.to_owned();
+        self.runtime_status.provider_display = provider.to_owned();
         CommandDispatchOutcome {
             approval_outcome: ApprovalInputOutcome::none(),
             workspace_events: self
@@ -320,7 +360,7 @@ impl TuiState {
     }
 
     fn set_model(&mut self, model: &'static str) -> CommandDispatchOutcome {
-        self.runtime_status.model = model;
+        self.runtime_status.model = model.to_owned();
         CommandDispatchOutcome {
             approval_outcome: ApprovalInputOutcome::none(),
             workspace_events: self
@@ -353,6 +393,28 @@ impl TuiState {
             working_process_events,
             workspace_events,
         }
+    }
+
+    fn push_status_summary(&mut self) -> WorkspaceEvents {
+        let mut events = self.workspace.push_system_notice(format!(
+            "mode {} | config {}",
+            self.runtime_status.mode, self.runtime_status.config_source,
+        ));
+        events.extend(self.workspace.push_system_notice(format!(
+            "provider {} | model {}",
+            self.runtime_status.provider, self.runtime_status.model,
+        )));
+        events.extend(self.workspace.push_system_notice(format!(
+            "base_url {} | context {}",
+            self.runtime_status.base_url, self.runtime_status.context_tokens,
+        )));
+        if let Some(warning) = &self.runtime_status.config_warning {
+            events.extend(
+                self.workspace
+                    .push_system_notice(format!("config warning {warning}")),
+            );
+        }
+        events
     }
 
     fn record_working_workspace_items(&mut self, events: &WorkingProcessEvents) -> WorkspaceEvents {
@@ -458,35 +520,63 @@ impl CommandDispatchOutcome {
 }
 
 pub struct RuntimeStatus {
-    pub mode: &'static str,
-    pub provider: &'static str,
-    pub model: &'static str,
+    pub mode: String,
+    pub provider: String,
+    pub provider_display: String,
+    pub model: String,
+    pub base_url: String,
     pub workspace: String,
-    pub context: &'static str,
+    pub context: String,
+    pub context_tokens: u32,
     pub tokens: &'static str,
     pub web: &'static str,
     pub runtime_state: &'static str,
+    pub config_source: String,
+    pub config_warning: Option<String>,
 }
 
 impl RuntimeStatus {
-    fn new(workspace: String) -> Self {
+    fn new(
+        workspace: String,
+        config: &RuntimeConfig,
+        config_source: ConfigLoadSource,
+        config_warning: Option<&str>,
+    ) -> Self {
         Self {
-            mode: product::DEFAULT_MODE,
-            provider: product::DEFAULT_PROVIDER,
-            model: product::DEFAULT_MODEL,
+            mode: config.mode.default.clone(),
+            provider: config.provider.active.clone(),
+            provider_display: provider_display_name(&config.provider.active).to_owned(),
+            model: config.provider.model.clone(),
+            base_url: config.provider.base_url.clone(),
             workspace,
-            context: product::DEFAULT_CONTEXT_STATUS,
+            context: format!("ctx {}", config.provider.context_tokens),
+            context_tokens: config.provider.context_tokens,
             tokens: product::DEFAULT_TOKEN_STATUS,
-            web: product::DEFAULT_WEB_STATUS,
+            web: if config.web.enabled {
+                "web on"
+            } else {
+                "web off"
+            },
             runtime_state: product::DEFAULT_RUNTIME_STATE,
+            config_source: config_source.as_str().to_owned(),
+            config_warning: config_warning.map(ToOwned::to_owned),
+        }
+    }
+
+    pub fn command_labels(&self) -> CommandRuntimeLabels<'_> {
+        CommandRuntimeLabels {
+            mode: self.mode.as_str(),
+            provider_display: self.provider_display.as_str(),
+            model: self.model.as_str(),
+            base_url: self.base_url.as_str(),
         }
     }
 }
 
 pub struct EpilogueSummary {
     pub workspace: String,
-    pub model: &'static str,
-    pub mode: &'static str,
+    pub model: String,
+    pub mode: String,
     pub session: &'static str,
     pub tools_executed: u16,
     pub tools_failed: u16,
@@ -497,12 +587,20 @@ impl EpilogueSummary {
     fn from_runtime(runtime_status: &RuntimeStatus) -> Self {
         Self {
             workspace: runtime_status.workspace.clone(),
-            model: runtime_status.model,
-            mode: runtime_status.mode,
+            model: runtime_status.model.clone(),
+            mode: runtime_status.mode.clone(),
             session: product::SESSION_SAVED_LABEL,
             tools_executed: 0,
             tools_failed: 0,
             closing_message: product::GOODBYE_LABEL,
         }
+    }
+}
+
+fn provider_display_name(provider: &str) -> &str {
+    if provider == product::DEFAULT_PROVIDER {
+        product::DEFAULT_PROVIDER_DISPLAY
+    } else {
+        provider
     }
 }
