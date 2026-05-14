@@ -12,7 +12,7 @@ use super::persona::{
     PersonaBuffer, PersonaEvent, PersonaEvents, PersonaMessage, PersonaRendered,
     MIN_PERSONA_TERMINAL_WIDTH,
 };
-use super::working_process::{WorkingProcessEvents, WorkingProcessState};
+use super::working_process::{WorkingPhase, WorkingProcessEvents, WorkingProcessState};
 use super::workspace::{WorkspaceBuffer, WorkspaceEvents, WorkspaceRendered};
 
 #[derive(Clone, Copy)]
@@ -214,6 +214,19 @@ impl TuiState {
 
     pub fn tick_working_process(&mut self) -> WorkingRuntimeOutcome {
         let working_process_events = self.working_process.tick();
+        let workspace_events = self.record_working_workspace_items(&working_process_events);
+        WorkingRuntimeOutcome {
+            working_process_events,
+            workspace_events,
+        }
+    }
+
+    pub fn set_working_process_phase(
+        &mut self,
+        phase: WorkingPhase,
+        detail: impl Into<String>,
+    ) -> WorkingRuntimeOutcome {
+        let working_process_events = self.working_process.set_phase(phase, detail);
         let workspace_events = self.record_working_workspace_items(&working_process_events);
         WorkingRuntimeOutcome {
             working_process_events,

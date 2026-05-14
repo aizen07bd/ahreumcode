@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkingPhase {
     Interpret,
     Classify,
@@ -54,7 +54,7 @@ pub const PHASES: [WorkingPhase; 6] = [
 pub struct WorkingProcessState {
     active: bool,
     phase: WorkingPhase,
-    detail: &'static str,
+    detail: String,
     started_at: Instant,
     last_phase_index: usize,
 }
@@ -64,7 +64,7 @@ impl Default for WorkingProcessState {
         Self {
             active: false,
             phase: WorkingPhase::Interpret,
-            detail: WorkingPhase::Interpret.detail(),
+            detail: WorkingPhase::Interpret.detail().to_owned(),
             started_at: Instant::now(),
             last_phase_index: 0,
         }
@@ -75,7 +75,7 @@ impl WorkingProcessState {
     pub fn start(&mut self) -> WorkingProcessEvents {
         self.active = true;
         self.phase = WorkingPhase::Interpret;
-        self.detail = WorkingPhase::Interpret.detail();
+        self.detail = WorkingPhase::Interpret.detail().to_owned();
         self.started_at = Instant::now();
         self.last_phase_index = 0;
 
@@ -90,19 +90,22 @@ impl WorkingProcessState {
     }
 
     pub fn tick(&mut self) -> WorkingProcessEvents {
+        WorkingProcessEvents::none()
+    }
+
+    pub fn set_phase(
+        &mut self,
+        phase: WorkingPhase,
+        detail: impl Into<String>,
+    ) -> WorkingProcessEvents {
         if !self.active {
             return WorkingProcessEvents::none();
         }
 
-        let elapsed = self.started_at.elapsed();
-        let phase_index = (elapsed.as_secs() as usize).min(PHASES.len() - 1);
-        if phase_index == self.last_phase_index {
-            return WorkingProcessEvents::none();
-        }
-
+        let phase_index = phase.number() - 1;
         self.last_phase_index = phase_index;
-        self.phase = PHASES[phase_index];
-        self.detail = self.phase.detail();
+        self.phase = phase;
+        self.detail = detail.into();
 
         WorkingProcessEvents {
             events: vec![WorkingProcessEvent::PhaseChanged { phase: self.phase }],
@@ -138,8 +141,8 @@ impl WorkingProcessState {
         self.phase
     }
 
-    pub fn detail(&self) -> &'static str {
-        self.detail
+    pub fn detail(&self) -> &str {
+        &self.detail
     }
 
     pub fn elapsed_secs(&self) -> u64 {
@@ -199,5 +202,38 @@ impl WorkingProcessEvents {
             events: Vec::new(),
             workspace_line: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkingPhase, WorkingProcessEvent, WorkingProcessState};
+
+    #[test]
+    fn tick_does_not_change_phase_without_runtime_event() {
+        let mut state = WorkingProcessState::default();
+        state.start();
+
+        let events = state.tick();
+
+        assert!(events.events.is_empty());
+        assert_eq!(state.phase(), WorkingPhase::Interpret);
+    }
+
+    #[test]
+    fn runtime_event_changes_phase_and_detail() {
+        let mut state = WorkingProcessState::default();
+        state.start();
+
+        let events = state.set_phase(WorkingPhase::Validate, "runtime validation");
+
+        assert_eq!(state.phase(), WorkingPhase::Validate);
+        assert_eq!(state.detail(), "runtime validation");
+        assert!(matches!(
+            events.events.as_slice(),
+            [WorkingProcessEvent::PhaseChanged {
+                phase: WorkingPhase::Validate
+            }]
+        ));
     }
 }

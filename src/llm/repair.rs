@@ -44,6 +44,10 @@ impl RepairLoop {
         Self::new(MAX_REPAIR_ATTEMPTS)
     }
 
+    pub fn max_attempts(&self) -> u16 {
+        self.max_attempts
+    }
+
     pub fn next_request(
         &self,
         attempts: u16,

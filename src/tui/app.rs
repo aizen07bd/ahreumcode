@@ -16,11 +16,12 @@ use serde_json::json;
 use crate::cli::{AppCommand, RunMode, SceneCommand};
 use crate::config::{ConfigLoadOutcome, ConfigLoadSource, RuntimeConfig};
 use crate::llm::{
-    attach_schema_prompt, parse_runtime_response, LlmChatReport, LlmChatRequest, LlmChatStatus,
-    LlmHealthReport, LlmHealthStatus, LlmMessage, LlmMessageRole, LlmMessageVisibility,
-    LlmProviderFactory, MessageHistory, ParsedRuntimeResponse, RepairLimitReached, RepairLoop,
-    RepairRequest, RuntimeResponse, RuntimeResponseParseError, RuntimeResponseParseErrorKind,
-    SchemaPrompt, SchemaPromptBuilder,
+    attach_schema_prompt, parse_runtime_response, DecisionGate, LlmChatReport, LlmChatRequest,
+    LlmChatStatus, LlmDiagnostics, LlmDiagnosticsRuntime, LlmDiagnosticsSnapshot,
+    LlmDiagnosticsState, LlmHealthReport, LlmHealthStatus, LlmMessage, LlmMessageRole,
+    LlmMessageVisibility, LlmProviderFactory, MessageHistory, ParsedRuntimeResponse,
+    RepairLimitReached, RepairLoop, RepairRequest, RuntimeDecision, RuntimeDecisionError,
+    RuntimeResponseParseError, RuntimeResponseParseErrorKind, SchemaPrompt, SchemaPromptBuilder,
 };
 use crate::logging::{LogEvent, Logger};
 
@@ -32,7 +33,9 @@ use super::scenes::epilogue::print_epilogue;
 use super::scenes::intro::{handle_intro_event, render_intro};
 use super::scenes::main::{handle_main_event, render_main};
 use super::state::{Scene, TuiState};
-use super::working_process::{WorkingFinishReason, WorkingProcessEvent, WorkingProcessEvents};
+use super::working_process::{
+    WorkingFinishReason, WorkingPhase, WorkingProcessEvent, WorkingProcessEvents,
+};
 use super::workspace::{WorkspaceEvent, WorkspaceEvents, WorkspaceRendered};
 
 const TUI_01_SCOPE: &str = "tui-01-intro-scene";
@@ -52,6 +55,9 @@ const LLM_04_SCOPE: &str = "llm-04-message-history";
 const LLM_05_SCOPE: &str = "llm-05-schema-prompt-builder";
 const LLM_06_SCOPE: &str = "llm-06-json-response-parser";
 const LLM_07_SCOPE: &str = "llm-07-repair-request-loop";
+const LLM_08_SCOPE: &str = "llm-08-runtime-decision-gate";
+const LLM_09_SCOPE: &str = "llm-09-tui-process-binding";
+const LLM_10_SCOPE: &str = "llm-10-diagnostics-and-status";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -81,8 +87,15 @@ const EVENT_APPROVAL_OPTION_SELECTED: &str = "approval_option_selected";
 const EVENT_APPROVAL_RESULT_RECORDED: &str = "approval_result_recorded";
 const EVENT_WORKING_PROCESS_STARTED: &str = "working_process_started";
 const EVENT_WORKING_PHASE_CHANGED: &str = "working_phase_changed";
+const EVENT_WORKING_PROCESS_PHASE_CHANGED: &str = "working_process_phase_changed";
 const EVENT_WORKING_PROCESS_CANCEL_HINT_RENDERED: &str = "working_process_cancel_hint_rendered";
 const EVENT_WORKING_PROCESS_FINISHED: &str = "working_process_finished";
+const EVENT_WORKING_PROCESS_CANCELLED: &str = "working_process_cancelled";
+const EVENT_WORKING_PROCESS_COMPLETED: &str = "working_process_completed";
+const EVENT_LLM_DIAGNOSTICS_REQUESTED: &str = "llm_diagnostics_requested";
+const EVENT_LLM_DIAGNOSTICS_RENDERED: &str = "llm_diagnostics_rendered";
+const EVENT_LLM_STATUS_SNAPSHOT_RECORDED: &str = "llm_status_snapshot_recorded";
+const EVENT_LLM_RUNTIME_READY_FOR_TOOL_STAGE: &str = "llm_runtime_ready_for_tool_stage";
 const EVENT_WORKSPACE_PROMPT_BLOCK_ADDED: &str = "workspace_prompt_block_added";
 const EVENT_WORKSPACE_OUTPUT_ADDED: &str = "workspace_output_added";
 const EVENT_WORKSPACE_SCROLL_CHANGED: &str = "workspace_scroll_changed";
@@ -118,6 +131,10 @@ const EVENT_REPAIR_REQUEST_STARTED: &str = "repair_request_started";
 const EVENT_REPAIR_RESPONSE_RECEIVED: &str = "repair_response_received";
 const EVENT_REPAIR_SUCCEEDED: &str = "repair_succeeded";
 const EVENT_REPAIR_LIMIT_REACHED: &str = "repair_limit_reached";
+const EVENT_RUNTIME_DECISION_STARTED: &str = "runtime_decision_started";
+const EVENT_RUNTIME_DECISION_RECORDED: &str = "runtime_decision_recorded";
+const EVENT_TOOL_CANDIDATE_CLASSIFIED: &str = "tool_candidate_classified";
+const EVENT_RUNTIME_DECISION_FAILED: &str = "runtime_decision_failed";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
@@ -326,6 +343,7 @@ struct TuiApp {
     state: TuiState,
     logger: Logger,
     runtime_config: RuntimeConfig,
+    llm_diagnostics: LlmDiagnosticsState,
     active_plain_request: Option<ActivePlainRequest>,
     next_run_index: u64,
     run_mode: &'static str,
@@ -357,6 +375,7 @@ impl TuiApp {
             state: TuiState::intro(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            llm_diagnostics: LlmDiagnosticsState::default(),
             active_plain_request: None,
             next_run_index: 1,
             run_mode,
@@ -378,6 +397,7 @@ impl TuiApp {
             state: TuiState::main(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            llm_diagnostics: LlmDiagnosticsState::default(),
             active_plain_request: None,
             next_run_index: 1,
             run_mode,
@@ -399,6 +419,7 @@ impl TuiApp {
             state: TuiState::epilogue(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            llm_diagnostics: LlmDiagnosticsState::default(),
             active_plain_request: None,
             next_run_index: 1,
             run_mode,
@@ -488,9 +509,20 @@ impl TuiApp {
 
     fn handle_runtime_dispatch(&mut self, dispatch: CommandDispatch) -> io::Result<()> {
         match dispatch {
+            CommandDispatch::StatusShell => self.render_llm_diagnostics(),
             CommandDispatch::HealthCheck => self.run_health_check(),
             _ => Ok(()),
         }
+    }
+
+    fn render_llm_diagnostics(&mut self) -> io::Result<()> {
+        self.log_llm_diagnostics_requested("status")?;
+        let snapshot = self.llm_diagnostics_snapshot();
+        self.log_llm_status_snapshot_recorded(&snapshot)?;
+        self.log_llm_runtime_ready_for_tool_stage(&snapshot)?;
+        let events = self.record_llm_diagnostics(&snapshot);
+        self.log_workspace_events(&events.events)?;
+        self.log_llm_diagnostics_rendered(&snapshot)
     }
 
     fn run_health_check(&mut self) -> io::Result<()> {
@@ -505,9 +537,12 @@ impl TuiApp {
             LlmHealthStatus::Succeeded { .. } => self.log_health_check_succeeded(&report)?,
             LlmHealthStatus::Failed(_) => self.log_health_check_failed(&report)?,
         }
+        self.llm_diagnostics.record_health(&report);
 
         let events = self.record_health_report(&report);
-        self.log_workspace_events(&events.events)
+        self.log_workspace_events(&events.events)?;
+        let snapshot = self.llm_diagnostics_snapshot();
+        self.log_llm_status_snapshot_recorded(&snapshot)
     }
 
     fn record_health_report(&mut self, report: &LlmHealthReport) -> WorkspaceEvents {
@@ -543,6 +578,28 @@ impl TuiApp {
                 events
             }
         }
+    }
+
+    fn record_llm_diagnostics(&mut self, snapshot: &LlmDiagnosticsSnapshot) -> WorkspaceEvents {
+        let mut events = WorkspaceEvents::none();
+        for line in snapshot.lines() {
+            events.extend(self.state.record_system_notice(line));
+        }
+        events
+    }
+
+    fn llm_diagnostics_snapshot(&self) -> LlmDiagnosticsSnapshot {
+        LlmDiagnostics::snapshot(
+            LlmDiagnosticsRuntime {
+                provider: &self.runtime_config.provider.active,
+                model: &self.runtime_config.provider.model,
+                base_url: &self.runtime_config.provider.base_url,
+                context_tokens: self.runtime_config.provider.context_tokens,
+                mode: &self.state.runtime_status.mode,
+                web: self.state.runtime_status.web,
+            },
+            &self.llm_diagnostics,
+        )
     }
 
     fn log_health_check_started(&self) -> io::Result<()> {
@@ -613,6 +670,70 @@ impl TuiApp {
         ))
     }
 
+    fn log_llm_diagnostics_requested(&self, source: &str) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_10_SCOPE,
+            EVENT_LLM_DIAGNOSTICS_REQUESTED,
+            json!({
+                "source": source,
+                "provider": &self.runtime_config.provider.active,
+                "model": &self.runtime_config.provider.model,
+            }),
+        ))
+    }
+
+    fn log_llm_diagnostics_rendered(&self, snapshot: &LlmDiagnosticsSnapshot) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_10_SCOPE,
+            EVENT_LLM_DIAGNOSTICS_RENDERED,
+            json!({
+                "line_count": snapshot.lines().len(),
+                "last_request": &snapshot.last_request,
+                "last_parse": &snapshot.last_parse,
+                "last_decision": &snapshot.last_decision,
+            }),
+        ))
+    }
+
+    fn log_llm_status_snapshot_recorded(
+        &self,
+        snapshot: &LlmDiagnosticsSnapshot,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_10_SCOPE,
+            EVENT_LLM_STATUS_SNAPSHOT_RECORDED,
+            json!({
+                "provider": &snapshot.provider,
+                "model": &snapshot.model,
+                "base_url": &snapshot.base_url,
+                "context_tokens": snapshot.context_tokens,
+                "mode": &snapshot.mode,
+                "web": &snapshot.web,
+                "last_health": &snapshot.last_health,
+                "last_request": &snapshot.last_request,
+                "last_parse": &snapshot.last_parse,
+                "last_repair": &snapshot.last_repair,
+                "last_decision": &snapshot.last_decision,
+                "last_failure": &snapshot.last_failure,
+            }),
+        ))
+    }
+
+    fn log_llm_runtime_ready_for_tool_stage(
+        &self,
+        snapshot: &LlmDiagnosticsSnapshot,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_10_SCOPE,
+            EVENT_LLM_RUNTIME_READY_FOR_TOOL_STAGE,
+            json!({
+                "ready": snapshot.tool_stage_ready,
+                "reason": &snapshot.tool_stage_reason,
+                "e2e_verified": false,
+            }),
+        ))
+    }
+
     fn handle_plain_prompt_events(&mut self, events: &WorkingProcessEvents) -> io::Result<()> {
         if working_started(events) {
             if let Some(prompt) = self.state.pending_prompt.clone() {
@@ -654,6 +775,10 @@ impl TuiApp {
 
         let request_messages = history.for_request(None);
         self.log_plain_request_started(&run_id, &turn_id, &prompt)?;
+        self.llm_diagnostics
+            .record_request_started(&run_id, &turn_id);
+        self.log_runtime_process_started(&run_id, &turn_id)?;
+        self.set_runtime_working_phase(WorkingPhase::Interpret, "로컬 LLM 응답을 기다립니다.")?;
 
         let (sender, receiver) = mpsc::channel();
         let config = self.runtime_config.clone();
@@ -698,9 +823,6 @@ impl TuiApp {
                 );
                 self.log_message_recorded(&active.history, &failure_message)?;
                 self.log_plain_request_failed_channel(&active)?;
-                let complete_outcome = self.state.complete_working_process();
-                self.log_working_process_events(&complete_outcome.working_process_events.events)?;
-                self.log_workspace_events(&complete_outcome.workspace_events.events)?;
                 let mut events = self
                     .state
                     .record_system_notice("request failed: runtime_channel_disconnected");
@@ -708,7 +830,19 @@ impl TuiApp {
                     self.state
                         .record_system_notice("message local request worker ended unexpectedly"),
                 );
-                self.log_workspace_events(&events.events)?;
+                self.set_runtime_working_phase(
+                    WorkingPhase::Execute,
+                    "요청 채널이 끊겨 실행하지 않습니다.",
+                )?;
+                self.set_runtime_working_phase(
+                    WorkingPhase::Apply,
+                    "요청 채널 실패를 workspace에 반영합니다.",
+                )?;
+                self.finish_plain_request_with_events(
+                    events,
+                    "요청 실패 원인을 보고합니다.",
+                    Some((&active.run_id, &active.turn_id)),
+                )?;
                 return Ok(());
             }
         };
@@ -727,6 +861,7 @@ impl TuiApp {
 
         let events = match &report.status {
             LlmChatStatus::Succeeded { answer } => {
+                self.llm_diagnostics.record_request_report(&report);
                 let assistant_message = active.history.append(
                     active.turn_id.clone(),
                     LlmMessageRole::Assistant,
@@ -736,28 +871,101 @@ impl TuiApp {
                 self.log_message_recorded(&active.history, &assistant_message)?;
                 self.log_plain_response_received(&active, &report)?;
                 self.log_raw_response_received(&active, answer)?;
+                self.set_runtime_working_phase(
+                    WorkingPhase::Classify,
+                    "모델 응답 형식을 분류합니다.",
+                )?;
                 if active.repair_attempts > 0 {
                     self.log_repair_response_received(&active, answer)?;
                 }
                 match parse_runtime_response(answer) {
                     Ok(parsed) => {
                         self.log_runtime_response_parsed(&active, &parsed)?;
+                        self.llm_diagnostics.record_parse_success(
+                            parsed.response.response_type(),
+                            parsed.response.activity().as_str(),
+                            parsed.payloads.len(),
+                        );
                         if active.repair_attempts > 0 {
                             self.log_repair_succeeded(&active, &parsed)?;
+                            self.llm_diagnostics.record_repair_succeeded(
+                                active.repair_attempts,
+                                RepairLoop::default_local().max_attempts(),
+                            );
                         }
-                        self.record_parsed_runtime_response(&parsed)
+                        self.set_runtime_working_phase(
+                            WorkingPhase::Validate,
+                            "응답 후보를 runtime decision으로 검증합니다.",
+                        )?;
+                        self.log_runtime_decision_started(&active, &parsed)?;
+                        match DecisionGate::classify(&parsed) {
+                            Ok(decision) => {
+                                self.log_runtime_decision_recorded(&active, &decision)?;
+                                self.llm_diagnostics.record_decision(
+                                    decision.kind(),
+                                    decision.activity().map(|activity| activity.as_str()),
+                                    decision.tool_name(),
+                                );
+                                if decision.tool_name().is_some() {
+                                    self.log_tool_candidate_classified(&active, &decision)?;
+                                }
+                                self.set_runtime_working_phase(
+                                    WorkingPhase::Execute,
+                                    runtime_execute_detail(&decision),
+                                )?;
+                                self.set_runtime_working_phase(
+                                    WorkingPhase::Apply,
+                                    "결정 결과를 workspace에 반영합니다.",
+                                )?;
+                                self.record_runtime_decision(&decision)
+                            }
+                            Err(error) => {
+                                self.log_runtime_decision_failed(&active, &error)?;
+                                self.llm_diagnostics
+                                    .record_decision_failure(error.kind.as_str());
+                                self.set_runtime_working_phase(
+                                    WorkingPhase::Execute,
+                                    "실행 가능한 후보가 없어 실행하지 않습니다.",
+                                )?;
+                                self.set_runtime_working_phase(
+                                    WorkingPhase::Apply,
+                                    "검증 실패를 workspace에 반영합니다.",
+                                )?;
+                                self.record_runtime_decision_error(&error)
+                            }
+                        }
                     }
                     Err(error) => {
                         self.log_runtime_response_parse_failed(&active, answer, &error)?;
+                        self.llm_diagnostics
+                            .record_parse_failure(error.kind.as_str());
                         match RepairLoop::default_local()
                             .next_request(active.repair_attempts, &error)
                         {
                             Ok(repair_request) => {
+                                self.llm_diagnostics.record_repair_started(
+                                    repair_request.attempt,
+                                    repair_request.max_attempts,
+                                );
+                                self.set_runtime_working_phase(
+                                    WorkingPhase::Classify,
+                                    "응답 오류를 repair 요청으로 재구성합니다.",
+                                )?;
                                 self.start_repair_request(active, repair_request)?;
                                 return Ok(());
                             }
                             Err(limit) => {
                                 self.log_repair_limit_reached(&active, &limit)?;
+                                self.llm_diagnostics
+                                    .record_repair_limited(limit.attempts, limit.max_attempts);
+                                self.set_runtime_working_phase(
+                                    WorkingPhase::Execute,
+                                    "실행 가능한 응답이 없어 실행하지 않습니다.",
+                                )?;
+                                self.set_runtime_working_phase(
+                                    WorkingPhase::Apply,
+                                    "repair 제한 초과를 workspace에 반영합니다.",
+                                )?;
                                 self.record_runtime_response_parse_error(&error)
                             }
                         }
@@ -765,6 +973,7 @@ impl TuiApp {
                 }
             }
             LlmChatStatus::Failed(failure) => {
+                self.llm_diagnostics.record_request_report(&report);
                 let failure_message = active.history.append(
                     active.turn_id.clone(),
                     LlmMessageRole::System,
@@ -773,10 +982,22 @@ impl TuiApp {
                 );
                 self.log_message_recorded(&active.history, &failure_message)?;
                 self.log_plain_request_failed(&active, &report)?;
+                self.set_runtime_working_phase(
+                    WorkingPhase::Execute,
+                    "요청이 실패해 실행하지 않습니다.",
+                )?;
+                self.set_runtime_working_phase(
+                    WorkingPhase::Apply,
+                    "요청 실패를 workspace에 반영합니다.",
+                )?;
                 self.record_plain_chat_failure(&report)
             }
         };
-        self.finish_plain_request_with_events(events)
+        self.finish_plain_request_with_events(
+            events,
+            "응답 준비를 마무리합니다.",
+            Some((&active.run_id, &active.turn_id)),
+        )
     }
 
     fn cancel_active_plain_request(&mut self) -> io::Result<()> {
@@ -792,6 +1013,7 @@ impl TuiApp {
         );
         self.log_message_recorded(&active.history, &cancel_message)?;
         self.log_plain_request_cancelled(&active)?;
+        self.log_runtime_process_cancelled(&active)?;
         self.state.pending_prompt = None;
         Ok(())
     }
@@ -819,26 +1041,42 @@ impl TuiApp {
         events
     }
 
-    fn record_parsed_runtime_response(
-        &mut self,
-        parsed: &ParsedRuntimeResponse,
-    ) -> WorkspaceEvents {
-        match &parsed.response {
-            RuntimeResponse::Answer(response) => self.state.record_answer(response.message.clone()),
-            RuntimeResponse::Clarify(response) => {
-                self.state.record_answer(response.message.clone())
-            }
-            RuntimeResponse::Blocked(response) => {
+    fn record_runtime_decision(&mut self, decision: &RuntimeDecision) -> WorkspaceEvents {
+        match decision {
+            RuntimeDecision::Answer { message } => self.state.record_answer(message.clone()),
+            RuntimeDecision::Clarify { message, .. } => self.state.record_answer(message.clone()),
+            RuntimeDecision::Blocked { message, .. } => {
                 let mut events = self.state.record_system_notice("response blocked");
-                events.extend(self.state.record_system_notice(response.message.clone()));
+                events.extend(self.state.record_system_notice(message.clone()));
                 events
             }
-            RuntimeResponse::Tool(response) => self.state.record_system_notice(format!(
-                "tool candidate parsed: {} ({})",
-                response.tool_name,
-                response.activity.as_str()
+            RuntimeDecision::ToolCandidatePending {
+                activity,
+                tool_name,
+                ..
+            } => self.state.record_system_notice(format!(
+                "tool candidate pending: {} ({})",
+                tool_name,
+                activity.as_str()
+            )),
+            RuntimeDecision::ApprovalNeeded {
+                activity,
+                tool_name,
+                ..
+            } => self.state.record_system_notice(format!(
+                "approval needed: {} ({})",
+                tool_name,
+                activity.as_str()
             )),
         }
+    }
+
+    fn record_runtime_decision_error(&mut self, error: &RuntimeDecisionError) -> WorkspaceEvents {
+        let mut events = self
+            .state
+            .record_system_notice(format!("runtime decision failed: {}", error.kind.as_str()));
+        events.extend(self.state.record_system_notice(error.message.clone()));
+        events
     }
 
     fn record_runtime_response_parse_error(
@@ -883,10 +1121,32 @@ impl TuiApp {
         Ok(())
     }
 
-    fn finish_plain_request_with_events(&mut self, events: WorkspaceEvents) -> io::Result<()> {
+    fn set_runtime_working_phase(
+        &mut self,
+        phase: WorkingPhase,
+        detail: impl Into<String>,
+    ) -> io::Result<()> {
+        let detail = detail.into();
+        let runtime_outcome = self.state.set_working_process_phase(phase, detail.clone());
+        self.log_working_process_events(&runtime_outcome.working_process_events.events)?;
+        self.log_workspace_events(&runtime_outcome.workspace_events.events)?;
+        if !runtime_outcome.working_process_events.events.is_empty() {
+            self.log_runtime_process_phase_changed(phase, &detail)?;
+        }
+        Ok(())
+    }
+
+    fn finish_plain_request_with_events(
+        &mut self,
+        events: WorkspaceEvents,
+        answer_detail: &str,
+        runtime_ids: Option<(&str, &str)>,
+    ) -> io::Result<()> {
+        self.set_runtime_working_phase(WorkingPhase::Answer, answer_detail)?;
         let complete_outcome = self.state.complete_working_process();
         self.log_working_process_events(&complete_outcome.working_process_events.events)?;
         self.log_workspace_events(&complete_outcome.workspace_events.events)?;
+        self.log_runtime_process_completed(runtime_ids)?;
         self.state.pending_prompt = None;
         self.log_workspace_events(&events.events)
     }
@@ -1183,6 +1443,132 @@ impl TuiApp {
                 "max_attempts": limit.max_attempts,
                 "failure_signature": &limit.failure_signature,
                 "reason": limit.reason.as_str(),
+            }),
+        ))
+    }
+
+    fn log_runtime_decision_started(
+        &self,
+        active: &ActivePlainRequest,
+        parsed: &ParsedRuntimeResponse,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_08_SCOPE,
+            EVENT_RUNTIME_DECISION_STARTED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "response_type": parsed.response.response_type(),
+                "activity": parsed.response.activity().as_str(),
+                "payload_count": parsed.payloads.len(),
+            }),
+        ))
+    }
+
+    fn log_runtime_decision_recorded(
+        &self,
+        active: &ActivePlainRequest,
+        decision: &RuntimeDecision,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_08_SCOPE,
+            EVENT_RUNTIME_DECISION_RECORDED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "decision": decision.kind(),
+                "activity": decision.activity().map(|activity| activity.as_str()),
+                "tool_name": decision.tool_name(),
+            }),
+        ))
+    }
+
+    fn log_tool_candidate_classified(
+        &self,
+        active: &ActivePlainRequest,
+        decision: &RuntimeDecision,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_08_SCOPE,
+            EVENT_TOOL_CANDIDATE_CLASSIFIED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "decision": decision.kind(),
+                "activity": decision.activity().map(|activity| activity.as_str()),
+                "tool_name": decision.tool_name(),
+            }),
+        ))
+    }
+
+    fn log_runtime_decision_failed(
+        &self,
+        active: &ActivePlainRequest,
+        error: &RuntimeDecisionError,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_08_SCOPE,
+            EVENT_RUNTIME_DECISION_FAILED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "error_kind": error.kind.as_str(),
+                "message": &error.message,
+                "recoverable": true,
+            }),
+        ))
+    }
+
+    fn log_runtime_process_started(&self, run_id: &str, turn_id: &str) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_09_SCOPE,
+            EVENT_WORKING_PROCESS_STARTED,
+            json!({
+                "run_id": run_id,
+                "turn_id": turn_id,
+                "phase": WorkingPhase::Interpret.label(),
+                "step": WorkingPhase::Interpret.number(),
+            }),
+        ))
+    }
+
+    fn log_runtime_process_phase_changed(
+        &self,
+        phase: WorkingPhase,
+        detail: &str,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_09_SCOPE,
+            EVENT_WORKING_PROCESS_PHASE_CHANGED,
+            json!({
+                "phase": phase.label(),
+                "step": phase.number(),
+                "detail": detail,
+            }),
+        ))
+    }
+
+    fn log_runtime_process_cancelled(&self, active: &ActivePlainRequest) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_09_SCOPE,
+            EVENT_WORKING_PROCESS_CANCELLED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "reason": "canceled",
+            }),
+        ))
+    }
+
+    fn log_runtime_process_completed(&self, runtime_ids: Option<(&str, &str)>) -> io::Result<()> {
+        let (run_id, turn_id) = runtime_ids.unwrap_or(("", ""));
+        self.logger.llm(LogEvent::ui(
+            LLM_09_SCOPE,
+            EVENT_WORKING_PROCESS_COMPLETED,
+            json!({
+                "run_id": run_id,
+                "turn_id": turn_id,
+                "reason": "completed",
             }),
         ))
     }
@@ -1604,6 +1990,20 @@ fn working_cancelled(events: &WorkingProcessEvents) -> bool {
             }
         )
     })
+}
+
+fn runtime_execute_detail(decision: &RuntimeDecision) -> &'static str {
+    match decision {
+        RuntimeDecision::Answer { .. }
+        | RuntimeDecision::Clarify { .. }
+        | RuntimeDecision::Blocked { .. } => "실행할 도구가 없어 실행 단계를 통과합니다.",
+        RuntimeDecision::ToolCandidatePending { .. } => {
+            "도구 후보를 실행하지 않고 다음 runtime 단계로 넘깁니다."
+        }
+        RuntimeDecision::ApprovalNeeded { .. } => {
+            "승인이 필요한 후보이므로 직접 실행하지 않습니다."
+        }
+    }
 }
 
 fn log_main_scene_rendered(logger: &Logger, run_mode: &str) -> io::Result<()> {
