@@ -21,6 +21,7 @@ const REQUIRED_SCHEMA_RULES: &[&str] = &[
     "tool_manifest_version",
     "Unknown fields are rejected.",
     "Do not wrap JSON in markdown or code fences.",
+    "Use answer_payload_id and raw markdown payload blocks for code or markdown answers.",
     "Do not put source, patch, or file body text inside JSON string fields.",
     "Use payload_id and raw payload blocks for source, patch, or file body text.",
 ];
@@ -61,7 +62,7 @@ impl SchemaPromptBuilder {
             "- Ask",
             "",
             "Response shape rules:",
-            "- answer uses response_type, activity, message, tool_manifest_id, tool_manifest_version.",
+            "- answer uses response_type, activity, message, optional answer_payload_id, tool_manifest_id, tool_manifest_version.",
             "- tool uses response_type, activity, message, tool_name, arguments, reason, tool_manifest_id, tool_manifest_version.",
             "- clarify uses response_type, activity, message, reason, tool_manifest_id, tool_manifest_version.",
             "- blocked uses response_type, activity, message, reason, tool_manifest_id, tool_manifest_version.",
@@ -72,12 +73,15 @@ impl SchemaPromptBuilder {
             "- Do not wrap JSON in markdown or code fences.",
             "",
             "Raw payload rules:",
+            "- Do not put code or markdown answer bodies inside message.",
+            "- Use answer_payload_id and raw markdown payload blocks for code or markdown answers.",
             "- Do not put source, patch, or file body text inside JSON string fields.",
             "- Use payload_id and raw payload blocks for source, patch, or file body text.",
             "- A payload_id reference must have exactly one matching raw payload block.",
             "",
             "Example answer:",
-            r#"{"response_type":"answer","activity":"None","message":"...","tool_manifest_id":"ahreumcode.local-llm.tool-manifest.v1","tool_manifest_version":"1"}"#,
+            r#"{"response_type":"answer","activity":"None","message":"short summary","answer_payload_id":"answer_001","tool_manifest_id":"ahreumcode.local-llm.tool-manifest.v1","tool_manifest_version":"1"}"#,
+            r#"<AHREUM_PAYLOAD id="answer_001" format="markdown">answer body</AHREUM_PAYLOAD>"#,
         ]
         .join("\n");
 

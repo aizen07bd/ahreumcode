@@ -90,6 +90,7 @@ pub enum ChatFailureKind {
     EndpointFailure,
     InvalidEndpoint,
     InvalidResponse,
+    ModelEmptyResponse,
 }
 
 impl ChatFailureKind {
@@ -100,6 +101,7 @@ impl ChatFailureKind {
             Self::EndpointFailure => "endpoint_failure",
             Self::InvalidEndpoint => "invalid_endpoint",
             Self::InvalidResponse => "invalid_response",
+            Self::ModelEmptyResponse => "model_empty_response",
         }
     }
 }

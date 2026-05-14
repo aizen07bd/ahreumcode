@@ -179,7 +179,7 @@ fn parse_chat_response(raw: &str) -> Result<String, LlmChatFailure> {
 
     if choice.message.content.trim().is_empty() {
         return Err(LlmChatFailure::new(
-            ChatFailureKind::InvalidResponse,
+            ChatFailureKind::ModelEmptyResponse,
             "chat response content was empty",
         ));
     }
@@ -338,5 +338,14 @@ mod tests {
         .expect("chat response should parse");
 
         assert_eq!(answer, "plain answer");
+    }
+
+    #[test]
+    fn classifies_empty_chat_content_as_model_empty_response() {
+        let failure =
+            parse_chat_response(r#"{"choices":[{"message":{"role":"assistant","content":""}}]}"#)
+                .expect_err("empty assistant content should fail");
+
+        assert_eq!(failure.kind.as_str(), "model_empty_response");
     }
 }

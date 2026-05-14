@@ -16,6 +16,7 @@ const COMMON_FIELDS: &[&str] = &[
     "tool_manifest_id",
     "tool_manifest_version",
 ];
+const ANSWER_FIELDS: &[&str] = &["answer_payload_id"];
 const TOOL_FIELDS: &[&str] = &["tool_name", "arguments", "reason"];
 const REASON_FIELD: &[&str] = &["reason"];
 const FORBIDDEN_RAW_ARGUMENT_FIELDS: &[&str] = &[
@@ -76,6 +77,7 @@ impl RuntimeResponse {
 pub struct RuntimeAnswer {
     pub activity: Activity,
     pub message: String,
+    pub answer_payload_id: Option<String>,
     pub manifest: RuntimeManifest,
 }
 
@@ -392,12 +394,13 @@ fn to_runtime_response(
 
     match response_type {
         "answer" => {
-            validate_allowed_fields(envelope, COMMON_FIELDS)?;
+            validate_allowed_fields(envelope, &[COMMON_FIELDS, ANSWER_FIELDS].concat())?;
             validate_activity_pair(response_type, activity)?;
-            reject_unreferenced_payloads(payloads)?;
+            let answer_payload_id = optional_str(envelope, "answer_payload_id")?.map(str::to_owned);
             Ok(RuntimeResponse::Answer(RuntimeAnswer {
                 activity,
                 message,
+                answer_payload_id,
                 manifest,
             }))
         }
@@ -506,31 +509,59 @@ fn validate_payload_reference(
     response: &RuntimeResponse,
     payloads: &[RuntimePayload],
 ) -> Result<(), RuntimeResponseParseError> {
-    let RuntimeResponse::Tool(candidate) = response else {
-        return Ok(());
-    };
-    let Some(payload_id) = candidate
-        .arguments
-        .as_object()
-        .and_then(|arguments| arguments.get("payload_id"))
-    else {
-        reject_unreferenced_payloads(payloads)?;
-        return Ok(());
-    };
-    let payload_id = payload_id
-        .as_str()
-        .ok_or_else(|| RuntimeResponseParseError::payload("payload_id must be a string"))?;
+    match response {
+        RuntimeResponse::Answer(answer) => {
+            let Some(payload_id) = answer.answer_payload_id.as_deref() else {
+                return reject_unreferenced_payloads(payloads);
+            };
+            validate_single_payload_reference(payload_id, payloads, Some("markdown"))
+        }
+        RuntimeResponse::Tool(candidate) => {
+            let Some(payload_id) = candidate
+                .arguments
+                .as_object()
+                .and_then(|arguments| arguments.get("payload_id"))
+            else {
+                reject_unreferenced_payloads(payloads)?;
+                return Ok(());
+            };
+            let payload_id = payload_id
+                .as_str()
+                .ok_or_else(|| RuntimeResponseParseError::payload("payload_id must be a string"))?;
+            validate_single_payload_reference(payload_id, payloads, None)
+        }
+        RuntimeResponse::Clarify(_) | RuntimeResponse::Blocked(_) => {
+            reject_unreferenced_payloads(payloads)
+        }
+    }
+}
+
+fn validate_single_payload_reference(
+    payload_id: &str,
+    payloads: &[RuntimePayload],
+    expected_format: Option<&str>,
+) -> Result<(), RuntimeResponseParseError> {
     let matches = payloads
         .iter()
         .filter(|payload| payload.id == payload_id)
-        .count();
+        .collect::<Vec<_>>();
 
-    match matches {
-        1 if payloads.len() == 1 => Ok(()),
-        1 => Err(RuntimeResponseParseError::payload(
+    match matches.as_slice() {
+        [payload] if payloads.len() == 1 => {
+            if let Some(expected_format) = expected_format {
+                if payload.format != expected_format {
+                    return Err(RuntimeResponseParseError::payload(format!(
+                        "payload format must be {expected_format}: {}",
+                        payload.format
+                    )));
+                }
+            }
+            Ok(())
+        }
+        [_] => Err(RuntimeResponseParseError::payload(
             "payload block exists without payload_id reference",
         )),
-        0 => Err(RuntimeResponseParseError::payload(format!(
+        [] => Err(RuntimeResponseParseError::payload(format!(
             "missing payload block: {payload_id}"
         ))),
         _ => Err(RuntimeResponseParseError::payload(format!(
@@ -582,6 +613,19 @@ fn required_str<'a>(
         .ok_or_else(|| RuntimeResponseParseError::schema(format!("field must be string: {key}")))
 }
 
+fn optional_str<'a>(
+    envelope: &'a Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, RuntimeResponseParseError> {
+    let Some(value) = envelope.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| RuntimeResponseParseError::schema(format!("field must be string: {key}")))
+}
+
 fn required_object_value<'a>(
     envelope: &'a Map<String, Value>,
     key: &str,
@@ -620,7 +664,57 @@ mod tests {
         };
         assert_eq!(answer.activity, Activity::None);
         assert_eq!(answer.message, "ready");
+        assert_eq!(answer.answer_payload_id, None);
         assert!(parsed.payloads.is_empty());
+    }
+
+    #[test]
+    fn parses_answer_response_with_markdown_payload() {
+        let raw = format!(
+            r#"<AHREUM_ACTION>
+{{"response_type":"answer","activity":"None","message":"summary","answer_payload_id":"answer_001",{} }}
+</AHREUM_ACTION>
+
+<AHREUM_PAYLOAD id="answer_001" format="markdown">
+```typescript
+const greeting: string = "Hello, World!";
+console.log(greeting);
+```
+</AHREUM_PAYLOAD>"#,
+            manifest_fields()
+        );
+
+        let parsed = parse_runtime_response(&raw).expect("answer payload should parse");
+
+        let RuntimeResponse::Answer(answer) = parsed.response else {
+            panic!("expected answer");
+        };
+        assert_eq!(answer.answer_payload_id.as_deref(), Some("answer_001"));
+        assert_eq!(parsed.payloads[0].format, "markdown");
+        assert!(parsed.payloads[0].body.contains("Hello, World!"));
+    }
+
+    #[test]
+    fn rejects_answer_payload_without_markdown_format() {
+        let raw = format!(
+            r#"<AHREUM_ACTION>
+{{"response_type":"answer","activity":"None","message":"summary","answer_payload_id":"answer_001",{} }}
+</AHREUM_ACTION>
+
+<AHREUM_PAYLOAD id="answer_001" format="text">
+body
+</AHREUM_PAYLOAD>"#,
+            manifest_fields()
+        );
+
+        let error =
+            parse_runtime_response(&raw).expect_err("wrong answer payload format should fail");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::PayloadValidationFailed
+        );
+        assert!(error.message.contains("markdown"));
     }
 
     #[test]

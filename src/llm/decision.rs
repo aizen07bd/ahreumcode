@@ -1,7 +1,7 @@
 use serde_json::{Map, Value};
 
 use super::response_parser::{
-    Activity, ParsedRuntimeResponse, RuntimeResponse, RuntimeToolCandidate,
+    Activity, ParsedRuntimeResponse, RuntimeAnswer, RuntimeResponse, RuntimeToolCandidate,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,9 +102,7 @@ impl DecisionGate {
         parsed: &ParsedRuntimeResponse,
     ) -> Result<RuntimeDecision, RuntimeDecisionError> {
         match &parsed.response {
-            RuntimeResponse::Answer(response) => Ok(RuntimeDecision::Answer {
-                message: response.message.clone(),
-            }),
+            RuntimeResponse::Answer(response) => classify_answer(response, parsed),
             RuntimeResponse::Clarify(response) => Ok(RuntimeDecision::Clarify {
                 message: response.message.clone(),
                 reason: response.reason.clone(),
@@ -116,6 +114,30 @@ impl DecisionGate {
             RuntimeResponse::Tool(candidate) => classify_tool_candidate(candidate, parsed),
         }
     }
+}
+
+fn classify_answer(
+    response: &RuntimeAnswer,
+    parsed: &ParsedRuntimeResponse,
+) -> Result<RuntimeDecision, RuntimeDecisionError> {
+    let Some(payload_id) = response.answer_payload_id.as_deref() else {
+        return Ok(RuntimeDecision::Answer {
+            message: response.message.clone(),
+        });
+    };
+    let payload = parsed
+        .payloads
+        .iter()
+        .find(|payload| payload.id == payload_id)
+        .ok_or_else(|| {
+            RuntimeDecisionError::invalid_arguments(format!(
+                "answer_payload_id has no matching payload: {payload_id}"
+            ))
+        })?;
+
+    Ok(RuntimeDecision::Answer {
+        message: payload.body.clone(),
+    })
 }
 
 fn classify_tool_candidate(
@@ -454,6 +476,7 @@ mod tests {
             response: RuntimeResponse::Answer(RuntimeAnswer {
                 activity: Activity::None,
                 message: "done".to_owned(),
+                answer_payload_id: None,
                 manifest: manifest(),
             }),
             payloads: Vec::new(),
@@ -465,6 +488,32 @@ mod tests {
             decision,
             RuntimeDecision::Answer {
                 message: "done".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_answer_payload_body_as_answer_message() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Answer(RuntimeAnswer {
+                activity: Activity::None,
+                message: "summary".to_owned(),
+                answer_payload_id: Some("answer_001".to_owned()),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "answer_001".to_owned(),
+                format: "markdown".to_owned(),
+                body: "```typescript\nconsole.log(\"Hello\");\n```".to_owned(),
+            }],
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("payload answer should classify");
+
+        assert_eq!(
+            decision,
+            RuntimeDecision::Answer {
+                message: "```typescript\nconsole.log(\"Hello\");\n```".to_owned()
             }
         );
     }
