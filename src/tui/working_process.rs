@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum WorkingPhase {
@@ -51,8 +51,6 @@ pub const PHASES: [WorkingPhase; 6] = [
     WorkingPhase::Answer,
 ];
 
-const PHASE_DURATION: Duration = Duration::from_secs(1);
-
 pub struct WorkingProcessState {
     active: bool,
     phase: WorkingPhase,
@@ -97,10 +95,6 @@ impl WorkingProcessState {
         }
 
         let elapsed = self.started_at.elapsed();
-        if elapsed >= PHASE_DURATION * PHASES.len() as u32 {
-            return self.finish(WorkingFinishReason::Completed);
-        }
-
         let phase_index = (elapsed.as_secs() as usize).min(PHASES.len() - 1);
         if phase_index == self.last_phase_index {
             return WorkingProcessEvents::none();
@@ -121,6 +115,19 @@ impl WorkingProcessState {
             return WorkingProcessEvents::none();
         }
         self.finish(WorkingFinishReason::Canceled)
+    }
+
+    pub fn complete(&mut self) -> WorkingProcessEvents {
+        if !self.active {
+            return WorkingProcessEvents::none();
+        }
+        self.active = false;
+        WorkingProcessEvents {
+            events: vec![WorkingProcessEvent::Finished {
+                reason: WorkingFinishReason::Completed,
+            }],
+            workspace_line: None,
+        }
     }
 
     pub fn is_active(&self) -> bool {

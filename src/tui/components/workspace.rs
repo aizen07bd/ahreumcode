@@ -37,6 +37,15 @@ fn workspace_lines(workspace: &WorkspaceBuffer, width: u16) -> Vec<Line<'static>
                     Span::styled(text.clone(), style::panel()),
                 ]));
             }
+            WorkspaceItem::AssistantAnswer { text } => {
+                lines.push(Line::from(Span::styled("Answer", style::cyan())));
+                for line in text.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  ", style::muted()),
+                        Span::styled(line.to_owned(), style::panel()),
+                    ]));
+                }
+            }
             WorkspaceItem::ActivityOutput { group, summary } => {
                 lines.push(Line::from(vec![
                     Span::styled(group.label(), style::cyan()),

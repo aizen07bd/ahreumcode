@@ -3,10 +3,14 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::config::RuntimeConfig;
 
-use super::provider::{HealthFailureKind, LlmHealthFailure, LlmHealthReport, LlmHealthStatus};
+use super::provider::{
+    ChatFailureKind, HealthFailureKind, LlmChatFailure, LlmChatReport, LlmChatRequest,
+    LlmChatStatus, LlmHealthFailure, LlmHealthReport, LlmHealthStatus,
+};
 
 pub struct LmStudioProvider {
     provider: String,
@@ -57,6 +61,24 @@ impl LmStudioProvider {
         }
     }
 
+    pub fn send_chat(&self, request: LlmChatRequest) -> LlmChatReport {
+        let chat_url = build_chat_request(&self.base_url);
+        let started_at = Instant::now();
+        let status = self
+            .request_chat(&chat_url, &request.prompt)
+            .map(|answer| LlmChatStatus::Succeeded { answer })
+            .unwrap_or_else(LlmChatStatus::Failed);
+
+        LlmChatReport {
+            provider: self.provider.clone(),
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            chat_url,
+            latency_ms: started_at.elapsed().as_millis(),
+            status,
+        }
+    }
+
     fn request_models(&self, models_url: &str) -> Result<Vec<String>, LlmHealthFailure> {
         let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
         let response = agent.get(models_url).call().map_err(map_provider_error)?;
@@ -69,10 +91,50 @@ impl LmStudioProvider {
 
         parse_models_response(&raw)
     }
+
+    fn request_chat(&self, chat_url: &str, prompt: &str) -> Result<String, LlmChatFailure> {
+        let body = build_plain_chat_request(&self.model, prompt)?;
+        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
+        let response = agent
+            .post(chat_url)
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+            .map_err(map_chat_provider_error)?;
+        let raw = response.into_string().map_err(|source| {
+            LlmChatFailure::new(
+                ChatFailureKind::InvalidResponse,
+                format!("failed to read chat response: {source}"),
+            )
+        })?;
+
+        parse_chat_response(&raw)
+    }
 }
 
 pub fn build_models_request(base_url: &str) -> String {
     format!("{}/models", base_url.trim_end_matches('/'))
+}
+
+pub fn build_chat_request(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+fn build_plain_chat_request(model: &str, prompt: &str) -> Result<String, LlmChatFailure> {
+    serde_json::to_string(&json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }))
+    .map_err(|source| {
+        LlmChatFailure::new(
+            ChatFailureKind::InvalidResponse,
+            format!("failed to build chat request: {source}"),
+        )
+    })
 }
 
 fn parse_models_response(raw: &str) -> Result<Vec<String>, LlmHealthFailure> {
@@ -84,6 +146,31 @@ fn parse_models_response(raw: &str) -> Result<Vec<String>, LlmHealthFailure> {
     })?;
 
     Ok(response.data.into_iter().map(|model| model.id).collect())
+}
+
+fn parse_chat_response(raw: &str) -> Result<String, LlmChatFailure> {
+    let response: ChatResponse = serde_json::from_str(raw).map_err(|source| {
+        LlmChatFailure::new(
+            ChatFailureKind::InvalidResponse,
+            format!("failed to parse chat response: {source}"),
+        )
+    })?;
+
+    let Some(choice) = response.choices.into_iter().next() else {
+        return Err(LlmChatFailure::new(
+            ChatFailureKind::InvalidResponse,
+            "chat response did not include choices",
+        ));
+    };
+
+    if choice.message.content.trim().is_empty() {
+        return Err(LlmChatFailure::new(
+            ChatFailureKind::InvalidResponse,
+            "chat response content was empty",
+        ));
+    }
+
+    Ok(choice.message.content)
 }
 
 fn map_provider_error(error: ureq::Error) -> LlmHealthFailure {
@@ -108,6 +195,28 @@ fn map_provider_error(error: ureq::Error) -> LlmHealthFailure {
     }
 }
 
+fn map_chat_provider_error(error: ureq::Error) -> LlmChatFailure {
+    match error {
+        ureq::Error::Status(status, _) => LlmChatFailure::with_http_status(
+            ChatFailureKind::EndpointFailure,
+            status,
+            format!("chat endpoint returned HTTP {status}"),
+        ),
+        ureq::Error::Transport(transport) => match transport.kind() {
+            ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns => {
+                LlmChatFailure::new(ChatFailureKind::ConnectionFailed, transport.to_string())
+            }
+            ureq::ErrorKind::InvalidUrl | ureq::ErrorKind::UnknownScheme => {
+                LlmChatFailure::new(ChatFailureKind::InvalidEndpoint, transport.to_string())
+            }
+            ureq::ErrorKind::Io if is_timeout(&transport) => {
+                LlmChatFailure::new(ChatFailureKind::Timeout, transport.to_string())
+            }
+            _ => LlmChatFailure::new(ChatFailureKind::EndpointFailure, transport.to_string()),
+        },
+    }
+}
+
 fn is_timeout(transport: &ureq::Transport) -> bool {
     let Some(source) = transport.source() else {
         return false;
@@ -128,9 +237,29 @@ struct ModelItem {
     id: String,
 }
 
+#[derive(Deserialize)]
+struct ChatResponse {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
+}
+
+#[derive(Deserialize)]
+struct ChatMessage {
+    content: String,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_models_request, parse_models_response};
+    use serde_json::Value;
+
+    use super::{
+        build_chat_request, build_models_request, build_plain_chat_request, parse_chat_response,
+        parse_models_response,
+    };
 
     #[test]
     fn builds_models_endpoint_from_openai_compatible_base_url() {
@@ -148,5 +277,34 @@ mod tests {
         .expect("models response should parse");
 
         assert_eq!(models, vec!["google/gemma-4-e4b", "other"]);
+    }
+
+    #[test]
+    fn builds_chat_endpoint_from_openai_compatible_base_url() {
+        assert_eq!(
+            build_chat_request("http://127.0.0.1:1234/v1/"),
+            "http://127.0.0.1:1234/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn builds_plain_chat_request_with_user_message() {
+        let raw = build_plain_chat_request("google/gemma-4-e4b", "hello")
+            .expect("plain chat request should serialize");
+        let value: Value = serde_json::from_str(&raw).expect("request should be json");
+
+        assert_eq!(value["model"], "google/gemma-4-e4b");
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(value["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn parses_openai_compatible_chat_response() {
+        let answer = parse_chat_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":"plain answer"}}]}"#,
+        )
+        .expect("chat response should parse");
+
+        assert_eq!(answer, "plain answer");
     }
 }

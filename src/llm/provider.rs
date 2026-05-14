@@ -24,6 +24,83 @@ impl LlmProviderClient {
             Self::LmStudio(provider) => provider.health_check(),
         }
     }
+
+    pub fn send_chat(&self, request: LlmChatRequest) -> LlmChatReport {
+        match self {
+            Self::LmStudio(provider) => provider.send_chat(request),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LlmChatRequest {
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LlmChatReport {
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub chat_url: String,
+    pub latency_ms: u128,
+    pub status: LlmChatStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LlmChatStatus {
+    Succeeded { answer: String },
+    Failed(LlmChatFailure),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LlmChatFailure {
+    pub kind: ChatFailureKind,
+    pub message: String,
+    pub http_status: Option<u16>,
+}
+
+impl LlmChatFailure {
+    pub fn new(kind: ChatFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            http_status: None,
+        }
+    }
+
+    pub fn with_http_status(
+        kind: ChatFailureKind,
+        status: u16,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            http_status: Some(status),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatFailureKind {
+    ConnectionFailed,
+    Timeout,
+    EndpointFailure,
+    InvalidEndpoint,
+    InvalidResponse,
+}
+
+impl ChatFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectionFailed => "connection_failed",
+            Self::Timeout => "timeout",
+            Self::EndpointFailure => "endpoint_failure",
+            Self::InvalidEndpoint => "invalid_endpoint",
+            Self::InvalidResponse => "invalid_response",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

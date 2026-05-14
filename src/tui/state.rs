@@ -12,10 +12,8 @@ use super::persona::{
     PersonaBuffer, PersonaEvent, PersonaEvents, PersonaMessage, PersonaRendered,
     MIN_PERSONA_TERMINAL_WIDTH,
 };
-use super::working_process::{
-    WorkingFinishReason, WorkingProcessEvent, WorkingProcessEvents, WorkingProcessState,
-};
-use super::workspace::{ActivityGroup, WorkspaceBuffer, WorkspaceEvents, WorkspaceRendered};
+use super::working_process::{WorkingProcessEvents, WorkingProcessState};
+use super::workspace::{WorkspaceBuffer, WorkspaceEvents, WorkspaceRendered};
 
 #[derive(Clone, Copy)]
 pub enum Scene {
@@ -178,6 +176,19 @@ impl TuiState {
 
     pub fn record_system_notice(&mut self, text: impl Into<String>) -> WorkspaceEvents {
         self.workspace.push_system_notice(text)
+    }
+
+    pub fn record_answer(&mut self, text: impl Into<String>) -> WorkspaceEvents {
+        self.workspace.push_answer(text)
+    }
+
+    pub fn complete_working_process(&mut self) -> WorkingRuntimeOutcome {
+        let working_process_events = self.working_process.complete();
+        let workspace_events = self.record_working_workspace_items(&working_process_events);
+        WorkingRuntimeOutcome {
+            working_process_events,
+            workspace_events,
+        }
     }
 
     pub fn enter_main_for_runtime_output(&mut self) {
@@ -419,45 +430,6 @@ impl TuiState {
 
     fn record_working_workspace_items(&mut self, events: &WorkingProcessEvents) -> WorkspaceEvents {
         let mut workspace_events = WorkspaceEvents::none();
-        let finish_reason = events.events.iter().find_map(|event| match event {
-            WorkingProcessEvent::Finished { reason } => Some(*reason),
-            _ => None,
-        });
-
-        if finish_reason == Some(WorkingFinishReason::Completed) {
-            // tui-07 workspace render sample only.
-            // Remove this auto-injection block when LLM/tool events are connected.
-            workspace_events.extend(
-                self.workspace
-                    .push_work_output(ActivityGroup::Explore, "evidence block shell ready"),
-            );
-            workspace_events.extend(
-                self.workspace
-                    .push_work_output(ActivityGroup::Change, "diff summary shell ready"),
-            );
-            workspace_events.extend(
-                self.workspace
-                    .push_work_output(ActivityGroup::Execute, "execution output row shell ready"),
-            );
-            workspace_events.extend(self.workspace.push_work_output(
-                ActivityGroup::Configure,
-                "configuration output row shell ready",
-            ));
-            workspace_events.extend(
-                self.workspace
-                    .push_work_output(ActivityGroup::Ask, "response layout shell prepared"),
-            );
-            workspace_events.extend(self.workspace.push_evidence(
-                "read/search evidence shell",
-                "tool evidence will appear here after tool integration",
-            ));
-            workspace_events.extend(self.workspace.push_diff_summary(
-                "workspace/change-summary-shell",
-                0,
-                0,
-            ));
-        }
-
         if let Some(workspace_line) = &events.workspace_line {
             workspace_events.extend(self.workspace.push_result(workspace_line.clone()));
         }

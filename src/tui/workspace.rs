@@ -1,4 +1,5 @@
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub enum ActivityGroup {
     Explore,
     Change,
@@ -19,6 +20,7 @@ impl ActivityGroup {
     }
 }
 
+#[allow(dead_code)]
 pub enum WorkspaceItem {
     UserPrompt {
         text: String,
@@ -27,6 +29,9 @@ pub enum WorkspaceItem {
         text: String,
     },
     SystemNotice {
+        text: String,
+    },
+    AssistantAnswer {
         text: String,
     },
     ActivityOutput {
@@ -54,6 +59,7 @@ impl WorkspaceItem {
             Self::UserPrompt { .. } => "user_prompt",
             Self::ManagerMessage { .. } => "manager_message",
             Self::SystemNotice { .. } => "system_notice",
+            Self::AssistantAnswer { .. } => "assistant_answer",
             Self::ActivityOutput { .. } => "activity_output",
             Self::EvidenceBlock { .. } => "evidence",
             Self::DiffSummary { .. } => "diff_summary",
@@ -66,6 +72,7 @@ impl WorkspaceItem {
             Self::UserPrompt { .. } => 3,
             Self::ManagerMessage { .. } => 1,
             Self::SystemNotice { .. } => 1,
+            Self::AssistantAnswer { text } => text.lines().count().max(1) + 1,
             Self::ActivityOutput { .. } => 1,
             Self::EvidenceBlock { .. } => 2,
             Self::DiffSummary { expanded, .. } => {
@@ -104,6 +111,11 @@ impl WorkspaceBuffer {
         self.push_output(WorkspaceItem::SystemNotice { text: text.into() })
     }
 
+    pub fn push_answer(&mut self, text: impl Into<String>) -> WorkspaceEvents {
+        self.push_output(WorkspaceItem::AssistantAnswer { text: text.into() })
+    }
+
+    #[allow(dead_code)]
     pub fn push_work_output(
         &mut self,
         group: ActivityGroup,
@@ -115,6 +127,7 @@ impl WorkspaceBuffer {
         })
     }
 
+    #[allow(dead_code)]
     pub fn push_evidence(
         &mut self,
         title: impl Into<String>,
@@ -126,6 +139,7 @@ impl WorkspaceBuffer {
         })
     }
 
+    #[allow(dead_code)]
     pub fn push_diff_summary(
         &mut self,
         path: impl Into<String>,

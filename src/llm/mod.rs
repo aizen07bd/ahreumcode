@@ -1,4 +1,7 @@
 mod lm_studio;
 mod provider;
 
-pub use provider::{LlmHealthReport, LlmHealthStatus, LlmProviderFactory};
+pub use provider::{
+    LlmChatReport, LlmChatRequest, LlmChatStatus, LlmHealthReport, LlmHealthStatus,
+    LlmProviderFactory,
+};

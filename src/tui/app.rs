@@ -1,5 +1,7 @@
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event};
@@ -13,7 +15,10 @@ use serde_json::json;
 
 use crate::cli::{AppCommand, RunMode, SceneCommand};
 use crate::config::{ConfigLoadOutcome, ConfigLoadSource, RuntimeConfig};
-use crate::llm::{LlmHealthReport, LlmHealthStatus, LlmProviderFactory};
+use crate::llm::{
+    LlmChatReport, LlmChatRequest, LlmChatStatus, LlmHealthReport, LlmHealthStatus,
+    LlmProviderFactory,
+};
 use crate::logging::{LogEvent, Logger};
 
 use super::approval::ApprovalInputEvent;
@@ -24,7 +29,7 @@ use super::scenes::epilogue::print_epilogue;
 use super::scenes::intro::{handle_intro_event, render_intro};
 use super::scenes::main::{handle_main_event, render_main};
 use super::state::{Scene, TuiState};
-use super::working_process::WorkingProcessEvent;
+use super::working_process::{WorkingFinishReason, WorkingProcessEvent, WorkingProcessEvents};
 use super::workspace::{WorkspaceEvent, WorkspaceEvents, WorkspaceRendered};
 
 const TUI_01_SCOPE: &str = "tui-01-intro-scene";
@@ -39,6 +44,7 @@ const TUI_09_SCOPE: &str = "tui-09-complex-commands";
 const TUI_10_SCOPE: &str = "tui-10-modal-expanded-form";
 const LLM_01_SCOPE: &str = "llm-01-config-runtime";
 const LLM_02_SCOPE: &str = "llm-02-provider-connection";
+const LLM_03_SCOPE: &str = "llm-03-plain-prompt-request";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -86,6 +92,10 @@ const EVENT_LLM_HEALTH_CHECK_STARTED: &str = "llm_health_check_started";
 const EVENT_LLM_HEALTH_CHECK_SUCCEEDED: &str = "llm_health_check_succeeded";
 const EVENT_LLM_HEALTH_CHECK_FAILED: &str = "llm_health_check_failed";
 const EVENT_LLM_LATENCY_RECORDED: &str = "llm_latency_recorded";
+const EVENT_LLM_REQUEST_STARTED: &str = "llm_request_started";
+const EVENT_LLM_RESPONSE_RECEIVED: &str = "llm_response_received";
+const EVENT_LLM_REQUEST_CANCELLED: &str = "llm_request_cancelled";
+const EVENT_LLM_REQUEST_FAILED: &str = "llm_request_failed";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
@@ -294,10 +304,19 @@ struct TuiApp {
     state: TuiState,
     logger: Logger,
     runtime_config: RuntimeConfig,
+    active_plain_request: Option<ActivePlainRequest>,
+    next_run_index: u64,
     run_mode: &'static str,
     intro_render_logged: bool,
     main_render_logged: bool,
     terminal_restore_scope: Option<&'static str>,
+}
+
+struct ActivePlainRequest {
+    run_id: String,
+    prompt: String,
+    receiver: Receiver<LlmChatReport>,
+    cancelled: bool,
 }
 
 impl TuiApp {
@@ -313,6 +332,8 @@ impl TuiApp {
             state: TuiState::intro(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            active_plain_request: None,
+            next_run_index: 1,
             run_mode,
             intro_render_logged: false,
             main_render_logged: false,
@@ -332,6 +353,8 @@ impl TuiApp {
             state: TuiState::main(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            active_plain_request: None,
+            next_run_index: 1,
             run_mode,
             intro_render_logged: true,
             main_render_logged: false,
@@ -351,6 +374,8 @@ impl TuiApp {
             state: TuiState::epilogue(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            active_plain_request: None,
+            next_run_index: 1,
             run_mode,
             intro_render_logged: true,
             main_render_logged: true,
@@ -368,6 +393,8 @@ impl TuiApp {
         }
 
         while !self.state.should_quit {
+            self.poll_plain_prompt_request()?;
+
             if matches!(self.state.scene, Scene::Main) {
                 let runtime_outcome = self.state.tick_working_process();
                 self.log_working_process_events(&runtime_outcome.working_process_events.events)?;
@@ -403,6 +430,7 @@ impl TuiApp {
                         self.log_working_process_events(&action.working_process_events.events)?;
                         self.log_workspace_events(&action.workspace_events.events)?;
                         self.handle_runtime_dispatch(action.command_outcome.dispatch)?;
+                        self.handle_plain_prompt_events(&action.working_process_events)?;
                         if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "intro_prompt")?;
@@ -418,6 +446,7 @@ impl TuiApp {
                         self.log_persona_events(&action.persona_events.events)?;
                         self.log_expanded_form_events(&action.expanded_form_events.events)?;
                         self.handle_runtime_dispatch(action.command_outcome.dispatch)?;
+                        self.handle_plain_prompt_events(&action.working_process_events)?;
                         if action.command_outcome.dispatch == CommandDispatch::ExitRequested {
                             self.terminal_restore_scope = Some(TUI_02_SCOPE);
                             self.log_exit_requested(self.run_mode, "main_prompt")?;
@@ -555,6 +584,240 @@ impl TuiApp {
                 "http_status": failure.http_status,
                 "message": &failure.message,
                 "recoverable": true,
+            }),
+        ))
+    }
+
+    fn handle_plain_prompt_events(&mut self, events: &WorkingProcessEvents) -> io::Result<()> {
+        if working_started(events) {
+            if let Some(prompt) = self.state.pending_prompt.clone() {
+                self.start_plain_prompt_request(prompt)?;
+            }
+        }
+
+        if working_cancelled(events) {
+            self.cancel_active_plain_request()?;
+        }
+
+        Ok(())
+    }
+
+    fn start_plain_prompt_request(&mut self, prompt: String) -> io::Result<()> {
+        if self.active_plain_request.is_some() {
+            return Ok(());
+        }
+
+        let run_id = self.next_run_id();
+        self.log_plain_request_started(&run_id, &prompt)?;
+
+        let (sender, receiver) = mpsc::channel();
+        let config = self.runtime_config.clone();
+        let thread_prompt = prompt.clone();
+        thread::spawn(move || {
+            let provider = LlmProviderFactory::from_config(&config);
+            let report = provider.send_chat(LlmChatRequest {
+                prompt: thread_prompt,
+            });
+            let _ = sender.send(report);
+        });
+
+        self.active_plain_request = Some(ActivePlainRequest {
+            run_id,
+            prompt,
+            receiver,
+            cancelled: false,
+        });
+
+        Ok(())
+    }
+
+    fn poll_plain_prompt_request(&mut self) -> io::Result<()> {
+        let Some(active) = self.active_plain_request.as_ref() else {
+            return Ok(());
+        };
+
+        let result = match active.receiver.try_recv() {
+            Ok(report) => Some(report),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.log_plain_request_failed_channel(active)?;
+                let complete_outcome = self.state.complete_working_process();
+                self.log_working_process_events(&complete_outcome.working_process_events.events)?;
+                self.log_workspace_events(&complete_outcome.workspace_events.events)?;
+                let mut events = self
+                    .state
+                    .record_system_notice("request failed: runtime_channel_disconnected");
+                events.extend(
+                    self.state
+                        .record_system_notice("message local request worker ended unexpectedly"),
+                );
+                self.log_workspace_events(&events.events)?;
+                self.active_plain_request = None;
+                return Ok(());
+            }
+        };
+
+        let Some(report) = result else {
+            return Ok(());
+        };
+
+        let Some(active) = self.active_plain_request.take() else {
+            return Ok(());
+        };
+
+        if active.cancelled {
+            return Ok(());
+        }
+
+        let complete_outcome = self.state.complete_working_process();
+        self.log_working_process_events(&complete_outcome.working_process_events.events)?;
+        self.log_workspace_events(&complete_outcome.workspace_events.events)?;
+        self.state.pending_prompt = None;
+
+        match &report.status {
+            LlmChatStatus::Succeeded { .. } => {
+                self.log_plain_response_received(&active, &report)?
+            }
+            LlmChatStatus::Failed(_) => self.log_plain_request_failed(&active, &report)?,
+        }
+
+        let events = self.record_plain_chat_report(&report);
+        self.log_workspace_events(&events.events)
+    }
+
+    fn cancel_active_plain_request(&mut self) -> io::Result<()> {
+        let Some(mut active) = self.active_plain_request.take() else {
+            return Ok(());
+        };
+        active.cancelled = true;
+        self.log_plain_request_cancelled(&active)?;
+        self.state.pending_prompt = None;
+        Ok(())
+    }
+
+    fn record_plain_chat_report(&mut self, report: &LlmChatReport) -> WorkspaceEvents {
+        match &report.status {
+            LlmChatStatus::Succeeded { answer } => self.state.record_answer(answer.clone()),
+            LlmChatStatus::Failed(failure) => {
+                let mut events = self
+                    .state
+                    .record_system_notice(format!("request failed: {}", failure.kind.as_str()));
+                events.extend(self.state.record_system_notice(format!(
+                    "provider {} | model {}",
+                    report.provider, report.model
+                )));
+                events.extend(
+                    self.state
+                        .record_system_notice(format!("endpoint {}", report.chat_url)),
+                );
+                events.extend(
+                    self.state
+                        .record_system_notice(format!("message {}", failure.message)),
+                );
+                events
+            }
+        }
+    }
+
+    fn next_run_id(&mut self) -> String {
+        let run_id = format!("run-{number:04}", number = self.next_run_index);
+        self.next_run_index += 1;
+        run_id
+    }
+
+    fn log_plain_request_started(&self, run_id: &str, prompt: &str) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_03_SCOPE,
+            EVENT_LLM_REQUEST_STARTED,
+            json!({
+                "run_id": run_id,
+                "provider": &self.runtime_config.provider.active,
+                "provider_type": self.runtime_config.provider.provider_type.as_str(),
+                "base_url": &self.runtime_config.provider.base_url,
+                "model": &self.runtime_config.provider.model,
+                "prompt_chars": prompt.chars().count(),
+                "timeout_ms": self.runtime_config.limits.command_timeout_ms,
+            }),
+        ))
+    }
+
+    fn log_plain_response_received(
+        &self,
+        active: &ActivePlainRequest,
+        report: &LlmChatReport,
+    ) -> io::Result<()> {
+        let LlmChatStatus::Succeeded { answer } = &report.status else {
+            return Ok(());
+        };
+
+        self.logger.llm(LogEvent::ui(
+            LLM_03_SCOPE,
+            EVENT_LLM_RESPONSE_RECEIVED,
+            json!({
+                "run_id": &active.run_id,
+                "provider": &report.provider,
+                "base_url": &report.base_url,
+                "model": &report.model,
+                "endpoint": &report.chat_url,
+                "latency_ms": report.latency_ms,
+                "prompt_chars": active.prompt.chars().count(),
+                "response_chars": answer.chars().count(),
+            }),
+        ))
+    }
+
+    fn log_plain_request_failed(
+        &self,
+        active: &ActivePlainRequest,
+        report: &LlmChatReport,
+    ) -> io::Result<()> {
+        let LlmChatStatus::Failed(failure) = &report.status else {
+            return Ok(());
+        };
+
+        self.logger.llm(LogEvent::ui(
+            LLM_03_SCOPE,
+            EVENT_LLM_REQUEST_FAILED,
+            json!({
+                "run_id": &active.run_id,
+                "provider": &report.provider,
+                "base_url": &report.base_url,
+                "model": &report.model,
+                "endpoint": &report.chat_url,
+                "latency_ms": report.latency_ms,
+                "prompt_chars": active.prompt.chars().count(),
+                "failure_kind": failure.kind.as_str(),
+                "http_status": failure.http_status,
+                "message": &failure.message,
+                "recoverable": true,
+            }),
+        ))
+    }
+
+    fn log_plain_request_failed_channel(&self, active: &ActivePlainRequest) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_03_SCOPE,
+            EVENT_LLM_REQUEST_FAILED,
+            json!({
+                "run_id": &active.run_id,
+                "provider": &self.runtime_config.provider.active,
+                "model": &self.runtime_config.provider.model,
+                "prompt_chars": active.prompt.chars().count(),
+                "failure_kind": "runtime_channel_disconnected",
+                "recoverable": true,
+            }),
+        ))
+    }
+
+    fn log_plain_request_cancelled(&self, active: &ActivePlainRequest) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_03_SCOPE,
+            EVENT_LLM_REQUEST_CANCELLED,
+            json!({
+                "run_id": &active.run_id,
+                "provider": &self.runtime_config.provider.active,
+                "model": &self.runtime_config.provider.model,
+                "prompt_chars": active.prompt.chars().count(),
             }),
         ))
     }
@@ -898,6 +1161,24 @@ fn command_log_data(
         "presentation": metadata.presentation.as_str(),
         "risk": metadata.risk.as_str(),
         "availability": metadata.availability,
+    })
+}
+
+fn working_started(events: &WorkingProcessEvents) -> bool {
+    events
+        .events
+        .iter()
+        .any(|event| matches!(event, WorkingProcessEvent::Started))
+}
+
+fn working_cancelled(events: &WorkingProcessEvents) -> bool {
+    events.events.iter().any(|event| {
+        matches!(
+            event,
+            WorkingProcessEvent::Finished {
+                reason: WorkingFinishReason::Canceled
+            }
+        )
     })
 }
 

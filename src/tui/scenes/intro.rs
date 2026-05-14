@@ -1,8 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::product;
 
@@ -58,14 +59,11 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
                 workspace_events: WorkspaceEvents::none(),
             }
         }
-        KeyCode::Esc => {
-            state.should_quit = true;
-            IntroAction {
-                command_outcome: CommandInputOutcome::none(),
-                working_process_events: WorkingProcessEvents::none(),
-                workspace_events: WorkspaceEvents::none(),
-            }
-        }
+        KeyCode::Esc => IntroAction {
+            command_outcome: CommandInputOutcome::none(),
+            working_process_events: WorkingProcessEvents::none(),
+            workspace_events: WorkspaceEvents::none(),
+        },
         KeyCode::Enter => {
             let prompt_outcome = state.enter_main_with_prompt();
             IntroAction {
@@ -135,6 +133,8 @@ fn render_logo(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_prompt_panel(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    const PROMPT_PREFIX_WIDTH: u16 = 4;
+
     let panel = centered_width(area, 84);
     let input_text = if state.intro_input.is_empty() {
         product::INTRO_PROMPT_PLACEHOLDER.to_owned()
@@ -179,6 +179,18 @@ fn render_prompt_panel(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .style(style::prompt_background());
 
     frame.render_widget(paragraph, panel);
+
+    let inner_x = panel.x.saturating_add(1);
+    let input_width = state.intro_input.as_str().width() as u16;
+    let cursor_x = inner_x
+        .saturating_add(PROMPT_PREFIX_WIDTH)
+        .saturating_add(input_width)
+        .min(panel.right().saturating_sub(1));
+    let cursor_y = panel
+        .y
+        .saturating_add(1)
+        .min(panel.bottom().saturating_sub(1));
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
 fn render_intro_hint(frame: &mut Frame<'_>, area: Rect) {

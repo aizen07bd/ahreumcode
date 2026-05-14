@@ -1,8 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::product;
 
@@ -114,10 +115,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             state.should_quit = true;
             MainAction::none()
         }
-        KeyCode::Esc => {
-            state.should_quit = true;
-            MainAction::none()
-        }
+        KeyCode::Esc => MainAction::none(),
         KeyCode::Enter => {
             if state.main_input.trim().is_empty() {
                 MainAction::none()
@@ -319,6 +317,8 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn render_prompt_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    const PROMPT_PREFIX_WIDTH: u16 = 4;
+
     let lines = vec![
         Line::from(""),
         Line::from(vec![
@@ -332,6 +332,18 @@ fn render_prompt_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .block(Block::default().style(style::prompt_background()))
         .style(style::prompt_background());
     frame.render_widget(paragraph, area);
+
+    let input_width = state.main_input.as_str().width() as u16;
+    let cursor_x = area
+        .x
+        .saturating_add(PROMPT_PREFIX_WIDTH)
+        .saturating_add(input_width)
+        .min(area.right().saturating_sub(1));
+    let cursor_y = area
+        .y
+        .saturating_add(1)
+        .min(area.bottom().saturating_sub(1));
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
 fn persona_panel_width(total_width: u16) -> u16 {
