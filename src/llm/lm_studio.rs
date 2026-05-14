@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::config::RuntimeConfig;
 
+use super::history::{LlmMessage, LlmMessageRole};
 use super::provider::{
     ChatFailureKind, HealthFailureKind, LlmChatFailure, LlmChatReport, LlmChatRequest,
     LlmChatStatus, LlmHealthFailure, LlmHealthReport, LlmHealthStatus,
@@ -65,7 +66,7 @@ impl LmStudioProvider {
         let chat_url = build_chat_request(&self.base_url);
         let started_at = Instant::now();
         let status = self
-            .request_chat(&chat_url, &request.prompt)
+            .request_chat(&chat_url, &request.messages)
             .map(|answer| LlmChatStatus::Succeeded { answer })
             .unwrap_or_else(LlmChatStatus::Failed);
 
@@ -92,8 +93,12 @@ impl LmStudioProvider {
         parse_models_response(&raw)
     }
 
-    fn request_chat(&self, chat_url: &str, prompt: &str) -> Result<String, LlmChatFailure> {
-        let body = build_plain_chat_request(&self.model, prompt)?;
+    fn request_chat(
+        &self,
+        chat_url: &str,
+        messages: &[LlmMessage],
+    ) -> Result<String, LlmChatFailure> {
+        let body = build_chat_request_body(&self.model, messages)?;
         let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
         let response = agent
             .post(chat_url)
@@ -119,15 +124,16 @@ pub fn build_chat_request(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
 
-fn build_plain_chat_request(model: &str, prompt: &str) -> Result<String, LlmChatFailure> {
+fn build_chat_request_body(model: &str, messages: &[LlmMessage]) -> Result<String, LlmChatFailure> {
     serde_json::to_string(&json!({
         "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
+        "messages": messages
+            .iter()
+            .map(|message| json!({
+                "role": chat_role(message.role),
+                "content": message.content
+            }))
+            .collect::<Vec<_>>()
     }))
     .map_err(|source| {
         LlmChatFailure::new(
@@ -135,6 +141,14 @@ fn build_plain_chat_request(model: &str, prompt: &str) -> Result<String, LlmChat
             format!("failed to build chat request: {source}"),
         )
     })
+}
+
+fn chat_role(role: LlmMessageRole) -> &'static str {
+    match role {
+        LlmMessageRole::System => "system",
+        LlmMessageRole::User => "user",
+        LlmMessageRole::Assistant => "assistant",
+    }
 }
 
 fn parse_models_response(raw: &str) -> Result<Vec<String>, LlmHealthFailure> {
@@ -256,8 +270,10 @@ struct ChatMessage {
 mod tests {
     use serde_json::Value;
 
+    use crate::llm::{LlmMessage, LlmMessageRole, LlmMessageVisibility};
+
     use super::{
-        build_chat_request, build_models_request, build_plain_chat_request, parse_chat_response,
+        build_chat_request, build_chat_request_body, build_models_request, parse_chat_response,
         parse_models_response,
     };
 
@@ -289,13 +305,29 @@ mod tests {
 
     #[test]
     fn builds_plain_chat_request_with_user_message() {
-        let raw = build_plain_chat_request("google/gemma-4-e4b", "hello")
+        let messages = vec![
+            LlmMessage {
+                turn_id: "turn-1".to_owned(),
+                role: LlmMessageRole::System,
+                visibility: LlmMessageVisibility::Internal,
+                content: "system instruction".to_owned(),
+            },
+            LlmMessage {
+                turn_id: "turn-1".to_owned(),
+                role: LlmMessageRole::User,
+                visibility: LlmMessageVisibility::UserVisible,
+                content: "hello".to_owned(),
+            },
+        ];
+        let raw = build_chat_request_body("google/gemma-4-e4b", &messages)
             .expect("plain chat request should serialize");
         let value: Value = serde_json::from_str(&raw).expect("request should be json");
 
         assert_eq!(value["model"], "google/gemma-4-e4b");
-        assert_eq!(value["messages"][0]["role"], "user");
-        assert_eq!(value["messages"][0]["content"], "hello");
+        assert_eq!(value["messages"][0]["role"], "system");
+        assert_eq!(value["messages"][0]["content"], "system instruction");
+        assert_eq!(value["messages"][1]["role"], "user");
+        assert_eq!(value["messages"][1]["content"], "hello");
     }
 
     #[test]

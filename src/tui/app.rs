@@ -16,8 +16,11 @@ use serde_json::json;
 use crate::cli::{AppCommand, RunMode, SceneCommand};
 use crate::config::{ConfigLoadOutcome, ConfigLoadSource, RuntimeConfig};
 use crate::llm::{
-    LlmChatReport, LlmChatRequest, LlmChatStatus, LlmHealthReport, LlmHealthStatus,
-    LlmProviderFactory,
+    attach_schema_prompt, parse_runtime_response, LlmChatReport, LlmChatRequest, LlmChatStatus,
+    LlmHealthReport, LlmHealthStatus, LlmMessage, LlmMessageRole, LlmMessageVisibility,
+    LlmProviderFactory, MessageHistory, ParsedRuntimeResponse, RepairLimitReached, RepairLoop,
+    RepairRequest, RuntimeResponse, RuntimeResponseParseError, RuntimeResponseParseErrorKind,
+    SchemaPrompt, SchemaPromptBuilder,
 };
 use crate::logging::{LogEvent, Logger};
 
@@ -45,6 +48,10 @@ const TUI_10_SCOPE: &str = "tui-10-modal-expanded-form";
 const LLM_01_SCOPE: &str = "llm-01-config-runtime";
 const LLM_02_SCOPE: &str = "llm-02-provider-connection";
 const LLM_03_SCOPE: &str = "llm-03-plain-prompt-request";
+const LLM_04_SCOPE: &str = "llm-04-message-history";
+const LLM_05_SCOPE: &str = "llm-05-schema-prompt-builder";
+const LLM_06_SCOPE: &str = "llm-06-json-response-parser";
+const LLM_07_SCOPE: &str = "llm-07-repair-request-loop";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -96,6 +103,21 @@ const EVENT_LLM_REQUEST_STARTED: &str = "llm_request_started";
 const EVENT_LLM_RESPONSE_RECEIVED: &str = "llm_response_received";
 const EVENT_LLM_REQUEST_CANCELLED: &str = "llm_request_cancelled";
 const EVENT_LLM_REQUEST_FAILED: &str = "llm_request_failed";
+const EVENT_MESSAGE_HISTORY_CREATED: &str = "message_history_created";
+const EVENT_MESSAGE_RECORDED: &str = "message_recorded";
+const EVENT_TURN_ID_ASSIGNED: &str = "turn_id_assigned";
+const EVENT_HISTORY_WRITE_FAILED: &str = "history_write_failed";
+const EVENT_SCHEMA_PROMPT_BUILT: &str = "schema_prompt_built";
+const EVENT_SCHEMA_PROMPT_ATTACHED: &str = "schema_prompt_attached";
+const EVENT_SCHEMA_PROMPT_BUILD_FAILED: &str = "schema_prompt_build_failed";
+const EVENT_RAW_RESPONSE_RECEIVED: &str = "raw_response_received";
+const EVENT_JSON_PARSE_SUCCEEDED: &str = "json_parse_succeeded";
+const EVENT_JSON_PARSE_FAILED: &str = "json_parse_failed";
+const EVENT_SCHEMA_VALIDATION_FAILED: &str = "schema_validation_failed";
+const EVENT_REPAIR_REQUEST_STARTED: &str = "repair_request_started";
+const EVENT_REPAIR_RESPONSE_RECEIVED: &str = "repair_response_received";
+const EVENT_REPAIR_SUCCEEDED: &str = "repair_succeeded";
+const EVENT_REPAIR_LIMIT_REACHED: &str = "repair_limit_reached";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
@@ -314,9 +336,12 @@ struct TuiApp {
 
 struct ActivePlainRequest {
     run_id: String,
+    turn_id: String,
     prompt: String,
+    history: MessageHistory,
     receiver: Receiver<LlmChatReport>,
     cancelled: bool,
+    repair_attempts: u16,
 }
 
 impl TuiApp {
@@ -608,24 +633,46 @@ impl TuiApp {
         }
 
         let run_id = self.next_run_id();
-        self.log_plain_request_started(&run_id, &prompt)?;
+        let mut history = MessageHistory::new(run_id.clone());
+        self.log_message_history_created(&history)?;
+
+        let turn_id = history.next_turn_id();
+        self.log_turn_id_assigned(&history, &turn_id)?;
+
+        let schema_prompt = self.build_schema_prompt()?;
+        let schema_message = attach_schema_prompt(&mut history, turn_id.clone(), &schema_prompt);
+        self.log_schema_prompt_attached(&history, &schema_message, &schema_prompt)?;
+        self.log_message_recorded(&history, &schema_message)?;
+
+        let user_message = history.append(
+            turn_id.clone(),
+            LlmMessageRole::User,
+            LlmMessageVisibility::UserVisible,
+            prompt.clone(),
+        );
+        self.log_message_recorded(&history, &user_message)?;
+
+        let request_messages = history.for_request(None);
+        self.log_plain_request_started(&run_id, &turn_id, &prompt)?;
 
         let (sender, receiver) = mpsc::channel();
         let config = self.runtime_config.clone();
-        let thread_prompt = prompt.clone();
         thread::spawn(move || {
             let provider = LlmProviderFactory::from_config(&config);
             let report = provider.send_chat(LlmChatRequest {
-                prompt: thread_prompt,
+                messages: request_messages,
             });
             let _ = sender.send(report);
         });
 
         self.active_plain_request = Some(ActivePlainRequest {
             run_id,
+            turn_id,
             prompt,
+            history,
             receiver,
             cancelled: false,
+            repair_attempts: 0,
         });
 
         Ok(())
@@ -640,7 +687,17 @@ impl TuiApp {
             Ok(report) => Some(report),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
-                self.log_plain_request_failed_channel(active)?;
+                let Some(mut active) = self.active_plain_request.take() else {
+                    return Ok(());
+                };
+                let failure_message = active.history.append(
+                    active.turn_id.clone(),
+                    LlmMessageRole::System,
+                    LlmMessageVisibility::Internal,
+                    "request_failed:runtime_channel_disconnected",
+                );
+                self.log_message_recorded(&active.history, &failure_message)?;
+                self.log_plain_request_failed_channel(&active)?;
                 let complete_outcome = self.state.complete_working_process();
                 self.log_working_process_events(&complete_outcome.working_process_events.events)?;
                 self.log_workspace_events(&complete_outcome.workspace_events.events)?;
@@ -652,7 +709,6 @@ impl TuiApp {
                         .record_system_notice("message local request worker ended unexpectedly"),
                 );
                 self.log_workspace_events(&events.events)?;
-                self.active_plain_request = None;
                 return Ok(());
             }
         };
@@ -661,7 +717,7 @@ impl TuiApp {
             return Ok(());
         };
 
-        let Some(active) = self.active_plain_request.take() else {
+        let Some(mut active) = self.active_plain_request.take() else {
             return Ok(());
         };
 
@@ -669,20 +725,58 @@ impl TuiApp {
             return Ok(());
         }
 
-        let complete_outcome = self.state.complete_working_process();
-        self.log_working_process_events(&complete_outcome.working_process_events.events)?;
-        self.log_workspace_events(&complete_outcome.workspace_events.events)?;
-        self.state.pending_prompt = None;
-
-        match &report.status {
-            LlmChatStatus::Succeeded { .. } => {
-                self.log_plain_response_received(&active, &report)?
+        let events = match &report.status {
+            LlmChatStatus::Succeeded { answer } => {
+                let assistant_message = active.history.append(
+                    active.turn_id.clone(),
+                    LlmMessageRole::Assistant,
+                    LlmMessageVisibility::UserVisible,
+                    answer.clone(),
+                );
+                self.log_message_recorded(&active.history, &assistant_message)?;
+                self.log_plain_response_received(&active, &report)?;
+                self.log_raw_response_received(&active, answer)?;
+                if active.repair_attempts > 0 {
+                    self.log_repair_response_received(&active, answer)?;
+                }
+                match parse_runtime_response(answer) {
+                    Ok(parsed) => {
+                        self.log_runtime_response_parsed(&active, &parsed)?;
+                        if active.repair_attempts > 0 {
+                            self.log_repair_succeeded(&active, &parsed)?;
+                        }
+                        self.record_parsed_runtime_response(&parsed)
+                    }
+                    Err(error) => {
+                        self.log_runtime_response_parse_failed(&active, answer, &error)?;
+                        match RepairLoop::default_local()
+                            .next_request(active.repair_attempts, &error)
+                        {
+                            Ok(repair_request) => {
+                                self.start_repair_request(active, repair_request)?;
+                                return Ok(());
+                            }
+                            Err(limit) => {
+                                self.log_repair_limit_reached(&active, &limit)?;
+                                self.record_runtime_response_parse_error(&error)
+                            }
+                        }
+                    }
+                }
             }
-            LlmChatStatus::Failed(_) => self.log_plain_request_failed(&active, &report)?,
-        }
-
-        let events = self.record_plain_chat_report(&report);
-        self.log_workspace_events(&events.events)
+            LlmChatStatus::Failed(failure) => {
+                let failure_message = active.history.append(
+                    active.turn_id.clone(),
+                    LlmMessageRole::System,
+                    LlmMessageVisibility::Internal,
+                    format!("request_failed:{}", failure.kind.as_str()),
+                );
+                self.log_message_recorded(&active.history, &failure_message)?;
+                self.log_plain_request_failed(&active, &report)?;
+                self.record_plain_chat_failure(&report)
+            }
+        };
+        self.finish_plain_request_with_events(events)
     }
 
     fn cancel_active_plain_request(&mut self) -> io::Result<()> {
@@ -690,33 +784,111 @@ impl TuiApp {
             return Ok(());
         };
         active.cancelled = true;
+        let cancel_message = active.history.append(
+            active.turn_id.clone(),
+            LlmMessageRole::System,
+            LlmMessageVisibility::Internal,
+            "request_cancelled",
+        );
+        self.log_message_recorded(&active.history, &cancel_message)?;
         self.log_plain_request_cancelled(&active)?;
         self.state.pending_prompt = None;
         Ok(())
     }
 
-    fn record_plain_chat_report(&mut self, report: &LlmChatReport) -> WorkspaceEvents {
-        match &report.status {
-            LlmChatStatus::Succeeded { answer } => self.state.record_answer(answer.clone()),
-            LlmChatStatus::Failed(failure) => {
-                let mut events = self
-                    .state
-                    .record_system_notice(format!("request failed: {}", failure.kind.as_str()));
-                events.extend(self.state.record_system_notice(format!(
-                    "provider {} | model {}",
-                    report.provider, report.model
-                )));
-                events.extend(
-                    self.state
-                        .record_system_notice(format!("endpoint {}", report.chat_url)),
-                );
-                events.extend(
-                    self.state
-                        .record_system_notice(format!("message {}", failure.message)),
-                );
+    fn record_plain_chat_failure(&mut self, report: &LlmChatReport) -> WorkspaceEvents {
+        let LlmChatStatus::Failed(failure) = &report.status else {
+            return WorkspaceEvents::none();
+        };
+
+        let mut events = self
+            .state
+            .record_system_notice(format!("request failed: {}", failure.kind.as_str()));
+        events.extend(self.state.record_system_notice(format!(
+            "provider {} | model {}",
+            report.provider, report.model
+        )));
+        events.extend(
+            self.state
+                .record_system_notice(format!("endpoint {}", report.chat_url)),
+        );
+        events.extend(
+            self.state
+                .record_system_notice(format!("message {}", failure.message)),
+        );
+        events
+    }
+
+    fn record_parsed_runtime_response(
+        &mut self,
+        parsed: &ParsedRuntimeResponse,
+    ) -> WorkspaceEvents {
+        match &parsed.response {
+            RuntimeResponse::Answer(response) => self.state.record_answer(response.message.clone()),
+            RuntimeResponse::Clarify(response) => {
+                self.state.record_answer(response.message.clone())
+            }
+            RuntimeResponse::Blocked(response) => {
+                let mut events = self.state.record_system_notice("response blocked");
+                events.extend(self.state.record_system_notice(response.message.clone()));
                 events
             }
+            RuntimeResponse::Tool(response) => self.state.record_system_notice(format!(
+                "tool candidate parsed: {} ({})",
+                response.tool_name,
+                response.activity.as_str()
+            )),
         }
+    }
+
+    fn record_runtime_response_parse_error(
+        &mut self,
+        error: &RuntimeResponseParseError,
+    ) -> WorkspaceEvents {
+        let mut events = self
+            .state
+            .record_system_notice(format!("response parse failed: {}", error.kind.as_str()));
+        events.extend(self.state.record_system_notice(error.message.clone()));
+        events
+    }
+
+    fn start_repair_request(
+        &mut self,
+        mut active: ActivePlainRequest,
+        repair_request: RepairRequest,
+    ) -> io::Result<()> {
+        let repair_message = active.history.append(
+            active.turn_id.clone(),
+            LlmMessageRole::System,
+            LlmMessageVisibility::Internal,
+            repair_request.prompt.clone(),
+        );
+        self.log_message_recorded(&active.history, &repair_message)?;
+        self.log_repair_request_started(&active, &repair_request)?;
+
+        let request_messages = active.history.for_request(None);
+        let (sender, receiver) = mpsc::channel();
+        let config = self.runtime_config.clone();
+        thread::spawn(move || {
+            let provider = LlmProviderFactory::from_config(&config);
+            let report = provider.send_chat(LlmChatRequest {
+                messages: request_messages,
+            });
+            let _ = sender.send(report);
+        });
+
+        active.receiver = receiver;
+        active.repair_attempts = repair_request.attempt;
+        self.active_plain_request = Some(active);
+        Ok(())
+    }
+
+    fn finish_plain_request_with_events(&mut self, events: WorkspaceEvents) -> io::Result<()> {
+        let complete_outcome = self.state.complete_working_process();
+        self.log_working_process_events(&complete_outcome.working_process_events.events)?;
+        self.log_workspace_events(&complete_outcome.workspace_events.events)?;
+        self.state.pending_prompt = None;
+        self.log_workspace_events(&events.events)
     }
 
     fn next_run_id(&mut self) -> String {
@@ -725,12 +897,122 @@ impl TuiApp {
         run_id
     }
 
-    fn log_plain_request_started(&self, run_id: &str, prompt: &str) -> io::Result<()> {
+    fn build_schema_prompt(&self) -> io::Result<SchemaPrompt> {
+        match SchemaPromptBuilder::build() {
+            Ok(prompt) => {
+                self.logger.llm(LogEvent::ui(
+                    LLM_05_SCOPE,
+                    EVENT_SCHEMA_PROMPT_BUILT,
+                    json!({
+                        "tool_manifest_id": prompt.tool_manifest_id,
+                        "tool_manifest_version": prompt.tool_manifest_version,
+                        "prompt_chars": prompt.content.chars().count(),
+                    }),
+                ))?;
+                Ok(prompt)
+            }
+            Err(error) => {
+                self.logger.llm(LogEvent::ui(
+                    LLM_05_SCOPE,
+                    EVENT_SCHEMA_PROMPT_BUILD_FAILED,
+                    json!({
+                        "missing_rule": error.missing_rule,
+                    }),
+                ))?;
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "schema prompt validation failed",
+                ))
+            }
+        }
+    }
+
+    fn log_schema_prompt_attached(
+        &self,
+        history: &MessageHistory,
+        message: &LlmMessage,
+        prompt: &SchemaPrompt,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_05_SCOPE,
+            EVENT_SCHEMA_PROMPT_ATTACHED,
+            json!({
+                "run_id": history.run_id(),
+                "turn_id": &message.turn_id,
+                "tool_manifest_id": prompt.tool_manifest_id,
+                "tool_manifest_version": prompt.tool_manifest_version,
+                "role": message.role.as_str(),
+                "visibility": message.visibility.as_str(),
+                "content_chars": message.content.chars().count(),
+            }),
+        ))
+    }
+
+    fn log_message_history_created(&self, history: &MessageHistory) -> io::Result<()> {
+        self.write_history_event(
+            EVENT_MESSAGE_HISTORY_CREATED,
+            json!({
+                "run_id": history.run_id(),
+            }),
+        )
+    }
+
+    fn log_turn_id_assigned(&self, history: &MessageHistory, turn_id: &str) -> io::Result<()> {
+        self.write_history_event(
+            EVENT_TURN_ID_ASSIGNED,
+            json!({
+                "run_id": history.run_id(),
+                "turn_id": turn_id,
+            }),
+        )
+    }
+
+    fn log_message_recorded(
+        &self,
+        history: &MessageHistory,
+        message: &LlmMessage,
+    ) -> io::Result<()> {
+        self.write_history_event(
+            EVENT_MESSAGE_RECORDED,
+            json!({
+                "run_id": history.run_id(),
+                "turn_id": &message.turn_id,
+                "role": message.role.as_str(),
+                "visibility": message.visibility.as_str(),
+                "content_chars": message.content.chars().count(),
+            }),
+        )
+    }
+
+    fn write_history_event(&self, event: &'static str, data: serde_json::Value) -> io::Result<()> {
+        let result = self.logger.llm(LogEvent::ui(LLM_04_SCOPE, event, data));
+        if let Err(error) = result {
+            let _ = self.logger.llm(LogEvent::ui(
+                LLM_04_SCOPE,
+                EVENT_HISTORY_WRITE_FAILED,
+                json!({
+                    "failed_event": event,
+                    "message": error.to_string(),
+                }),
+            ));
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn log_plain_request_started(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+        prompt: &str,
+    ) -> io::Result<()> {
         self.logger.llm(LogEvent::ui(
             LLM_03_SCOPE,
             EVENT_LLM_REQUEST_STARTED,
             json!({
                 "run_id": run_id,
+                "turn_id": turn_id,
                 "provider": &self.runtime_config.provider.active,
                 "provider_type": self.runtime_config.provider.provider_type.as_str(),
                 "base_url": &self.runtime_config.provider.base_url,
@@ -755,6 +1037,7 @@ impl TuiApp {
             EVENT_LLM_RESPONSE_RECEIVED,
             json!({
                 "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
                 "provider": &report.provider,
                 "base_url": &report.base_url,
                 "model": &report.model,
@@ -762,6 +1045,144 @@ impl TuiApp {
                 "latency_ms": report.latency_ms,
                 "prompt_chars": active.prompt.chars().count(),
                 "response_chars": answer.chars().count(),
+            }),
+        ))
+    }
+
+    fn log_raw_response_received(
+        &self,
+        active: &ActivePlainRequest,
+        answer: &str,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_06_SCOPE,
+            EVENT_RAW_RESPONSE_RECEIVED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "response_chars": answer.chars().count(),
+            }),
+        ))
+    }
+
+    fn log_runtime_response_parsed(
+        &self,
+        active: &ActivePlainRequest,
+        parsed: &ParsedRuntimeResponse,
+    ) -> io::Result<()> {
+        let manifest = parsed.response.manifest();
+        self.logger.llm(LogEvent::ui(
+            LLM_06_SCOPE,
+            EVENT_JSON_PARSE_SUCCEEDED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "response_type": parsed.response.response_type(),
+                "activity": parsed.response.activity().as_str(),
+                "tool_manifest_id": &manifest.tool_manifest_id,
+                "tool_manifest_version": &manifest.tool_manifest_version,
+                "payload_count": parsed.payloads.len(),
+            }),
+        ))
+    }
+
+    fn log_runtime_response_parse_failed(
+        &self,
+        active: &ActivePlainRequest,
+        answer: &str,
+        error: &RuntimeResponseParseError,
+    ) -> io::Result<()> {
+        let event = match error.kind {
+            RuntimeResponseParseErrorKind::JsonParseFailed => EVENT_JSON_PARSE_FAILED,
+            RuntimeResponseParseErrorKind::SchemaValidationFailed
+            | RuntimeResponseParseErrorKind::PayloadValidationFailed
+            | RuntimeResponseParseErrorKind::PartialResponse => EVENT_SCHEMA_VALIDATION_FAILED,
+        };
+
+        self.logger.llm(LogEvent::ui(
+            LLM_06_SCOPE,
+            event,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "response_chars": answer.chars().count(),
+                "error_kind": error.kind.as_str(),
+                "message": &error.message,
+                "recoverable": true,
+            }),
+        ))
+    }
+
+    fn log_repair_request_started(
+        &self,
+        active: &ActivePlainRequest,
+        repair_request: &RepairRequest,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_07_SCOPE,
+            EVENT_REPAIR_REQUEST_STARTED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "attempt": repair_request.attempt,
+                "max_attempts": repair_request.max_attempts,
+                "failure_signature": &repair_request.failure_signature,
+                "prompt_chars": repair_request.prompt.chars().count(),
+            }),
+        ))
+    }
+
+    fn log_repair_response_received(
+        &self,
+        active: &ActivePlainRequest,
+        answer: &str,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_07_SCOPE,
+            EVENT_REPAIR_RESPONSE_RECEIVED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "attempt": active.repair_attempts,
+                "response_chars": answer.chars().count(),
+            }),
+        ))
+    }
+
+    fn log_repair_succeeded(
+        &self,
+        active: &ActivePlainRequest,
+        parsed: &ParsedRuntimeResponse,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_07_SCOPE,
+            EVENT_REPAIR_SUCCEEDED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "attempt": active.repair_attempts,
+                "response_type": parsed.response.response_type(),
+                "activity": parsed.response.activity().as_str(),
+                "payload_count": parsed.payloads.len(),
+            }),
+        ))
+    }
+
+    fn log_repair_limit_reached(
+        &self,
+        active: &ActivePlainRequest,
+        limit: &RepairLimitReached,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            LLM_07_SCOPE,
+            EVENT_REPAIR_LIMIT_REACHED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "attempts": limit.attempts,
+                "max_attempts": limit.max_attempts,
+                "failure_signature": &limit.failure_signature,
+                "reason": limit.reason.as_str(),
             }),
         ))
     }
@@ -780,6 +1201,7 @@ impl TuiApp {
             EVENT_LLM_REQUEST_FAILED,
             json!({
                 "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
                 "provider": &report.provider,
                 "base_url": &report.base_url,
                 "model": &report.model,
@@ -800,6 +1222,7 @@ impl TuiApp {
             EVENT_LLM_REQUEST_FAILED,
             json!({
                 "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
                 "provider": &self.runtime_config.provider.active,
                 "model": &self.runtime_config.provider.model,
                 "prompt_chars": active.prompt.chars().count(),
@@ -815,6 +1238,7 @@ impl TuiApp {
             EVENT_LLM_REQUEST_CANCELLED,
             json!({
                 "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
                 "provider": &self.runtime_config.provider.active,
                 "model": &self.runtime_config.provider.model,
                 "prompt_chars": active.prompt.chars().count(),

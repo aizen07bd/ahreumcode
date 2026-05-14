@@ -1,5 +1,6 @@
 use crate::config::{ProviderType, RuntimeConfig};
 
+use super::history::LlmMessage;
 use super::lm_studio::LmStudioProvider;
 
 pub struct LlmProviderFactory;
@@ -34,7 +35,7 @@ impl LlmProviderClient {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LlmChatRequest {
-    pub prompt: String,
+    pub messages: Vec<LlmMessage>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,0 +1,756 @@
+use std::collections::{BTreeSet, HashSet};
+
+use serde_json::{Map, Value};
+
+use super::schema_prompt::{TOOL_MANIFEST_ID, TOOL_MANIFEST_VERSION};
+
+const ACTION_OPEN: &str = "<AHREUM_ACTION>";
+const ACTION_CLOSE: &str = "</AHREUM_ACTION>";
+const PAYLOAD_OPEN_PREFIX: &str = "<AHREUM_PAYLOAD ";
+const PAYLOAD_CLOSE: &str = "</AHREUM_PAYLOAD>";
+
+const COMMON_FIELDS: &[&str] = &[
+    "response_type",
+    "activity",
+    "message",
+    "tool_manifest_id",
+    "tool_manifest_version",
+];
+const TOOL_FIELDS: &[&str] = &["tool_name", "arguments", "reason"];
+const REASON_FIELD: &[&str] = &["reason"];
+const FORBIDDEN_RAW_ARGUMENT_FIELDS: &[&str] = &[
+    "content",
+    "patch",
+    "file_body",
+    "file_content",
+    "source",
+    "source_code",
+    "code",
+    "command_body",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedRuntimeResponse {
+    pub response: RuntimeResponse,
+    pub payloads: Vec<RuntimePayload>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeResponse {
+    Answer(RuntimeAnswer),
+    Tool(RuntimeToolCandidate),
+    Clarify(RuntimeClarification),
+    Blocked(RuntimeBlocked),
+}
+
+impl RuntimeResponse {
+    pub fn response_type(&self) -> &'static str {
+        match self {
+            Self::Answer(_) => "answer",
+            Self::Tool(_) => "tool",
+            Self::Clarify(_) => "clarify",
+            Self::Blocked(_) => "blocked",
+        }
+    }
+
+    pub fn activity(&self) -> Activity {
+        match self {
+            Self::Answer(response) => response.activity,
+            Self::Tool(response) => response.activity,
+            Self::Clarify(response) => response.activity,
+            Self::Blocked(response) => response.activity,
+        }
+    }
+
+    pub fn manifest(&self) -> &RuntimeManifest {
+        match self {
+            Self::Answer(response) => &response.manifest,
+            Self::Tool(response) => &response.manifest,
+            Self::Clarify(response) => &response.manifest,
+            Self::Blocked(response) => &response.manifest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeAnswer {
+    pub activity: Activity,
+    pub message: String,
+    pub manifest: RuntimeManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeToolCandidate {
+    pub activity: Activity,
+    pub message: String,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub reason: String,
+    pub manifest: RuntimeManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeClarification {
+    pub activity: Activity,
+    pub message: String,
+    pub reason: String,
+    pub manifest: RuntimeManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeBlocked {
+    pub activity: Activity,
+    pub message: String,
+    pub reason: String,
+    pub manifest: RuntimeManifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Activity {
+    None,
+    Explore,
+    Change,
+    Execute,
+    Configure,
+    Ask,
+}
+
+impl Activity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Explore => "Explore",
+            Self::Change => "Change",
+            Self::Execute => "Execute",
+            Self::Configure => "Configure",
+            Self::Ask => "Ask",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, RuntimeResponseParseError> {
+        match raw {
+            "None" => Ok(Self::None),
+            "Explore" => Ok(Self::Explore),
+            "Change" => Ok(Self::Change),
+            "Execute" => Ok(Self::Execute),
+            "Configure" => Ok(Self::Configure),
+            "Ask" => Ok(Self::Ask),
+            value => Err(RuntimeResponseParseError::schema(format!(
+                "unknown activity: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeManifest {
+    pub tool_manifest_id: String,
+    pub tool_manifest_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimePayload {
+    pub id: String,
+    pub format: String,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeResponseParseError {
+    pub kind: RuntimeResponseParseErrorKind,
+    pub message: String,
+}
+
+impl RuntimeResponseParseError {
+    fn json(message: impl Into<String>) -> Self {
+        Self {
+            kind: RuntimeResponseParseErrorKind::JsonParseFailed,
+            message: message.into(),
+        }
+    }
+
+    fn schema(message: impl Into<String>) -> Self {
+        Self {
+            kind: RuntimeResponseParseErrorKind::SchemaValidationFailed,
+            message: message.into(),
+        }
+    }
+
+    fn payload(message: impl Into<String>) -> Self {
+        Self {
+            kind: RuntimeResponseParseErrorKind::PayloadValidationFailed,
+            message: message.into(),
+        }
+    }
+
+    fn partial(message: impl Into<String>) -> Self {
+        Self {
+            kind: RuntimeResponseParseErrorKind::PartialResponse,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeResponseParseErrorKind {
+    JsonParseFailed,
+    SchemaValidationFailed,
+    PayloadValidationFailed,
+    PartialResponse,
+}
+
+impl RuntimeResponseParseErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JsonParseFailed => "json_parse_failed",
+            Self::SchemaValidationFailed => "schema_validation_failed",
+            Self::PayloadValidationFailed => "payload_validation_failed",
+            Self::PartialResponse => "partial_response",
+        }
+    }
+}
+
+pub fn parse_runtime_response(
+    raw: &str,
+) -> Result<ParsedRuntimeResponse, RuntimeResponseParseError> {
+    let unwrapped = unwrap_whole_markdown_fence(raw.trim());
+    let (json_raw, payload_raw) = split_action_and_payloads(unwrapped)?;
+    let value = serde_json::from_str::<Value>(json_raw.trim())
+        .map_err(|source| RuntimeResponseParseError::json(source.to_string()))?;
+    let envelope = value.as_object().ok_or_else(|| {
+        RuntimeResponseParseError::schema("response envelope must be a JSON object")
+    })?;
+    let payloads = parse_runtime_payloads(payload_raw)?;
+    let response = to_runtime_response(envelope, &payloads)?;
+    validate_payload_reference(&response, &payloads)?;
+
+    Ok(ParsedRuntimeResponse { response, payloads })
+}
+
+fn unwrap_whole_markdown_fence(raw: &str) -> &str {
+    let Some(body) = raw.strip_prefix("```") else {
+        return raw;
+    };
+    let Some(last_line_start) = body.rfind("\n```") else {
+        return raw;
+    };
+    if !body[last_line_start + 1..].trim().eq("```") {
+        return raw;
+    }
+
+    let Some(first_line_end) = raw.find('\n') else {
+        return raw;
+    };
+    raw[first_line_end + 1..raw.len() - 3].trim()
+}
+
+fn split_action_and_payloads(raw: &str) -> Result<(&str, &str), RuntimeResponseParseError> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with(ACTION_OPEN) {
+        let close_index = trimmed
+            .find(ACTION_CLOSE)
+            .ok_or_else(|| RuntimeResponseParseError::partial("missing AHREUM_ACTION close tag"))?;
+        let json_raw = &trimmed[ACTION_OPEN.len()..close_index];
+        let payload_raw = &trimmed[close_index + ACTION_CLOSE.len()..];
+        return Ok((json_raw, payload_raw));
+    }
+
+    if trimmed.contains(ACTION_OPEN)
+        || trimmed.contains(ACTION_CLOSE)
+        || trimmed.contains(PAYLOAD_OPEN_PREFIX)
+        || trimmed.contains(PAYLOAD_CLOSE)
+    {
+        return Err(RuntimeResponseParseError::schema(
+            "framed response must start with AHREUM_ACTION",
+        ));
+    }
+
+    Ok((trimmed, ""))
+}
+
+fn parse_runtime_payloads(raw: &str) -> Result<Vec<RuntimePayload>, RuntimeResponseParseError> {
+    let mut rest = raw.trim();
+    let mut payloads = Vec::new();
+    let mut ids = HashSet::new();
+
+    while !rest.is_empty() {
+        if !rest.starts_with(PAYLOAD_OPEN_PREFIX) {
+            return Err(RuntimeResponseParseError::payload(
+                "unexpected text outside AHREUM_PAYLOAD block",
+            ));
+        }
+
+        let header_end = rest.find('>').ok_or_else(|| {
+            RuntimeResponseParseError::partial("missing AHREUM_PAYLOAD header end")
+        })?;
+        let header = &rest[1..header_end];
+        let attributes = parse_payload_attributes(header)?;
+        let body_start = header_end + 1;
+        let body_end = rest[body_start..]
+            .find(PAYLOAD_CLOSE)
+            .map(|index| body_start + index)
+            .ok_or_else(|| {
+                RuntimeResponseParseError::partial("missing AHREUM_PAYLOAD close tag")
+            })?;
+        let body = rest[body_start..body_end].trim_matches('\n').to_owned();
+
+        if !ids.insert(attributes.id.clone()) {
+            return Err(RuntimeResponseParseError::payload(format!(
+                "duplicate payload id: {}",
+                attributes.id
+            )));
+        }
+
+        payloads.push(RuntimePayload {
+            id: attributes.id,
+            format: attributes.format,
+            body,
+        });
+
+        rest = rest[body_end + PAYLOAD_CLOSE.len()..].trim();
+    }
+
+    Ok(payloads)
+}
+
+struct PayloadAttributes {
+    id: String,
+    format: String,
+}
+
+fn parse_payload_attributes(header: &str) -> Result<PayloadAttributes, RuntimeResponseParseError> {
+    let mut name = None;
+    let mut id = None;
+    let mut format = None;
+
+    for part in header.split_whitespace() {
+        if name.is_none() {
+            name = Some(part);
+            continue;
+        }
+
+        let Some((key, raw_value)) = part.split_once('=') else {
+            return Err(RuntimeResponseParseError::payload(format!(
+                "invalid payload attribute: {part}"
+            )));
+        };
+        let value = raw_value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .ok_or_else(|| {
+                RuntimeResponseParseError::payload(format!(
+                    "payload attribute must use double quotes: {key}"
+                ))
+            })?;
+
+        match key {
+            "id" => id = Some(value.to_owned()),
+            "format" => format = Some(value.to_owned()),
+            value => {
+                return Err(RuntimeResponseParseError::payload(format!(
+                    "unknown payload attribute: {value}"
+                )));
+            }
+        }
+    }
+
+    if name != Some("AHREUM_PAYLOAD") {
+        return Err(RuntimeResponseParseError::payload(
+            "payload block must start with AHREUM_PAYLOAD",
+        ));
+    }
+
+    let id = id.ok_or_else(|| RuntimeResponseParseError::payload("payload id is required"))?;
+    let format =
+        format.ok_or_else(|| RuntimeResponseParseError::payload("payload format is required"))?;
+    if id.trim().is_empty() {
+        return Err(RuntimeResponseParseError::payload(
+            "payload id cannot be empty",
+        ));
+    }
+    if format.trim().is_empty() {
+        return Err(RuntimeResponseParseError::payload(
+            "payload format cannot be empty",
+        ));
+    }
+
+    Ok(PayloadAttributes { id, format })
+}
+
+fn to_runtime_response(
+    envelope: &Map<String, Value>,
+    payloads: &[RuntimePayload],
+) -> Result<RuntimeResponse, RuntimeResponseParseError> {
+    validate_manifest(envelope)?;
+    let response_type = required_str(envelope, "response_type")?;
+    let activity = Activity::parse(required_str(envelope, "activity")?)?;
+    let message = required_str(envelope, "message")?.to_owned();
+    let manifest = RuntimeManifest {
+        tool_manifest_id: required_str(envelope, "tool_manifest_id")?.to_owned(),
+        tool_manifest_version: required_str(envelope, "tool_manifest_version")?.to_owned(),
+    };
+
+    match response_type {
+        "answer" => {
+            validate_allowed_fields(envelope, COMMON_FIELDS)?;
+            validate_activity_pair(response_type, activity)?;
+            reject_unreferenced_payloads(payloads)?;
+            Ok(RuntimeResponse::Answer(RuntimeAnswer {
+                activity,
+                message,
+                manifest,
+            }))
+        }
+        "tool" => {
+            validate_allowed_fields(envelope, &[COMMON_FIELDS, TOOL_FIELDS].concat())?;
+            validate_activity_pair(response_type, activity)?;
+            let arguments = required_object_value(envelope, "arguments")?.clone();
+            reject_forbidden_raw_argument_fields(&arguments)?;
+            Ok(RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity,
+                message,
+                tool_name: required_str(envelope, "tool_name")?.to_owned(),
+                arguments,
+                reason: required_str(envelope, "reason")?.to_owned(),
+                manifest,
+            }))
+        }
+        "clarify" => {
+            validate_allowed_fields(envelope, &[COMMON_FIELDS, REASON_FIELD].concat())?;
+            validate_activity_pair(response_type, activity)?;
+            reject_unreferenced_payloads(payloads)?;
+            Ok(RuntimeResponse::Clarify(RuntimeClarification {
+                activity,
+                message,
+                reason: required_str(envelope, "reason")?.to_owned(),
+                manifest,
+            }))
+        }
+        "blocked" => {
+            validate_allowed_fields(envelope, &[COMMON_FIELDS, REASON_FIELD].concat())?;
+            validate_activity_pair(response_type, activity)?;
+            reject_unreferenced_payloads(payloads)?;
+            Ok(RuntimeResponse::Blocked(RuntimeBlocked {
+                activity,
+                message,
+                reason: required_str(envelope, "reason")?.to_owned(),
+                manifest,
+            }))
+        }
+        value => Err(RuntimeResponseParseError::schema(format!(
+            "unknown response_type: {value}"
+        ))),
+    }
+}
+
+fn validate_manifest(envelope: &Map<String, Value>) -> Result<(), RuntimeResponseParseError> {
+    let manifest_id = required_str(envelope, "tool_manifest_id")?;
+    let manifest_version = required_str(envelope, "tool_manifest_version")?;
+
+    if manifest_id != TOOL_MANIFEST_ID {
+        return Err(RuntimeResponseParseError::schema(format!(
+            "tool_manifest_id mismatch: {manifest_id}"
+        )));
+    }
+    if manifest_version != TOOL_MANIFEST_VERSION {
+        return Err(RuntimeResponseParseError::schema(format!(
+            "tool_manifest_version mismatch: {manifest_version}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_allowed_fields(
+    envelope: &Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), RuntimeResponseParseError> {
+    let allowed = allowed.iter().copied().collect::<BTreeSet<_>>();
+    for key in envelope.keys() {
+        if !allowed.contains(key.as_str()) {
+            return Err(RuntimeResponseParseError::schema(format!(
+                "unknown field: {key}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_activity_pair(
+    response_type: &str,
+    activity: Activity,
+) -> Result<(), RuntimeResponseParseError> {
+    let valid = match response_type {
+        "answer" => activity == Activity::None,
+        "tool" => matches!(
+            activity,
+            Activity::Explore | Activity::Change | Activity::Execute | Activity::Configure
+        ),
+        "clarify" => activity == Activity::Ask,
+        "blocked" => matches!(activity, Activity::None | Activity::Ask),
+        _ => false,
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(RuntimeResponseParseError::schema(format!(
+            "invalid response_type/activity pair: {response_type}/{}",
+            activity.as_str()
+        )))
+    }
+}
+
+fn validate_payload_reference(
+    response: &RuntimeResponse,
+    payloads: &[RuntimePayload],
+) -> Result<(), RuntimeResponseParseError> {
+    let RuntimeResponse::Tool(candidate) = response else {
+        return Ok(());
+    };
+    let Some(payload_id) = candidate
+        .arguments
+        .as_object()
+        .and_then(|arguments| arguments.get("payload_id"))
+    else {
+        reject_unreferenced_payloads(payloads)?;
+        return Ok(());
+    };
+    let payload_id = payload_id
+        .as_str()
+        .ok_or_else(|| RuntimeResponseParseError::payload("payload_id must be a string"))?;
+    let matches = payloads
+        .iter()
+        .filter(|payload| payload.id == payload_id)
+        .count();
+
+    match matches {
+        1 if payloads.len() == 1 => Ok(()),
+        1 => Err(RuntimeResponseParseError::payload(
+            "payload block exists without payload_id reference",
+        )),
+        0 => Err(RuntimeResponseParseError::payload(format!(
+            "missing payload block: {payload_id}"
+        ))),
+        _ => Err(RuntimeResponseParseError::payload(format!(
+            "duplicate payload block: {payload_id}"
+        ))),
+    }
+}
+
+fn reject_unreferenced_payloads(
+    payloads: &[RuntimePayload],
+) -> Result<(), RuntimeResponseParseError> {
+    if payloads.is_empty() {
+        return Ok(());
+    }
+
+    Err(RuntimeResponseParseError::payload(
+        "payload block exists without payload_id reference",
+    ))
+}
+
+fn reject_forbidden_raw_argument_fields(
+    arguments: &Value,
+) -> Result<(), RuntimeResponseParseError> {
+    let Some(arguments) = arguments.as_object() else {
+        return Err(RuntimeResponseParseError::schema(
+            "arguments must be a JSON object",
+        ));
+    };
+
+    for field in FORBIDDEN_RAW_ARGUMENT_FIELDS {
+        if arguments.contains_key(*field) {
+            return Err(RuntimeResponseParseError::schema(format!(
+                "raw payload field must use payload_id: {field}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn required_str<'a>(
+    envelope: &'a Map<String, Value>,
+    key: &str,
+) -> Result<&'a str, RuntimeResponseParseError> {
+    envelope
+        .get(key)
+        .ok_or_else(|| RuntimeResponseParseError::schema(format!("missing field: {key}")))?
+        .as_str()
+        .ok_or_else(|| RuntimeResponseParseError::schema(format!("field must be string: {key}")))
+}
+
+fn required_object_value<'a>(
+    envelope: &'a Map<String, Value>,
+    key: &str,
+) -> Result<&'a Value, RuntimeResponseParseError> {
+    let value = envelope
+        .get(key)
+        .ok_or_else(|| RuntimeResponseParseError::schema(format!("missing field: {key}")))?;
+    if value.as_object().is_none() {
+        return Err(RuntimeResponseParseError::schema(format!(
+            "field must be object: {key}"
+        )));
+    }
+
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_runtime_response, Activity, RuntimeResponse, RuntimeResponseParseErrorKind};
+
+    fn manifest_fields() -> &'static str {
+        r#""tool_manifest_id":"ahreumcode.local-llm.tool-manifest.v1","tool_manifest_version":"1""#
+    }
+
+    #[test]
+    fn parses_answer_response() {
+        let raw = format!(
+            r#"{{"response_type":"answer","activity":"None","message":"ready",{}}}"#,
+            manifest_fields()
+        );
+
+        let parsed = parse_runtime_response(&raw).expect("answer should parse");
+
+        let RuntimeResponse::Answer(answer) = parsed.response else {
+            panic!("expected answer");
+        };
+        assert_eq!(answer.activity, Activity::None);
+        assert_eq!(answer.message, "ready");
+        assert!(parsed.payloads.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_field() {
+        let raw = format!(
+            r#"{{"response_type":"answer","activity":"None","message":"ready","extra":true,{}}}"#,
+            manifest_fields()
+        );
+
+        let error = parse_runtime_response(&raw).expect_err("unknown field should fail");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::SchemaValidationFailed
+        );
+        assert!(error.message.contains("unknown field"));
+    }
+
+    #[test]
+    fn parses_tool_candidate_with_payload() {
+        let raw = format!(
+            r#"<AHREUM_ACTION>
+{{"response_type":"tool","activity":"Change","message":"patch ready","tool_name":"apply_patch","arguments":{{"payload_id":"patch_001"}},"reason":"needs patch",{} }}
+</AHREUM_ACTION>
+
+<AHREUM_PAYLOAD id="patch_001" format="apply_patch">
+*** Begin Patch
+*** Update File: src/main.rs
+@@
+-old
++new
+*** End Patch
+</AHREUM_PAYLOAD>"#,
+            manifest_fields()
+        );
+
+        let parsed = parse_runtime_response(&raw).expect("framed response should parse");
+
+        let RuntimeResponse::Tool(candidate) = parsed.response else {
+            panic!("expected tool candidate");
+        };
+        assert_eq!(candidate.activity, Activity::Change);
+        assert_eq!(candidate.tool_name, "apply_patch");
+        assert_eq!(parsed.payloads[0].id, "patch_001");
+        assert_eq!(parsed.payloads[0].format, "apply_patch");
+    }
+
+    #[test]
+    fn rejects_missing_payload_reference() {
+        let raw = format!(
+            r#"{{"response_type":"tool","activity":"Change","message":"patch ready","tool_name":"apply_patch","arguments":{{"payload_id":"patch_001"}},"reason":"needs patch",{} }}"#,
+            manifest_fields()
+        );
+
+        let error = parse_runtime_response(&raw).expect_err("missing payload should fail");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::PayloadValidationFailed
+        );
+    }
+
+    #[test]
+    fn rejects_raw_payload_text_in_json_arguments() {
+        let raw = format!(
+            r#"{{"response_type":"tool","activity":"Change","message":"patch ready","tool_name":"apply_patch","arguments":{{"patch":"*** Begin Patch"}},"reason":"needs patch",{} }}"#,
+            manifest_fields()
+        );
+
+        let error = parse_runtime_response(&raw).expect_err("raw patch argument should fail");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::SchemaValidationFailed
+        );
+        assert!(error.message.contains("payload_id"));
+    }
+
+    #[test]
+    fn rejects_unreferenced_extra_payload_block() {
+        let raw = format!(
+            r#"<AHREUM_ACTION>
+{{"response_type":"tool","activity":"Change","message":"patch ready","tool_name":"apply_patch","arguments":{{"payload_id":"patch_001"}},"reason":"needs patch",{} }}
+</AHREUM_ACTION>
+
+<AHREUM_PAYLOAD id="patch_001" format="apply_patch">
+*** Begin Patch
+*** End Patch
+</AHREUM_PAYLOAD>
+<AHREUM_PAYLOAD id="patch_002" format="apply_patch">
+*** Begin Patch
+*** End Patch
+</AHREUM_PAYLOAD>"#,
+            manifest_fields()
+        );
+
+        let error = parse_runtime_response(&raw).expect_err("extra payload should fail");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::PayloadValidationFailed
+        );
+        assert!(error.message.contains("without payload_id"));
+    }
+
+    #[test]
+    fn unwraps_whole_markdown_fence_only() {
+        let raw = format!(
+            "```json\n{{\"response_type\":\"answer\",\"activity\":\"None\",\"message\":\"ready\",{}}}\n```",
+            manifest_fields()
+        );
+
+        let parsed = parse_runtime_response(&raw).expect("whole fence should unwrap");
+
+        let RuntimeResponse::Answer(answer) = parsed.response else {
+            panic!("expected answer");
+        };
+        assert_eq!(answer.message, "ready");
+    }
+
+    #[test]
+    fn detects_partial_action_block() {
+        let raw = format!(
+            r#"<AHREUM_ACTION>
+{{"response_type":"answer","activity":"None","message":"ready",{}}}"#,
+            manifest_fields()
+        );
+
+        let error = parse_runtime_response(&raw).expect_err("partial action should fail");
+
+        assert_eq!(error.kind, RuntimeResponseParseErrorKind::PartialResponse);
+    }
+}
