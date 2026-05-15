@@ -31,7 +31,7 @@ pub struct MainAction {
     pub expanded_form_events: ExpandedFormEvents,
 }
 
-pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
+pub fn render_main(frame: &mut Frame<'_>, state: &TuiState, registry: &CommandRegistry) {
     let area = frame.area();
     let layout = layout_main(
         area,
@@ -49,7 +49,7 @@ pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
         frame,
         layout.command,
         &state.command_surface,
-        &CommandRegistry::new(),
+        registry,
         state.scene.as_str(),
         state.runtime_status.command_labels(),
     );
@@ -57,7 +57,11 @@ pub fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
     expanded_form::render_expanded_form(frame, expanded_form_area(area), &state.expanded_form);
 }
 
-pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
+pub fn handle_main_event(
+    event: KeyEvent,
+    state: &mut TuiState,
+    registry: &CommandRegistry,
+) -> MainAction {
     if state.working_process.is_active() && matches!(event.code, KeyCode::Esc) {
         let runtime_outcome = state.cancel_working_process();
         return MainAction {
@@ -95,6 +99,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
             event,
             &mut state.main_input,
             &mut state.command_surface,
+            registry,
             state.scene.as_str(),
             state.working_process.is_active(),
         );
@@ -152,6 +157,7 @@ pub fn handle_main_event(event: KeyEvent, state: &mut TuiState) -> MainAction {
                 event,
                 &mut state.main_input,
                 &mut state.command_surface,
+                registry,
                 state.scene.as_str(),
                 state.working_process.is_active(),
             );

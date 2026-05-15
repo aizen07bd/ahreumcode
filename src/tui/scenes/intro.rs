@@ -22,23 +22,28 @@ pub struct IntroAction {
     pub workspace_events: WorkspaceEvents,
 }
 
-pub fn render_intro(frame: &mut Frame<'_>, state: &TuiState) {
+pub fn render_intro(frame: &mut Frame<'_>, state: &TuiState, registry: &CommandRegistry) {
     let area = frame.area();
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
-    render_intro_body(frame, root[0], state);
+    render_intro_body(frame, root[0], state, registry);
     statusline::render_statusline(frame, root[1], &state.runtime_status);
 }
 
-pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction {
+pub fn handle_intro_event(
+    event: KeyEvent,
+    state: &mut TuiState,
+    registry: &CommandRegistry,
+) -> IntroAction {
     if state.command_surface.open && !event.modifiers.contains(KeyModifiers::CONTROL) {
         let outcome = handle_prompt_event(
             event,
             &mut state.intro_input,
             &mut state.command_surface,
+            registry,
             state.scene.as_str(),
             false,
         );
@@ -77,6 +82,7 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
                 event,
                 &mut state.intro_input,
                 &mut state.command_surface,
+                registry,
                 state.scene.as_str(),
                 false,
             );
@@ -90,7 +96,12 @@ pub fn handle_intro_event(event: KeyEvent, state: &mut TuiState) -> IntroAction 
     }
 }
 
-fn render_intro_body(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn render_intro_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiState,
+    registry: &CommandRegistry,
+) {
     let command_height = if state.command_surface.open { 5 } else { 0 };
     let content_height = (17 + command_height).min(area.height);
     let vertical_margin = area.height.saturating_sub(content_height) / 2;
@@ -120,7 +131,7 @@ fn render_intro_body(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         frame,
         centered_width(chunks[3], 84),
         &state.command_surface,
-        &CommandRegistry::new(),
+        registry,
         state.scene.as_str(),
         state.runtime_status.command_labels(),
     );

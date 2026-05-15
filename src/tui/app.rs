@@ -1,7 +1,6 @@
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
+use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use crossterm::event::{self, Event};
@@ -16,38 +15,28 @@ use serde_json::json;
 use crate::cli::{AppCommand, RunMode, SceneCommand};
 use crate::config::{ConfigLoadOutcome, ConfigLoadSource, RuntimeConfig};
 use crate::llm::{
-    attach_schema_prompt, parse_runtime_response, DecisionGate, LlmChatReport, LlmChatRequest,
-    LlmChatStatus, LlmDiagnostics, LlmDiagnosticsRuntime, LlmDiagnosticsSnapshot,
-    LlmDiagnosticsState, LlmHealthReport, LlmHealthStatus, LlmMessage, LlmMessageRole,
-    LlmMessageVisibility, LlmProviderFactory, MessageHistory, ParsedRuntimeResponse,
-    RepairLimitReached, RepairLoop, RepairRequest, RuntimeDecision, RuntimeDecisionError,
-    RuntimeResponseParseError, RuntimeResponseParseErrorKind, SchemaPrompt, SchemaPromptBuilder,
+    attach_schema_prompt, parse_runtime_response, DecisionGate, LlmChatReport, LlmChatStatus,
+    LlmDiagnostics, LlmDiagnosticsRuntime, LlmDiagnosticsSnapshot, LlmDiagnosticsState,
+    LlmHealthReport, LlmHealthStatus, LlmMessage, LlmMessageRole, LlmMessageVisibility,
+    LlmProviderFactory, MessageHistory, ParsedRuntimeResponse, RepairLimitReached, RepairLoop,
+    RepairRequest, RuntimeDecision, RuntimeDecisionError, RuntimeResponseParseError,
+    RuntimeResponseParseErrorKind, SchemaPrompt, SchemaPromptBuilder,
 };
 use crate::logging::{LogEvent, Logger};
 
 use super::approval::ApprovalInputEvent;
 use super::command::{CommandDispatch, CommandInputEvent, CommandRegistry};
+use super::event_log::{self, TUI_01_SCOPE, TUI_02_SCOPE, TUI_03_SCOPE};
 use super::expanded_form::ExpandedFormEvent;
 use super::persona::{PersonaEvent, PersonaRendered};
+use super::runtime_request::{self, ActivePlainRequest};
 use super::scenes::epilogue::print_epilogue;
 use super::scenes::intro::{handle_intro_event, render_intro};
 use super::scenes::main::{handle_main_event, render_main};
 use super::state::{Scene, TuiState};
-use super::working_process::{
-    WorkingFinishReason, WorkingPhase, WorkingProcessEvent, WorkingProcessEvents,
-};
+use super::working_process::{WorkingPhase, WorkingProcessEvent, WorkingProcessEvents};
 use super::workspace::{WorkspaceEvent, WorkspaceEvents, WorkspaceRendered};
 
-const TUI_01_SCOPE: &str = "tui-01-intro-scene";
-const TUI_02_SCOPE: &str = "tui-02-epilogue-scene";
-const TUI_03_SCOPE: &str = "tui-03-main-scene-layout";
-const TUI_04_SCOPE: &str = "tui-04-command-area-basic-actions";
-const TUI_05_SCOPE: &str = "tui-05-approval-area";
-const TUI_06_SCOPE: &str = "tui-06-working-process-area";
-const TUI_07_SCOPE: &str = "tui-07-workspace-output-layout";
-const TUI_08_SCOPE: &str = "tui-08-persona-message-detail";
-const TUI_09_SCOPE: &str = "tui-09-complex-commands";
-const TUI_10_SCOPE: &str = "tui-10-modal-expanded-form";
 const LLM_01_SCOPE: &str = "llm-01-config-runtime";
 const LLM_02_SCOPE: &str = "llm-02-provider-connection";
 const LLM_03_SCOPE: &str = "llm-03-plain-prompt-request";
@@ -66,44 +55,14 @@ const EVENT_EXIT_REQUESTED: &str = "exit_requested";
 const EVENT_SESSION_SUMMARY_CREATED: &str = "session_summary_created";
 const EVENT_EPILOGUE_RENDERED: &str = "epilogue_rendered";
 const EVENT_TERMINAL_RESTORED: &str = "terminal_restored";
-const EVENT_MAIN_SCENE_RENDERED: &str = "main_scene_rendered";
-const EVENT_LAYOUT_CALCULATED: &str = "layout_calculated";
-const EVENT_PERSONA_LAYOUT_ABSENT: &str = "persona_layout_absent";
-const EVENT_STATUSLINE_POSITIONED: &str = "statusline_positioned";
-const EVENT_COMMAND_SURFACE_OPENED: &str = "command_surface_opened";
-const EVENT_COMMAND_FILTER_CHANGED: &str = "command_filter_changed";
-const EVENT_COMMAND_SELECTED: &str = "command_selected";
-const EVENT_COMMAND_ACTION_DISPATCHED: &str = "command_action_dispatched";
-const EVENT_COMMAND_AVAILABILITY_CHECKED: &str = "command_availability_checked";
-const EVENT_STEPPED_PICKER_OPENED: &str = "stepped_picker_opened";
-const EVENT_STEPPED_PICKER_SELECTION_CHANGED: &str = "stepped_picker_selection_changed";
-const EVENT_STEPPED_PICKER_CONFIRMED: &str = "stepped_picker_confirmed";
-const EVENT_EXPANDED_FORM_OPENED: &str = "expanded_form_opened";
-const EVENT_EXPANDED_FORM_FIELD_CHANGED: &str = "expanded_form_field_changed";
-const EVENT_EXPANDED_FORM_SUBMITTED: &str = "expanded_form_submitted";
-const EVENT_EXPANDED_FORM_CANCELLED: &str = "expanded_form_cancelled";
-const EVENT_APPROVAL_SURFACE_OPENED: &str = "approval_surface_opened";
-const EVENT_APPROVAL_OPTION_SELECTED: &str = "approval_option_selected";
-const EVENT_APPROVAL_RESULT_RECORDED: &str = "approval_result_recorded";
 const EVENT_WORKING_PROCESS_STARTED: &str = "working_process_started";
-const EVENT_WORKING_PHASE_CHANGED: &str = "working_phase_changed";
 const EVENT_WORKING_PROCESS_PHASE_CHANGED: &str = "working_process_phase_changed";
-const EVENT_WORKING_PROCESS_CANCEL_HINT_RENDERED: &str = "working_process_cancel_hint_rendered";
-const EVENT_WORKING_PROCESS_FINISHED: &str = "working_process_finished";
 const EVENT_WORKING_PROCESS_CANCELLED: &str = "working_process_cancelled";
 const EVENT_WORKING_PROCESS_COMPLETED: &str = "working_process_completed";
 const EVENT_LLM_DIAGNOSTICS_REQUESTED: &str = "llm_diagnostics_requested";
 const EVENT_LLM_DIAGNOSTICS_RENDERED: &str = "llm_diagnostics_rendered";
 const EVENT_LLM_STATUS_SNAPSHOT_RECORDED: &str = "llm_status_snapshot_recorded";
 const EVENT_LLM_RUNTIME_READY_FOR_TOOL_STAGE: &str = "llm_runtime_ready_for_tool_stage";
-const EVENT_WORKSPACE_PROMPT_BLOCK_ADDED: &str = "workspace_prompt_block_added";
-const EVENT_WORKSPACE_OUTPUT_ADDED: &str = "workspace_output_added";
-const EVENT_WORKSPACE_SCROLL_CHANGED: &str = "workspace_scroll_changed";
-const EVENT_WORKSPACE_RENDERED: &str = "workspace_rendered";
-const EVENT_PERSONA_PANEL_OPENED: &str = "persona_panel_opened";
-const EVENT_PERSONA_PANEL_CLOSED: &str = "persona_panel_closed";
-const EVENT_PERSONA_MESSAGE_RENDERED: &str = "persona_message_rendered";
-const EVENT_PERSONA_WIDTH_REJECTED: &str = "persona_width_rejected";
 const EVENT_CONFIG_LOAD_STARTED: &str = "config_load_started";
 const EVENT_CONFIG_LOADED: &str = "config_loaded";
 const EVENT_CONFIG_DEFAULT_APPLIED: &str = "config_default_applied";
@@ -195,6 +154,7 @@ fn run_intro_smoke(command: AppCommand) -> io::Result<()> {
 
     let backend = TestBackend::new(120, 30);
     let mut terminal = Terminal::new(backend)?;
+    let command_registry = CommandRegistry::new();
     let state = TuiState::intro(
         workspace,
         &config_outcome.config,
@@ -210,7 +170,7 @@ fn run_intro_smoke(command: AppCommand) -> io::Result<()> {
         EVENT_PROMPT_FOCUS_READY,
         json!({ "run_mode": command.run_mode.as_str() }),
     ))?;
-    terminal.draw(|frame| render_intro(frame, &state))?;
+    terminal.draw(|frame| render_intro(frame, &state, &command_registry))?;
     logger.ui(LogEvent::ui(
         TUI_01_SCOPE,
         EVENT_INTRO_RENDERED,
@@ -267,6 +227,7 @@ fn run_main_smoke(command: AppCommand) -> io::Result<()> {
     let config_outcome = load_runtime_config(&logger, &project_root)?;
     let backend = TestBackend::new(120, 32);
     let mut terminal = Terminal::new(backend)?;
+    let command_registry = CommandRegistry::new();
     let state = TuiState::main(
         workspace,
         &config_outcome.config,
@@ -277,8 +238,8 @@ fn run_main_smoke(command: AppCommand) -> io::Result<()> {
             .map(|warning| warning.message.as_str()),
     );
 
-    terminal.draw(|frame| render_main(frame, &state))?;
-    log_main_scene_rendered(&logger, command.run_mode.as_str())?;
+    terminal.draw(|frame| render_main(frame, &state, &command_registry))?;
+    event_log::log_main_scene_rendered(&logger, command.run_mode.as_str())?;
 
     println!("tui-03 main smoke ok");
     println!("scene=main");
@@ -343,6 +304,7 @@ struct TuiApp {
     state: TuiState,
     logger: Logger,
     runtime_config: RuntimeConfig,
+    command_registry: CommandRegistry,
     llm_diagnostics: LlmDiagnosticsState,
     active_plain_request: Option<ActivePlainRequest>,
     next_run_index: u64,
@@ -350,16 +312,6 @@ struct TuiApp {
     intro_render_logged: bool,
     main_render_logged: bool,
     terminal_restore_scope: Option<&'static str>,
-}
-
-struct ActivePlainRequest {
-    run_id: String,
-    turn_id: String,
-    prompt: String,
-    history: MessageHistory,
-    receiver: Receiver<LlmChatReport>,
-    cancelled: bool,
-    repair_attempts: u16,
 }
 
 impl TuiApp {
@@ -375,6 +327,7 @@ impl TuiApp {
             state: TuiState::intro(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            command_registry: CommandRegistry::new(),
             llm_diagnostics: LlmDiagnosticsState::default(),
             active_plain_request: None,
             next_run_index: 1,
@@ -397,6 +350,7 @@ impl TuiApp {
             state: TuiState::main(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            command_registry: CommandRegistry::new(),
             llm_diagnostics: LlmDiagnosticsState::default(),
             active_plain_request: None,
             next_run_index: 1,
@@ -419,6 +373,7 @@ impl TuiApp {
             state: TuiState::epilogue(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            command_registry: CommandRegistry::new(),
             llm_diagnostics: LlmDiagnosticsState::default(),
             active_plain_request: None,
             next_run_index: 1,
@@ -448,8 +403,8 @@ impl TuiApp {
             }
 
             terminal.draw(|frame| match self.state.scene {
-                Scene::Intro => render_intro(frame, &self.state),
-                Scene::Main => render_main(frame, &self.state),
+                Scene::Intro => render_intro(frame, &self.state, &self.command_registry),
+                Scene::Main => render_main(frame, &self.state, &self.command_registry),
                 Scene::Epilogue => {}
             })?;
 
@@ -459,7 +414,7 @@ impl TuiApp {
                 self.intro_render_logged = true;
             }
             if matches!(self.state.scene, Scene::Main) && !self.main_render_logged {
-                log_main_scene_rendered(&self.logger, self.run_mode)?;
+                event_log::log_main_scene_rendered(&self.logger, self.run_mode)?;
                 self.main_render_logged = true;
             }
             self.log_workspace_render_if_pending()?;
@@ -471,7 +426,8 @@ impl TuiApp {
                 };
                 match self.state.scene {
                     Scene::Intro => {
-                        let action = handle_intro_event(key_event, &mut self.state);
+                        let action =
+                            handle_intro_event(key_event, &mut self.state, &self.command_registry);
                         self.log_command_events(&action.command_outcome.events)?;
                         self.log_working_process_events(&action.working_process_events.events)?;
                         self.log_workspace_events(&action.workspace_events.events)?;
@@ -484,7 +440,8 @@ impl TuiApp {
                         }
                     }
                     Scene::Main => {
-                        let action = handle_main_event(key_event, &mut self.state);
+                        let action =
+                            handle_main_event(key_event, &mut self.state, &self.command_registry);
                         self.log_command_events(&action.command_outcome.events)?;
                         self.log_approval_events(&action.approval_outcome.events)?;
                         self.log_working_process_events(&action.working_process_events.events)?;
@@ -735,13 +692,13 @@ impl TuiApp {
     }
 
     fn handle_plain_prompt_events(&mut self, events: &WorkingProcessEvents) -> io::Result<()> {
-        if working_started(events) {
+        if event_log::working_started(&events.events) {
             if let Some(prompt) = self.state.pending_prompt.clone() {
                 self.start_plain_prompt_request(prompt)?;
             }
         }
 
-        if working_cancelled(events) {
+        if event_log::working_cancelled(&events.events) {
             self.cancel_active_plain_request()?;
         }
 
@@ -753,7 +710,7 @@ impl TuiApp {
             return Ok(());
         }
 
-        let run_id = self.next_run_id();
+        let run_id = runtime_request::next_run_id(&mut self.next_run_index);
         let mut history = MessageHistory::new(run_id.clone());
         self.log_message_history_created(&history)?;
 
@@ -780,25 +737,11 @@ impl TuiApp {
         self.log_runtime_process_started(&run_id, &turn_id)?;
         self.set_runtime_working_phase(WorkingPhase::Interpret, "로컬 LLM 응답을 기다립니다.")?;
 
-        let (sender, receiver) = mpsc::channel();
-        let config = self.runtime_config.clone();
-        thread::spawn(move || {
-            let provider = LlmProviderFactory::from_config(&config);
-            let report = provider.send_chat(LlmChatRequest {
-                messages: request_messages,
-            });
-            let _ = sender.send(report);
-        });
+        let receiver = runtime_request::spawn_chat_request(&self.runtime_config, request_messages);
 
-        self.active_plain_request = Some(ActivePlainRequest {
-            run_id,
-            turn_id,
-            prompt,
-            history,
-            receiver,
-            cancelled: false,
-            repair_attempts: 0,
-        });
+        self.active_plain_request = Some(ActivePlainRequest::new(
+            run_id, turn_id, prompt, history, receiver,
+        ));
 
         Ok(())
     }
@@ -911,7 +854,7 @@ impl TuiApp {
                                 }
                                 self.set_runtime_working_phase(
                                     WorkingPhase::Execute,
-                                    runtime_execute_detail(&decision),
+                                    runtime_request::runtime_execute_detail(&decision),
                                 )?;
                                 self.set_runtime_working_phase(
                                     WorkingPhase::Apply,
@@ -1104,21 +1047,8 @@ impl TuiApp {
         self.log_message_recorded(&active.history, &repair_message)?;
         self.log_repair_request_started(&active, &repair_request)?;
 
-        let request_messages = active
-            .history
-            .for_request(None)
-            .into_iter()
-            .filter(|message| message.role != LlmMessageRole::Assistant)
-            .collect();
-        let (sender, receiver) = mpsc::channel();
-        let config = self.runtime_config.clone();
-        thread::spawn(move || {
-            let provider = LlmProviderFactory::from_config(&config);
-            let report = provider.send_chat(LlmChatRequest {
-                messages: request_messages,
-            });
-            let _ = sender.send(report);
-        });
+        let request_messages = runtime_request::repair_request_messages(&active.history);
+        let receiver = runtime_request::spawn_chat_request(&self.runtime_config, request_messages);
 
         active.receiver = receiver;
         active.repair_attempts = repair_request.attempt;
@@ -1154,12 +1084,6 @@ impl TuiApp {
         self.log_runtime_process_completed(runtime_ids)?;
         self.state.pending_prompt = None;
         self.log_workspace_events(&events.events)
-    }
-
-    fn next_run_id(&mut self) -> String {
-        let run_id = format!("run-{number:04}", number = self.next_run_index);
-        self.next_run_index += 1;
-        run_id
     }
 
     fn build_schema_prompt(&self) -> io::Result<SchemaPrompt> {
@@ -1684,174 +1608,24 @@ impl TuiApp {
     }
 
     fn log_command_events(&self, events: &[CommandInputEvent]) -> io::Result<()> {
-        let registry = CommandRegistry::new();
-
-        for event in events {
-            match event {
-                CommandInputEvent::SurfaceOpened => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_04_SCOPE,
-                        EVENT_COMMAND_SURFACE_OPENED,
-                        json!({ "scene": self.state.scene.as_str() }),
-                    ))?;
-                }
-                CommandInputEvent::FilterChanged { query } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_04_SCOPE,
-                        EVENT_COMMAND_FILTER_CHANGED,
-                        json!({ "query": query }),
-                    ))?;
-                }
-                CommandInputEvent::CommandSelected { command } => {
-                    let data = command_log_data(&registry, *command);
-                    self.logger
-                        .ui(LogEvent::ui(TUI_04_SCOPE, EVENT_COMMAND_SELECTED, data))?;
-                }
-                CommandInputEvent::ActionDispatched { command } => {
-                    let data = command_log_data(&registry, *command);
-                    self.logger.ui(LogEvent::ui(
-                        TUI_04_SCOPE,
-                        EVENT_COMMAND_ACTION_DISPATCHED,
-                        data,
-                    ))?;
-                }
-                CommandInputEvent::CommandAvailabilityChecked {
-                    command,
-                    allowed,
-                    reason,
-                } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_09_SCOPE,
-                        EVENT_COMMAND_AVAILABILITY_CHECKED,
-                        json!({
-                            "command": command.as_str(),
-                            "allowed": allowed,
-                            "reason": reason,
-                        }),
-                    ))?;
-                }
-                CommandInputEvent::SteppedPickerOpened { command, step } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_09_SCOPE,
-                        EVENT_STEPPED_PICKER_OPENED,
-                        json!({ "command": command.as_str(), "step": step }),
-                    ))?;
-                }
-                CommandInputEvent::SteppedPickerSelectionChanged { command, selected } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_09_SCOPE,
-                        EVENT_STEPPED_PICKER_SELECTION_CHANGED,
-                        json!({ "command": command.as_str(), "selected": selected }),
-                    ))?;
-                }
-                CommandInputEvent::SteppedPickerConfirmed { command, selected } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_09_SCOPE,
-                        EVENT_STEPPED_PICKER_CONFIRMED,
-                        json!({ "command": command.as_str(), "selected": selected }),
-                    ))?;
-                }
-            }
-        }
-
-        Ok(())
+        event_log::log_command_events(
+            &self.logger,
+            self.state.scene.as_str(),
+            &self.command_registry,
+            events,
+        )
     }
 
     fn log_approval_events(&self, events: &[ApprovalInputEvent]) -> io::Result<()> {
-        for event in events {
-            match event {
-                ApprovalInputEvent::SurfaceOpened => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_05_SCOPE,
-                        EVENT_APPROVAL_SURFACE_OPENED,
-                        json!({ "scene": self.state.scene.as_str() }),
-                    ))?;
-                }
-                ApprovalInputEvent::OptionSelected { option } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_05_SCOPE,
-                        EVENT_APPROVAL_OPTION_SELECTED,
-                        json!({ "option": option.as_str() }),
-                    ))?;
-                }
-                ApprovalInputEvent::ResultRecorded { result } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_05_SCOPE,
-                        EVENT_APPROVAL_RESULT_RECORDED,
-                        json!({ "result": result.as_str() }),
-                    ))?;
-                }
-            }
-        }
-
-        Ok(())
+        event_log::log_approval_events(&self.logger, self.state.scene.as_str(), events)
     }
 
     fn log_working_process_events(&self, events: &[WorkingProcessEvent]) -> io::Result<()> {
-        for event in events {
-            match event {
-                WorkingProcessEvent::Started => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_06_SCOPE,
-                        EVENT_WORKING_PROCESS_STARTED,
-                        json!({ "scene": self.state.scene.as_str() }),
-                    ))?;
-                }
-                WorkingProcessEvent::PhaseChanged { phase } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_06_SCOPE,
-                        EVENT_WORKING_PHASE_CHANGED,
-                        json!({ "phase": phase.label(), "step": phase.number() }),
-                    ))?;
-                }
-                WorkingProcessEvent::CancelHintRendered => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_06_SCOPE,
-                        EVENT_WORKING_PROCESS_CANCEL_HINT_RENDERED,
-                        json!({ "hint": "esc 취소" }),
-                    ))?;
-                }
-                WorkingProcessEvent::Finished { reason } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_06_SCOPE,
-                        EVENT_WORKING_PROCESS_FINISHED,
-                        json!({ "reason": reason.as_str() }),
-                    ))?;
-                }
-            }
-        }
-
-        Ok(())
+        event_log::log_working_process_events(&self.logger, self.state.scene.as_str(), events)
     }
 
     fn log_workspace_events(&self, events: &[WorkspaceEvent]) -> io::Result<()> {
-        for event in events {
-            match event {
-                WorkspaceEvent::PromptBlockAdded => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_07_SCOPE,
-                        EVENT_WORKSPACE_PROMPT_BLOCK_ADDED,
-                        json!({ "scene": self.state.scene.as_str() }),
-                    ))?;
-                }
-                WorkspaceEvent::OutputAdded { item_type } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_07_SCOPE,
-                        EVENT_WORKSPACE_OUTPUT_ADDED,
-                        json!({ "item_type": item_type }),
-                    ))?;
-                }
-                WorkspaceEvent::ScrollChanged { scroll } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_07_SCOPE,
-                        EVENT_WORKSPACE_SCROLL_CHANGED,
-                        json!({ "scroll": scroll }),
-                    ))?;
-                }
-            }
-        }
-
-        Ok(())
+        event_log::log_workspace_events(&self.logger, self.state.scene.as_str(), events)
     }
 
     fn log_workspace_render_if_pending(&mut self) -> io::Result<()> {
@@ -1863,41 +1637,11 @@ impl TuiApp {
     }
 
     fn log_workspace_rendered(&self, rendered: WorkspaceRendered) -> io::Result<()> {
-        self.logger.ui(LogEvent::ui(
-            TUI_07_SCOPE,
-            EVENT_WORKSPACE_RENDERED,
-            json!({ "item_count": rendered.item_count, "scroll": rendered.scroll }),
-        ))
+        event_log::log_workspace_rendered(&self.logger, rendered)
     }
 
     fn log_persona_events(&self, events: &[PersonaEvent]) -> io::Result<()> {
-        for event in events {
-            match event {
-                PersonaEvent::PanelOpened => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_08_SCOPE,
-                        EVENT_PERSONA_PANEL_OPENED,
-                        json!({ "scene": self.state.scene.as_str() }),
-                    ))?;
-                }
-                PersonaEvent::PanelClosed => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_08_SCOPE,
-                        EVENT_PERSONA_PANEL_CLOSED,
-                        json!({ "scene": self.state.scene.as_str() }),
-                    ))?;
-                }
-                PersonaEvent::WidthRejected { width, min_width } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_08_SCOPE,
-                        EVENT_PERSONA_WIDTH_REJECTED,
-                        json!({ "width": width, "min_width": min_width }),
-                    ))?;
-                }
-            }
-        }
-
-        Ok(())
+        event_log::log_persona_events(&self.logger, self.state.scene.as_str(), events)
     }
 
     fn log_persona_render_if_pending(&mut self) -> io::Result<()> {
@@ -1909,129 +1653,12 @@ impl TuiApp {
     }
 
     fn log_persona_message_rendered(&self, rendered: PersonaRendered) -> io::Result<()> {
-        self.logger.ui(LogEvent::ui(
-            TUI_08_SCOPE,
-            EVENT_PERSONA_MESSAGE_RENDERED,
-            json!({ "message_count": rendered.message_count }),
-        ))
+        event_log::log_persona_message_rendered(&self.logger, rendered)
     }
 
     fn log_expanded_form_events(&self, events: &[ExpandedFormEvent]) -> io::Result<()> {
-        for event in events {
-            match event {
-                ExpandedFormEvent::Opened { kind } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_10_SCOPE,
-                        EVENT_EXPANDED_FORM_OPENED,
-                        json!({ "kind": kind.as_str() }),
-                    ))?;
-                }
-                ExpandedFormEvent::FieldChanged {
-                    kind,
-                    field,
-                    masked,
-                } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_10_SCOPE,
-                        EVENT_EXPANDED_FORM_FIELD_CHANGED,
-                        json!({
-                            "kind": kind.as_str(),
-                            "field": field,
-                            "masked": masked,
-                        }),
-                    ))?;
-                }
-                ExpandedFormEvent::Submitted { kind } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_10_SCOPE,
-                        EVENT_EXPANDED_FORM_SUBMITTED,
-                        json!({ "kind": kind.as_str() }),
-                    ))?;
-                }
-                ExpandedFormEvent::Cancelled { kind } => {
-                    self.logger.ui(LogEvent::ui(
-                        TUI_10_SCOPE,
-                        EVENT_EXPANDED_FORM_CANCELLED,
-                        json!({ "kind": kind.as_str() }),
-                    ))?;
-                }
-            }
-        }
-
-        Ok(())
+        event_log::log_expanded_form_events(&self.logger, events)
     }
-}
-
-fn command_log_data(
-    registry: &CommandRegistry,
-    command: super::command::CommandId,
-) -> serde_json::Value {
-    let Some(metadata) = registry.command(command) else {
-        return json!({ "command": command.as_str() });
-    };
-
-    json!({
-        "command": metadata.name,
-        "group": metadata.group,
-        "presentation": metadata.presentation.as_str(),
-        "risk": metadata.risk.as_str(),
-        "availability": metadata.availability,
-    })
-}
-
-fn working_started(events: &WorkingProcessEvents) -> bool {
-    events
-        .events
-        .iter()
-        .any(|event| matches!(event, WorkingProcessEvent::Started))
-}
-
-fn working_cancelled(events: &WorkingProcessEvents) -> bool {
-    events.events.iter().any(|event| {
-        matches!(
-            event,
-            WorkingProcessEvent::Finished {
-                reason: WorkingFinishReason::Canceled
-            }
-        )
-    })
-}
-
-fn runtime_execute_detail(decision: &RuntimeDecision) -> &'static str {
-    match decision {
-        RuntimeDecision::Answer { .. }
-        | RuntimeDecision::Clarify { .. }
-        | RuntimeDecision::Blocked { .. } => "실행할 도구가 없어 실행 단계를 통과합니다.",
-        RuntimeDecision::ToolCandidatePending { .. } => {
-            "도구 후보를 실행하지 않고 다음 runtime 단계로 넘깁니다."
-        }
-        RuntimeDecision::ApprovalNeeded { .. } => {
-            "승인이 필요한 후보이므로 직접 실행하지 않습니다."
-        }
-    }
-}
-
-fn log_main_scene_rendered(logger: &Logger, run_mode: &str) -> io::Result<()> {
-    logger.ui(LogEvent::ui(
-        TUI_03_SCOPE,
-        EVENT_LAYOUT_CALCULATED,
-        json!({ "run_mode": run_mode }),
-    ))?;
-    logger.ui(LogEvent::ui(
-        TUI_03_SCOPE,
-        EVENT_PERSONA_LAYOUT_ABSENT,
-        json!({ "persona": "off" }),
-    ))?;
-    logger.ui(LogEvent::ui(
-        TUI_03_SCOPE,
-        EVENT_STATUSLINE_POSITIONED,
-        json!({ "position": "bottom" }),
-    ))?;
-    logger.ui(LogEvent::ui(
-        TUI_03_SCOPE,
-        EVENT_MAIN_SCENE_RENDERED,
-        json!({ "run_mode": run_mode }),
-    ))
 }
 
 fn load_runtime_config(logger: &Logger, project_root: &Path) -> io::Result<ConfigLoadOutcome> {

@@ -8,13 +8,12 @@ pub fn handle_prompt_event(
     event: KeyEvent,
     input: &mut String,
     surface: &mut CommandSurfaceState,
+    registry: &CommandRegistry,
     scene: &str,
     runtime_busy: bool,
 ) -> CommandInputOutcome {
-    let registry = CommandRegistry::new();
-
     if surface.open {
-        return handle_command_event(event, input, surface, &registry, scene, runtime_busy);
+        return handle_command_event(event, input, surface, registry, scene, runtime_busy);
     }
 
     match event.code {
