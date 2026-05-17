@@ -64,7 +64,8 @@ pub fn write_epilogue(writer: &mut impl Write, summary: &EpilogueSummary) -> io:
         writer,
         &[Segment::muted(">_ "), Segment::bold(product::APP_NAME)],
     )?;
-    write_row(writer, &[Segment::muted(product::KOREAN_VERSION_LINE)])?;
+    let korean_version_line = product::korean_version_line();
+    write_row(writer, &[Segment::muted(korean_version_line.as_str())])?;
     write_row(writer, &[])?;
     write_row(
         writer,

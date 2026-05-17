@@ -320,17 +320,20 @@ fn format_decision(value: Option<&LlmDecisionSnapshot>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{LlmDiagnostics, LlmDiagnosticsRuntime, LlmDiagnosticsState};
+    use crate::config::{
+        DEFAULT_BASE_URL, DEFAULT_CONTEXT_TOKENS, DEFAULT_MODE, DEFAULT_MODEL, DEFAULT_PROVIDER,
+    };
 
     #[test]
     fn snapshot_contains_default_runtime_state() {
         let state = LlmDiagnosticsState::default();
         let snapshot = LlmDiagnostics::snapshot(
             LlmDiagnosticsRuntime {
-                provider: "lm-studio",
-                model: "google/gemma-4-e4b",
-                base_url: "http://127.0.0.1:1234/v1",
-                context_tokens: 32000,
-                mode: "Crew",
+                provider: DEFAULT_PROVIDER,
+                model: DEFAULT_MODEL,
+                base_url: DEFAULT_BASE_URL,
+                context_tokens: DEFAULT_CONTEXT_TOKENS,
+                mode: DEFAULT_MODE,
                 web: "web on",
             },
             &state,
@@ -348,11 +351,11 @@ mod tests {
 
         let snapshot = LlmDiagnostics::snapshot(
             LlmDiagnosticsRuntime {
-                provider: "lm-studio",
-                model: "google/gemma-4-e4b",
-                base_url: "http://127.0.0.1:1234/v1",
-                context_tokens: 32000,
-                mode: "Crew",
+                provider: DEFAULT_PROVIDER,
+                model: DEFAULT_MODEL,
+                base_url: DEFAULT_BASE_URL,
+                context_tokens: DEFAULT_CONTEXT_TOKENS,
+                mode: DEFAULT_MODE,
                 web: "web on",
             },
             &state,

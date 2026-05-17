@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::observation::{ToolErrorKind, ToolObservation};
 use super::path::{resolve_existing_workspace_path, WorkspacePath};
-use super::runtime::{bool_arg, string_arg, u64_arg};
+use super::runtime::{string_arg, u64_arg};
 
 const READ_FILE: &str = "read_file";
 const LIST_FILES: &str = "list_files";
@@ -34,7 +34,6 @@ impl ListFilesArgs {
 pub struct SearchTextArgs {
     path: String,
     query: String,
-    use_regex: bool,
     max_results: usize,
 }
 
@@ -43,7 +42,6 @@ impl SearchTextArgs {
         Ok(Self {
             path: string_arg(arguments, "path")?.to_owned(),
             query: string_arg(arguments, "query")?.to_owned(),
-            use_regex: bool_arg(arguments, "use_regex")?,
             max_results: usize::try_from(u64_arg(arguments, "max_results")?)
                 .map_err(|_| "max_results is too large".to_owned())?,
         })
@@ -111,15 +109,6 @@ pub fn list_files(root: &Path, args: ListFilesArgs) -> ToolObservation {
 }
 
 pub fn search_text(root: &Path, args: SearchTextArgs) -> ToolObservation {
-    if args.use_regex {
-        return ToolObservation::failed(
-            SEARCH_TEXT,
-            Some(args.path),
-            ToolErrorKind::UnsupportedArgument,
-            "tool-01 search_text supports literal search only",
-        );
-    }
-
     let target = match resolve_existing_workspace_path(root, &args.path) {
         Ok(target) => target,
         Err(error) => return path_failure(SEARCH_TEXT, Some(args.path), error.kind, error.message),
@@ -458,7 +447,6 @@ mod tests {
         let args = SearchTextArgs::from_value(&json!({
             "path": ".",
             "query": "beta",
-            "use_regex": false,
             "max_results": 10
         }))
         .expect("args");

@@ -9,6 +9,7 @@ use super::explore::{
     SearchTextArgs,
 };
 use super::observation::{ToolErrorKind, ToolObservation, DEFAULT_PREVIEW_LINE_LIMIT};
+use crate::tool::{validate_tool_arguments, ToolName, ToolRuntimeSupport};
 
 #[derive(Clone)]
 pub struct ToolRuntime {
@@ -32,38 +33,62 @@ impl ToolRuntime {
                 call.tool_name,
                 None,
                 ToolErrorKind::UnsupportedTool,
-                "tool-01 only executes Explore tools",
+                "tool runtime cannot execute this activity",
             );
         }
 
-        let mut observation = match call.tool_name.as_str() {
-            "list_files" => match ListFilesArgs::from_value(&call.arguments) {
+        let Some(tool_name) = ToolName::parse(&call.tool_name) else {
+            return ToolObservation::failed(
+                call.tool_name,
+                None,
+                ToolErrorKind::UnsupportedTool,
+                "tool is not available in runtime",
+            );
+        };
+        let spec = tool_name.spec();
+        if spec.runtime != ToolRuntimeSupport::Explore {
+            return ToolObservation::failed(
+                spec.name,
+                None,
+                ToolErrorKind::UnsupportedTool,
+                "tool is not executable by the current runtime",
+            );
+        }
+        if let Err(error) = validate_tool_arguments(tool_name, &call.arguments) {
+            return invalid_arguments(spec.name, error);
+        }
+
+        let mut observation = match tool_name {
+            ToolName::ListFiles => match ListFilesArgs::from_value(&call.arguments) {
                 Ok(args) => list_files(&self.workspace_root, args),
                 Err(error) => invalid_arguments("list_files", error),
             },
-            "search_text" => match SearchTextArgs::from_value(&call.arguments) {
+            ToolName::SearchText => match SearchTextArgs::from_value(&call.arguments) {
                 Ok(args) => search_text(&self.workspace_root, args),
                 Err(error) => invalid_arguments("search_text", error),
             },
-            "read_file" => match ReadFileArgs::from_value(&call.arguments) {
+            ToolName::ReadFile => match ReadFileArgs::from_value(&call.arguments) {
                 Ok(args) => read_file(&self.workspace_root, args),
                 Err(error) => invalid_arguments("read_file", error),
             },
-            "inspect_git" => match string_arg(&call.arguments, "scope") {
+            ToolName::InspectGit => match string_arg(&call.arguments, "scope") {
                 Ok("status") => inspect_git_status(&self.workspace_root),
                 Ok(_) => ToolObservation::failed(
-                    "inspect_git",
+                    ToolName::InspectGit.as_str(),
                     None,
                     ToolErrorKind::UnsupportedArgument,
-                    "tool-01 only supports inspect_git scope=status",
+                    "unsupported inspect_git scope",
                 ),
                 Err(error) => invalid_arguments("inspect_git", error),
             },
-            _ => ToolObservation::failed(
-                call.tool_name.clone(),
+            ToolName::ApplyPatch
+            | ToolName::RunCommand
+            | ToolName::AddProvider
+            | ToolName::UpdateConfig => ToolObservation::failed(
+                spec.name,
                 None,
                 ToolErrorKind::UnsupportedTool,
-                "tool is not implemented in tool-01",
+                "tool is not executable by the current runtime",
             ),
         };
         let artifact_name = call.artifact_name();
@@ -150,14 +175,6 @@ pub(super) fn u64_arg(arguments: &Value, name: &str) -> Result<u64, String> {
         .and_then(|object| object.get(name))
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("{name} must be an unsigned integer"))
-}
-
-pub(super) fn bool_arg(arguments: &Value, name: &str) -> Result<bool, String> {
-    arguments
-        .as_object()
-        .and_then(|object| object.get(name))
-        .and_then(Value::as_bool)
-        .ok_or_else(|| format!("{name} must be a boolean"))
 }
 
 fn invalid_arguments(tool_name: &'static str, message: String) -> ToolObservation {

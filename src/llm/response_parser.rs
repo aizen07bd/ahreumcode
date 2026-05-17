@@ -541,33 +541,42 @@ fn validate_single_payload_reference(
     payloads: &[RuntimePayload],
     expected_format: Option<&str>,
 ) -> Result<(), RuntimeResponseParseError> {
-    let matches = payloads
-        .iter()
-        .filter(|payload| payload.id == payload_id)
-        .collect::<Vec<_>>();
-
-    match matches.as_slice() {
-        [payload] if payloads.len() == 1 => {
-            if let Some(expected_format) = expected_format {
-                if payload.format != expected_format {
-                    return Err(RuntimeResponseParseError::payload(format!(
-                        "payload format must be {expected_format}: {}",
-                        payload.format
-                    )));
-                }
-            }
-            Ok(())
+    let mut matching_payload = None;
+    for payload in payloads.iter().filter(|payload| payload.id == payload_id) {
+        if matching_payload.replace(payload).is_some() {
+            return Err(RuntimeResponseParseError::payload(format!(
+                "duplicate payload block: {payload_id}"
+            )));
         }
-        [_] => Err(RuntimeResponseParseError::payload(
-            "payload block exists without payload_id reference",
-        )),
-        [] => Err(RuntimeResponseParseError::payload(format!(
-            "missing payload block: {payload_id}"
-        ))),
-        _ => Err(RuntimeResponseParseError::payload(format!(
-            "duplicate payload block: {payload_id}"
-        ))),
     }
+
+    let Some(payload) = matching_payload else {
+        return Err(RuntimeResponseParseError::payload(format!(
+            "missing payload block: {payload_id}"
+        )));
+    };
+
+    if let Some(expected_format) = expected_format {
+        if payload.format != expected_format {
+            return Err(RuntimeResponseParseError::payload(format!(
+                "payload format must be {expected_format}: {}",
+                payload.format
+            )));
+        }
+    }
+
+    let referenced_ids = HashSet::from([payload_id]);
+    if let Some(unreferenced) = payloads
+        .iter()
+        .find(|payload| !referenced_ids.contains(payload.id.as_str()))
+    {
+        return Err(RuntimeResponseParseError::payload(format!(
+            "payload block exists without payload_id reference: {}",
+            unreferenced.id
+        )));
+    }
+
+    Ok(())
 }
 
 fn reject_unreferenced_payloads(
@@ -692,6 +701,26 @@ console.log(greeting);
         assert_eq!(answer.answer_payload_id.as_deref(), Some("answer_001"));
         assert_eq!(parsed.payloads[0].format, "markdown");
         assert!(parsed.payloads[0].body.contains("Hello, World!"));
+    }
+
+    #[test]
+    fn rejects_payload_answer_without_action_framing() {
+        let raw = format!(
+            r#"{{"response_type":"answer","activity":"None","message":"summary","answer_payload_id":"answer_001",{} }}
+<AHREUM_PAYLOAD id="answer_001" format="markdown">
+answer body
+</AHREUM_PAYLOAD>"#,
+            manifest_fields()
+        );
+
+        let error =
+            parse_runtime_response(&raw).expect_err("payload without action framing should fail");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::SchemaValidationFailed
+        );
+        assert!(error.message.contains("AHREUM_ACTION"));
     }
 
     #[test]

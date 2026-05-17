@@ -1,4 +1,4 @@
-use crate::product;
+use crate::config;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum ExpandedFormKind {
@@ -224,16 +224,24 @@ impl ExpandedFormEvents {
 fn fields_for(kind: ExpandedFormKind) -> Vec<ExpandedFormField> {
     match kind {
         ExpandedFormKind::LocalProvider => vec![
-            field("provider_name", "provider name", product::DEFAULT_PROVIDER),
-            field("base_url", "base url", "http://127.0.0.1:1234/v1"),
-            field("model", "model", product::DEFAULT_MODEL),
-            field("context_tokens", "context tokens", "32000"),
+            field("provider_name", "provider name", config::DEFAULT_PROVIDER),
+            field("base_url", "base url", config::DEFAULT_BASE_URL),
+            field("model", "model", config::DEFAULT_MODEL),
+            field(
+                "context_tokens",
+                "context tokens",
+                config::DEFAULT_CONTEXT_TOKENS.to_string(),
+            ),
             optional_field("api_key_env", "api key env", ""),
         ],
         ExpandedFormKind::LocalModel => vec![
-            field("provider_name", "provider name", product::DEFAULT_PROVIDER),
-            field("model", "model", product::DEFAULT_MODEL),
-            field("context_tokens", "context tokens", "32000"),
+            field("provider_name", "provider name", config::DEFAULT_PROVIDER),
+            field("model", "model", config::DEFAULT_MODEL),
+            field(
+                "context_tokens",
+                "context tokens",
+                config::DEFAULT_CONTEXT_TOKENS.to_string(),
+            ),
         ],
         ExpandedFormKind::DocsInit => vec![
             field("guide_file", "guide file", "documentation-guide.md"),
@@ -247,11 +255,11 @@ fn fields_for(kind: ExpandedFormKind) -> Vec<ExpandedFormField> {
     }
 }
 
-fn field(key: &'static str, label: &'static str, value: &'static str) -> ExpandedFormField {
+fn field(key: &'static str, label: &'static str, value: impl Into<String>) -> ExpandedFormField {
     ExpandedFormField {
         key,
         label,
-        value: value.to_owned(),
+        value: value.into(),
         required: true,
         secret: false,
     }
@@ -260,13 +268,62 @@ fn field(key: &'static str, label: &'static str, value: &'static str) -> Expande
 fn optional_field(
     key: &'static str,
     label: &'static str,
-    value: &'static str,
+    value: impl Into<String>,
 ) -> ExpandedFormField {
     ExpandedFormField {
         key,
         label,
-        value: value.to_owned(),
+        value: value.into(),
         required: false,
         secret: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExpandedFormKind, ExpandedFormState};
+    use crate::config;
+
+    #[test]
+    fn local_provider_form_uses_config_defaults() {
+        let mut form = ExpandedFormState::default();
+
+        form.open(ExpandedFormKind::LocalProvider);
+
+        assert_eq!(
+            field_value(&form, "provider_name"),
+            config::DEFAULT_PROVIDER
+        );
+        assert_eq!(field_value(&form, "base_url"), config::DEFAULT_BASE_URL);
+        assert_eq!(field_value(&form, "model"), config::DEFAULT_MODEL);
+        assert_eq!(
+            field_value(&form, "context_tokens"),
+            config::DEFAULT_CONTEXT_TOKENS.to_string()
+        );
+    }
+
+    #[test]
+    fn local_model_form_uses_config_defaults() {
+        let mut form = ExpandedFormState::default();
+
+        form.open(ExpandedFormKind::LocalModel);
+
+        assert_eq!(
+            field_value(&form, "provider_name"),
+            config::DEFAULT_PROVIDER
+        );
+        assert_eq!(field_value(&form, "model"), config::DEFAULT_MODEL);
+        assert_eq!(
+            field_value(&form, "context_tokens"),
+            config::DEFAULT_CONTEXT_TOKENS.to_string()
+        );
+    }
+
+    fn field_value(form: &ExpandedFormState, key: &str) -> String {
+        form.fields
+            .iter()
+            .find(|field| field.key == key)
+            .map(|field| field.value.clone())
+            .unwrap_or_else(|| panic!("missing field {key}"))
     }
 }

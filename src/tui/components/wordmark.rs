@@ -55,9 +55,10 @@ pub fn lines() -> Vec<Line<'static>> {
 }
 
 fn version_line() -> String {
-    let text_width = product::KOREAN_VERSION_LINE.width();
+    let text = product::korean_version_line();
+    let text_width = text.width();
     let padding = width().saturating_sub(text_width);
-    format!("{}{}", " ".repeat(padding), product::KOREAN_VERSION_LINE)
+    format!("{}{}", " ".repeat(padding), text)
 }
 
 fn width() -> usize {

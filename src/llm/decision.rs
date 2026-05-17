@@ -4,11 +4,15 @@ use std::path::{Component, Path};
 use super::response_parser::{
     Activity, ParsedRuntimeResponse, RuntimeAnswer, RuntimeResponse, RuntimeToolCandidate,
 };
+use crate::tool::{
+    tool_spec, validate_tool_arguments as validate_registry_tool_arguments, ToolName,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeDecision {
     Answer {
-        message: String,
+        summary: String,
+        payload_body: Option<String>,
     },
     Clarify {
         message: String,
@@ -165,7 +169,8 @@ fn classify_answer(
 ) -> Result<RuntimeDecision, RuntimeDecisionError> {
     let Some(payload_id) = response.answer_payload_id.as_deref() else {
         return Ok(RuntimeDecision::Answer {
-            message: response.message.clone(),
+            summary: response.message.clone(),
+            payload_body: None,
         });
     };
     let payload = parsed
@@ -179,7 +184,8 @@ fn classify_answer(
         })?;
 
     Ok(RuntimeDecision::Answer {
-        message: payload.body.clone(),
+        summary: response.message.clone(),
+        payload_body: Some(payload.body.clone()),
     })
 }
 
@@ -217,7 +223,7 @@ fn classify_change_candidate(
     parsed: &ParsedRuntimeResponse,
 ) -> Result<RuntimeDecision, RuntimeDecisionError> {
     let mut change_preview = None;
-    if candidate.tool_name == "apply_patch" {
+    if candidate.tool_name == ToolName::ApplyPatch.as_str() {
         let payload_id = required_str(arguments_object(candidate)?, "payload_id")?;
         let payload = parsed
             .payloads
@@ -255,10 +261,10 @@ fn classify_change_candidate(
 }
 
 fn validate_tool_activity(candidate: &RuntimeToolCandidate) -> Result<(), RuntimeDecisionError> {
-    let expected = expected_activity(candidate.tool_name.as_str()).ok_or_else(|| {
+    let expected = tool_spec(candidate.tool_name.as_str()).ok_or_else(|| {
         RuntimeDecisionError::invalid_tool(format!("unknown tool: {}", candidate.tool_name))
     })?;
-    if expected != candidate.activity {
+    if expected.activity != candidate.activity {
         return Err(RuntimeDecisionError::invalid_tool(format!(
             "tool/activity mismatch: {}/{}",
             candidate.tool_name,
@@ -269,258 +275,16 @@ fn validate_tool_activity(candidate: &RuntimeToolCandidate) -> Result<(), Runtim
     Ok(())
 }
 
-fn expected_activity(tool_name: &str) -> Option<Activity> {
-    match tool_name {
-        "list_files" | "find_files" | "search_text" | "read_file" | "inspect_git"
-        | "web_search" | "web_fetch" => Some(Activity::Explore),
-        "apply_patch" => Some(Activity::Change),
-        "run_command" => Some(Activity::Execute),
-        "add_provider" | "update_config" => Some(Activity::Configure),
-        _ => None,
-    }
-}
-
 fn validate_tool_arguments(candidate: &RuntimeToolCandidate) -> Result<(), RuntimeDecisionError> {
-    match candidate.tool_name.as_str() {
-        "list_files" => validate_arguments(
-            candidate,
-            &[
-                ArgumentRule::workspace_path("path"),
-                ArgumentRule::integer_range("max_depth", 1, 5),
-                ArgumentRule::integer_range("max_entries", 1, 500),
-            ],
-        ),
-        "find_files" => validate_arguments(
-            candidate,
-            &[
-                ArgumentRule::workspace_path("path"),
-                ArgumentRule::non_empty_string("pattern"),
-                ArgumentRule::integer_range("max_results", 1, 200),
-            ],
-        ),
-        "search_text" => validate_arguments(
-            candidate,
-            &[
-                ArgumentRule::workspace_path("path"),
-                ArgumentRule::non_empty_string("query"),
-                ArgumentRule::boolean("use_regex"),
-                ArgumentRule::integer_range("max_results", 1, 200),
-            ],
-        ),
-        "read_file" => validate_arguments(
-            candidate,
-            &[
-                ArgumentRule::workspace_path("path"),
-                ArgumentRule::integer_range("start_line", 1, i64::MAX),
-                ArgumentRule::integer_range("max_lines", 1, 300),
-            ],
-        ),
-        "inspect_git" => validate_arguments(
-            candidate,
-            &[ArgumentRule::string_enum(
-                "scope",
-                &["status", "diff_summary", "recent_commits"],
-            )],
-        ),
-        "web_search" => validate_arguments(
-            candidate,
-            &[
-                ArgumentRule::non_empty_string("query"),
-                ArgumentRule::integer_range("max_results", 1, 10),
-            ],
-        ),
-        "web_fetch" => validate_arguments(
-            candidate,
-            &[
-                ArgumentRule::http_url("url"),
-                ArgumentRule::integer_range("max_bytes", 1, 200_000),
-            ],
-        ),
-        "apply_patch" => {
-            validate_arguments(candidate, &[ArgumentRule::non_empty_string("payload_id")])
-        }
-        "run_command" => validate_arguments(
-            candidate,
-            &[
-                ArgumentRule::non_empty_string_array("argv"),
-                ArgumentRule::workspace_path("cwd"),
-                ArgumentRule::integer_range("timeout_ms", 1, i64::MAX),
-            ],
-        ),
-        "add_provider" => validate_arguments(
-            candidate,
-            &[
-                ArgumentRule::config_key("provider_id"),
-                ArgumentRule::http_url("base_url"),
-                ArgumentRule::non_empty_string("model"),
-                ArgumentRule::integer_range("context_tokens", 1, i64::MAX),
-            ],
-        ),
-        "update_config" => validate_arguments(
-            candidate,
-            &[
-                ArgumentRule::config_key("key_path"),
-                ArgumentRule::any("value"),
-            ],
-        ),
-        _ => Err(RuntimeDecisionError::invalid_tool(format!(
+    let Some(tool_name) = ToolName::parse(candidate.tool_name.as_str()) else {
+        return Err(RuntimeDecisionError::invalid_tool(format!(
             "unknown tool: {}",
             candidate.tool_name
-        ))),
-    }
-}
-
-struct ArgumentRule<'a> {
-    name: &'a str,
-    kind: ArgumentKind<'a>,
-}
-
-impl<'a> ArgumentRule<'a> {
-    fn non_empty_string(name: &'a str) -> Self {
-        Self {
-            name,
-            kind: ArgumentKind::NonEmptyString,
-        }
-    }
-
-    fn workspace_path(name: &'a str) -> Self {
-        Self {
-            name,
-            kind: ArgumentKind::WorkspacePath,
-        }
-    }
-
-    fn config_key(name: &'a str) -> Self {
-        Self {
-            name,
-            kind: ArgumentKind::ConfigKey,
-        }
-    }
-
-    fn http_url(name: &'a str) -> Self {
-        Self {
-            name,
-            kind: ArgumentKind::HttpUrl,
-        }
-    }
-
-    fn integer_range(name: &'a str, min: i64, max: i64) -> Self {
-        Self {
-            name,
-            kind: ArgumentKind::IntegerRange { min, max },
-        }
-    }
-
-    fn boolean(name: &'a str) -> Self {
-        Self {
-            name,
-            kind: ArgumentKind::Boolean,
-        }
-    }
-
-    fn non_empty_string_array(name: &'a str) -> Self {
-        Self {
-            name,
-            kind: ArgumentKind::NonEmptyStringArray,
-        }
-    }
-
-    fn string_enum(name: &'a str, values: &'a [&'a str]) -> Self {
-        Self {
-            name,
-            kind: ArgumentKind::StringEnum(values),
-        }
-    }
-
-    fn any(name: &'a str) -> Self {
-        Self {
-            name,
-            kind: ArgumentKind::Any,
-        }
-    }
-}
-
-enum ArgumentKind<'a> {
-    NonEmptyString,
-    WorkspacePath,
-    ConfigKey,
-    HttpUrl,
-    IntegerRange { min: i64, max: i64 },
-    Boolean,
-    NonEmptyStringArray,
-    StringEnum(&'a [&'a str]),
-    Any,
-}
-
-fn validate_arguments(
-    candidate: &RuntimeToolCandidate,
-    rules: &[ArgumentRule<'_>],
-) -> Result<(), RuntimeDecisionError> {
-    let arguments = arguments_object(candidate)?;
-    for key in arguments.keys() {
-        if !rules.iter().any(|rule| rule.name == key) {
-            return Err(RuntimeDecisionError::invalid_arguments(format!(
-                "unknown argument field: {key}"
-            )));
-        }
-    }
-
-    for rule in rules {
-        let value = arguments.get(rule.name).ok_or_else(|| {
-            RuntimeDecisionError::invalid_arguments(format!("missing argument: {}", rule.name))
-        })?;
-        validate_argument_value(rule, value)?;
-    }
-
-    Ok(())
-}
-
-fn validate_argument_value(
-    rule: &ArgumentRule<'_>,
-    value: &Value,
-) -> Result<(), RuntimeDecisionError> {
-    let valid = match rule.kind {
-        ArgumentKind::NonEmptyString => value
-            .as_str()
-            .map(validate_non_empty_plain_string)
-            .unwrap_or(false),
-        ArgumentKind::WorkspacePath => value
-            .as_str()
-            .map(validate_workspace_relative_path)
-            .unwrap_or(false),
-        ArgumentKind::ConfigKey => value.as_str().map(validate_config_key).unwrap_or(false),
-        ArgumentKind::HttpUrl => value.as_str().map(validate_http_url).unwrap_or(false),
-        ArgumentKind::IntegerRange { min, max } => value
-            .as_i64()
-            .map(|actual| (min..=max).contains(&actual))
-            .unwrap_or(false),
-        ArgumentKind::Boolean => value.as_bool().is_some(),
-        ArgumentKind::NonEmptyStringArray => value
-            .as_array()
-            .map(|items| {
-                !items.is_empty()
-                    && items.iter().all(|item| {
-                        item.as_str()
-                            .map(validate_non_empty_plain_string)
-                            .unwrap_or(false)
-                    })
-            })
-            .unwrap_or(false),
-        ArgumentKind::StringEnum(values) => value
-            .as_str()
-            .map(|actual| values.contains(&actual))
-            .unwrap_or(false),
-        ArgumentKind::Any => true,
+        )));
     };
 
-    if valid {
-        Ok(())
-    } else {
-        Err(RuntimeDecisionError::invalid_arguments(format!(
-            "invalid argument type or value: {}",
-            rule.name
-        )))
-    }
+    validate_registry_tool_arguments(tool_name, &candidate.arguments)
+        .map_err(RuntimeDecisionError::invalid_arguments)
 }
 
 fn validate_non_empty_plain_string(value: &str) -> bool {
@@ -543,31 +307,6 @@ fn validate_workspace_relative_path(value: &str) -> bool {
             Component::ParentDir | Component::Prefix(_) | Component::RootDir
         )
     })
-}
-
-fn validate_config_key(value: &str) -> bool {
-    validate_non_empty_plain_string(value)
-        && value.split('.').all(|segment| {
-            !segment.is_empty()
-                && segment.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-                })
-        })
-}
-
-fn validate_http_url(value: &str) -> bool {
-    if !validate_non_empty_plain_string(value) || value.chars().any(char::is_whitespace) {
-        return false;
-    }
-
-    let Some(rest) = value
-        .strip_prefix("http://")
-        .or_else(|| value.strip_prefix("https://"))
-    else {
-        return false;
-    };
-
-    !rest.is_empty()
 }
 
 fn contains_control_char(value: &str) -> bool {
@@ -695,13 +434,14 @@ mod tests {
         assert_eq!(
             decision,
             RuntimeDecision::Answer {
-                message: "done".to_owned()
+                summary: "done".to_owned(),
+                payload_body: None,
             }
         );
     }
 
     #[test]
-    fn classifies_answer_payload_body_as_answer_message() {
+    fn classifies_answer_summary_and_payload_body_separately() {
         let parsed = ParsedRuntimeResponse {
             response: RuntimeResponse::Answer(RuntimeAnswer {
                 activity: Activity::None,
@@ -721,7 +461,8 @@ mod tests {
         assert_eq!(
             decision,
             RuntimeDecision::Answer {
-                message: "```typescript\nconsole.log(\"Hello\");\n```".to_owned()
+                summary: "summary".to_owned(),
+                payload_body: Some("```typescript\nconsole.log(\"Hello\");\n```".to_owned()),
             }
         );
     }
@@ -930,20 +671,58 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_http_fetch_url() {
+    fn rejects_search_text_regex_argument() {
         let parsed = ParsedRuntimeResponse {
             response: RuntimeResponse::Tool(RuntimeToolCandidate {
                 activity: Activity::Explore,
-                message: "fetch".to_owned(),
-                tool_name: "web_fetch".to_owned(),
-                arguments: json!({"url":"file:///etc/passwd","max_bytes":200000}),
-                reason: "fetch".to_owned(),
+                message: "search".to_owned(),
+                tool_name: "search_text".to_owned(),
+                arguments: json!({"path":".","query":"fn main","use_regex":true,"max_results":20}),
+                reason: "search".to_owned(),
                 manifest: manifest(),
             }),
             payloads: Vec::new(),
         };
 
-        let error = DecisionGate::classify(&parsed).expect_err("file url should fail");
+        let error = DecisionGate::classify(&parsed).expect_err("unknown option should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+    }
+
+    #[test]
+    fn rejects_unregistered_web_tool() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Explore,
+                message: "search web".to_owned(),
+                tool_name: "web_search".to_owned(),
+                arguments: json!({"query":"rust","max_results":3}),
+                reason: "search".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("unregistered tool should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidToolCandidate);
+    }
+
+    #[test]
+    fn rejects_unregistered_git_scope() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Explore,
+                message: "inspect git".to_owned(),
+                tool_name: "inspect_git".to_owned(),
+                arguments: json!({"scope":"diff_summary"}),
+                reason: "inspect".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("unsupported scope should fail");
 
         assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
     }

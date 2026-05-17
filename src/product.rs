@@ -1,6 +1,5 @@
 pub const APP_NAME: &str = "AhreumCode";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const KOREAN_VERSION_LINE: &str = "아름코드 v1.0.0";
 
 pub use crate::config::{DEFAULT_MODE, DEFAULT_MODEL, DEFAULT_PROVIDER, DEFAULT_PROVIDER_DISPLAY};
 
@@ -23,4 +22,19 @@ pub const EPILOGUE_TIP_SUFFIX: &str = "로 이전 작업을 확인하세요";
 
 pub fn version_label() -> String {
     format!("v{VERSION}")
+}
+
+pub fn korean_version_line() -> String {
+    format!("아름코드 {}", version_label())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{korean_version_line, version_label, VERSION};
+
+    #[test]
+    fn korean_version_line_uses_cargo_package_version() {
+        assert_eq!(version_label(), format!("v{VERSION}"));
+        assert_eq!(korean_version_line(), format!("아름코드 v{VERSION}"));
+    }
 }

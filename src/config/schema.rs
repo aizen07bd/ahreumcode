@@ -468,38 +468,42 @@ enabled = {web_enabled}
 mod tests {
     use std::path::PathBuf;
 
-    use super::{parse_config_toml, RuntimeConfig};
+    use super::{
+        parse_config_toml, RuntimeConfig, DEFAULT_BASE_URL, DEFAULT_CONTEXT_TOKENS, DEFAULT_MODE,
+        DEFAULT_MODEL, DEFAULT_PROVIDER,
+    };
 
     #[test]
     fn default_local_uses_lm_studio_values() {
         let config = RuntimeConfig::default_local(PathBuf::from(".ahreumcode/config.toml"));
 
-        assert_eq!(config.provider.active, "lm-studio");
-        assert_eq!(config.provider.base_url, "http://127.0.0.1:1234/v1");
-        assert_eq!(config.provider.model, "google/gemma-4-e4b");
-        assert_eq!(config.provider.context_tokens, 32000);
-        assert_eq!(config.mode.default, "Crew");
+        assert_eq!(config.provider.active, DEFAULT_PROVIDER);
+        assert_eq!(config.provider.base_url, DEFAULT_BASE_URL);
+        assert_eq!(config.provider.model, DEFAULT_MODEL);
+        assert_eq!(config.provider.context_tokens, DEFAULT_CONTEXT_TOKENS);
+        assert_eq!(config.mode.default, DEFAULT_MODE);
     }
 
     #[test]
     fn parser_rejects_missing_active_provider() {
         let result = parse_config_toml(
-            r#"
+            &format!(
+                r#"
 [provider]
 active = "missing"
 
-[providers.lm-studio]
+[providers.{DEFAULT_PROVIDER}]
 type = "openai-compatible"
-base_url = "http://127.0.0.1:1234/v1"
-model = "google/gemma-4-e4b"
-context_tokens = 32000
+base_url = "{DEFAULT_BASE_URL}"
+model = "{DEFAULT_MODEL}"
+context_tokens = {DEFAULT_CONTEXT_TOKENS}
 api_key_env = ""
 
 [workspace]
 root = "."
 
 [mode]
-default = "Crew"
+default = "{DEFAULT_MODE}"
 
 [persona]
 default = "off"
@@ -516,6 +520,7 @@ command_timeout_ms = 30000
 [web]
 enabled = true
 "#,
+            ),
             PathBuf::from("config.toml"),
         );
         let Err(error) = result else {

@@ -6,6 +6,7 @@ mod event_log;
 mod expanded_form;
 mod persona;
 mod runtime_request;
+mod runtime_workspace;
 mod scenes;
 mod state;
 mod style;

@@ -46,7 +46,6 @@ pub enum WorkspaceItem {
         path: String,
         additions: u16,
         deletions: u16,
-        expanded: bool,
     },
     Result {
         text: String,
@@ -75,13 +74,7 @@ impl WorkspaceItem {
             Self::AssistantAnswer { text } => text.lines().count().max(1) + 1,
             Self::ActivityOutput { .. } => 1,
             Self::EvidenceBlock { body, .. } => body.lines().count().max(1) + 1,
-            Self::DiffSummary { expanded, .. } => {
-                if *expanded {
-                    3
-                } else {
-                    1
-                }
-            }
+            Self::DiffSummary { .. } => 1,
             Self::Result { .. } => 1,
         }
     }
@@ -148,7 +141,6 @@ impl WorkspaceBuffer {
             path: path.into(),
             additions,
             deletions,
-            expanded: false,
         })
     }
 

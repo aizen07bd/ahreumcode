@@ -34,6 +34,7 @@ use super::event_log::{self, TUI_01_SCOPE, TUI_02_SCOPE, TUI_03_SCOPE};
 use super::expanded_form::ExpandedFormEvent;
 use super::persona::{PersonaEvent, PersonaRendered};
 use super::runtime_request::{self, ActivePlainRequest};
+use super::runtime_workspace;
 use super::scenes::epilogue::print_epilogue;
 use super::scenes::intro::{handle_intro_event, render_intro};
 use super::scenes::main::{handle_main_event, render_main};
@@ -51,7 +52,7 @@ const LLM_07_SCOPE: &str = "llm-07-repair-request-loop";
 const LLM_08_SCOPE: &str = "llm-08-runtime-decision-gate";
 const LLM_09_SCOPE: &str = "llm-09-tui-process-binding";
 const LLM_10_SCOPE: &str = "llm-10-diagnostics-and-status";
-const TOOL_01_SCOPE: &str = "tool-01-explore-tool-runtime";
+const TOOL_EXPLORE_SCOPE: &str = "explore-tool-runtime";
 const TOOL_03_SCOPE: &str = "tool-03-tool-loop-binding";
 const TOOL_04_SCOPE: &str = "tool-04-permission-branches";
 const EVENT_APP_STARTED: &str = "app_started";
@@ -512,7 +513,7 @@ impl TuiApp {
         let snapshot = self.llm_diagnostics_snapshot();
         self.log_llm_status_snapshot_recorded(&snapshot)?;
         self.log_llm_runtime_ready_for_tool_stage(&snapshot)?;
-        let events = self.record_llm_diagnostics(&snapshot);
+        let events = runtime_workspace::record_llm_diagnostics(&mut self.state, &snapshot);
         self.log_workspace_events(&events.events)?;
         self.log_llm_diagnostics_rendered(&snapshot)
     }
@@ -531,53 +532,10 @@ impl TuiApp {
         }
         self.llm_diagnostics.record_health(&report);
 
-        let events = self.record_health_report(&report);
+        let events = runtime_workspace::record_health_report(&mut self.state, &report);
         self.log_workspace_events(&events.events)?;
         let snapshot = self.llm_diagnostics_snapshot();
         self.log_llm_status_snapshot_recorded(&snapshot)
-    }
-
-    fn record_health_report(&mut self, report: &LlmHealthReport) -> WorkspaceEvents {
-        match &report.status {
-            LlmHealthStatus::Succeeded { available_models } => {
-                let mut events = self.state.record_system_notice("health ok");
-                events.extend(self.state.record_system_notice(format!(
-                    "provider {} | model {}",
-                    report.provider, report.model
-                )));
-                events.extend(self.state.record_system_notice(format!(
-                    "latency {} ms | models {} | endpoint {}",
-                    report.latency_ms, available_models, report.models_url
-                )));
-                events
-            }
-            LlmHealthStatus::Failed(failure) => {
-                let mut events = self
-                    .state
-                    .record_system_notice(format!("health failed: {}", failure.kind.as_str()));
-                events.extend(self.state.record_system_notice(format!(
-                    "provider {} | model {}",
-                    report.provider, report.model
-                )));
-                events.extend(
-                    self.state
-                        .record_system_notice(format!("endpoint {}", report.models_url)),
-                );
-                events.extend(
-                    self.state
-                        .record_system_notice(format!("message {}", failure.message)),
-                );
-                events
-            }
-        }
-    }
-
-    fn record_llm_diagnostics(&mut self, snapshot: &LlmDiagnosticsSnapshot) -> WorkspaceEvents {
-        let mut events = WorkspaceEvents::none();
-        for line in snapshot.lines() {
-            events.extend(self.state.record_system_notice(line));
-        }
-        events
     }
 
     fn llm_diagnostics_snapshot(&self) -> LlmDiagnosticsSnapshot {
@@ -916,7 +874,10 @@ impl TuiApp {
                                             WorkingPhase::Apply,
                                             "결정 결과를 workspace에 반영합니다.",
                                         )?;
-                                        self.record_runtime_decision(&decision)
+                                        runtime_workspace::record_runtime_decision(
+                                            &mut self.state,
+                                            &decision,
+                                        )
                                     }
                                     PermissionDecision::Ask(request) => {
                                         self.set_runtime_working_phase(
@@ -950,7 +911,10 @@ impl TuiApp {
                                     WorkingPhase::Apply,
                                     "검증 실패를 workspace에 반영합니다.",
                                 )?;
-                                self.record_runtime_decision_error(&error)
+                                runtime_workspace::record_runtime_decision_error(
+                                    &mut self.state,
+                                    &error,
+                                )
                             }
                         }
                     }
@@ -985,7 +949,10 @@ impl TuiApp {
                                     WorkingPhase::Apply,
                                     "repair 제한 초과를 workspace에 반영합니다.",
                                 )?;
-                                self.record_runtime_response_parse_error(&error)
+                                runtime_workspace::record_runtime_response_parse_error(
+                                    &mut self.state,
+                                    &error,
+                                )
                             }
                         }
                     }
@@ -1009,7 +976,7 @@ impl TuiApp {
                     WorkingPhase::Apply,
                     "요청 실패를 workspace에 반영합니다.",
                 )?;
-                self.record_plain_chat_failure(&report)
+                runtime_workspace::record_plain_chat_failure(&mut self.state, &report)
             }
         };
         self.finish_plain_request_with_events(
@@ -1035,59 +1002,6 @@ impl TuiApp {
         self.log_runtime_process_cancelled(&active)?;
         self.state.pending_prompt = None;
         Ok(())
-    }
-
-    fn record_plain_chat_failure(&mut self, report: &LlmChatReport) -> WorkspaceEvents {
-        let LlmChatStatus::Failed(failure) = &report.status else {
-            return WorkspaceEvents::none();
-        };
-
-        let mut events = self
-            .state
-            .record_system_notice(format!("request failed: {}", failure.kind.as_str()));
-        events.extend(self.state.record_system_notice(format!(
-            "provider {} | model {}",
-            report.provider, report.model
-        )));
-        events.extend(
-            self.state
-                .record_system_notice(format!("endpoint {}", report.chat_url)),
-        );
-        events.extend(
-            self.state
-                .record_system_notice(format!("message {}", failure.message)),
-        );
-        events
-    }
-
-    fn record_runtime_decision(&mut self, decision: &RuntimeDecision) -> WorkspaceEvents {
-        match decision {
-            RuntimeDecision::Answer { message } => self.state.record_answer(message.clone()),
-            RuntimeDecision::Clarify { message, .. } => self.state.record_answer(message.clone()),
-            RuntimeDecision::Blocked { message, .. } => {
-                let mut events = self.state.record_system_notice("response blocked");
-                events.extend(self.state.record_system_notice(message.clone()));
-                events
-            }
-            RuntimeDecision::ToolCandidatePending {
-                activity,
-                tool_name,
-                ..
-            } => self.state.record_system_notice(format!(
-                "tool candidate pending: {} ({})",
-                tool_name,
-                activity.as_str()
-            )),
-            RuntimeDecision::ApprovalNeeded {
-                activity,
-                tool_name,
-                ..
-            } => self.state.record_system_notice(format!(
-                "approval needed: {} ({})",
-                tool_name,
-                activity.as_str()
-            )),
-        }
     }
 
     fn open_permission_approval(
@@ -1158,7 +1072,8 @@ impl TuiApp {
                 self.runtime_config.limits.max_tool_calls,
                 &signature,
             )?;
-            let events = self.record_tool_loop_limit("max_tool_calls");
+            let events =
+                runtime_workspace::record_tool_loop_limit(&mut self.state, "max_tool_calls");
             self.finish_plain_request_with_events(
                 events,
                 "도구 루프 제한을 보고합니다.",
@@ -1181,7 +1096,8 @@ impl TuiApp {
                 self.runtime_config.limits.max_same_tool_repeats,
                 &signature,
             )?;
-            let events = self.record_tool_loop_limit("max_same_tool_repeats");
+            let events =
+                runtime_workspace::record_tool_loop_limit(&mut self.state, "max_same_tool_repeats");
             self.finish_plain_request_with_events(
                 events,
                 "반복 도구 루프 제한을 보고합니다.",
@@ -1247,36 +1163,6 @@ impl TuiApp {
         self.active_plain_request = Some(active);
 
         Ok(())
-    }
-
-    fn record_tool_loop_limit(&mut self, reason: &str) -> WorkspaceEvents {
-        let mut events = self
-            .state
-            .record_system_notice(format!("tool loop stopped: {reason}"));
-        events.extend(
-            self.state
-                .record_system_notice("도구 반복 제한에 도달해 추가 LLM 요청을 보내지 않습니다."),
-        );
-        events
-    }
-
-    fn record_runtime_decision_error(&mut self, error: &RuntimeDecisionError) -> WorkspaceEvents {
-        let mut events = self
-            .state
-            .record_system_notice(format!("runtime decision failed: {}", error.kind.as_str()));
-        events.extend(self.state.record_system_notice(error.message.clone()));
-        events
-    }
-
-    fn record_runtime_response_parse_error(
-        &mut self,
-        error: &RuntimeResponseParseError,
-    ) -> WorkspaceEvents {
-        let mut events = self
-            .state
-            .record_system_notice(format!("response parse failed: {}", error.kind.as_str()));
-        events.extend(self.state.record_system_notice(error.message.clone()));
-        events
     }
 
     fn start_repair_request(
@@ -1741,7 +1627,7 @@ impl TuiApp {
         arguments: &serde_json::Value,
     ) -> io::Result<()> {
         self.logger.llm(LogEvent::ui(
-            TOOL_01_SCOPE,
+            TOOL_EXPLORE_SCOPE,
             EVENT_TOOL_CALL_RECEIVED,
             json!({
                 "run_id": &active.run_id,
@@ -1760,7 +1646,7 @@ impl TuiApp {
         call: &ToolCall,
     ) -> io::Result<()> {
         self.logger.llm(LogEvent::ui(
-            TOOL_01_SCOPE,
+            TOOL_EXPLORE_SCOPE,
             EVENT_TOOL_EXECUTION_STARTED,
             json!({
                 "run_id": &active.run_id,
@@ -1778,7 +1664,7 @@ impl TuiApp {
         observation: &ToolObservation,
     ) -> io::Result<()> {
         self.logger.llm(LogEvent::ui(
-            TOOL_01_SCOPE,
+            TOOL_EXPLORE_SCOPE,
             EVENT_TOOL_ARGUMENT_RESOLVED,
             json!({
                 "run_id": &active.run_id,
@@ -1789,7 +1675,7 @@ impl TuiApp {
             }),
         ))?;
         self.logger.llm(LogEvent::ui(
-            TOOL_01_SCOPE,
+            TOOL_EXPLORE_SCOPE,
             EVENT_TOOL_PATH_BOUNDARY_CHECKED,
             json!({
                 "run_id": &active.run_id,
@@ -1807,7 +1693,7 @@ impl TuiApp {
             ObservationStatus::Failed => EVENT_TOOL_EXECUTION_FAILED,
         };
         self.logger.llm(LogEvent::ui(
-            TOOL_01_SCOPE,
+            TOOL_EXPLORE_SCOPE,
             event,
             json!({
                 "run_id": &active.run_id,
@@ -1834,7 +1720,7 @@ impl TuiApp {
         observation: &ToolObservation,
     ) -> io::Result<()> {
         self.logger.llm(LogEvent::ui(
-            TOOL_01_SCOPE,
+            TOOL_EXPLORE_SCOPE,
             EVENT_TOOL_OBSERVATION_RECORDED,
             json!({
                 "run_id": &active.run_id,
@@ -1921,7 +1807,7 @@ impl TuiApp {
         observation: &ToolObservation,
     ) -> io::Result<()> {
         self.logger.llm(LogEvent::ui(
-            TOOL_01_SCOPE,
+            TOOL_EXPLORE_SCOPE,
             EVENT_TOOL_WORKSPACE_SUMMARY_RENDERED,
             json!({
                 "run_id": &active.run_id,

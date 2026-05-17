@@ -54,7 +54,28 @@ impl MessageHistory {
             return self.messages.clone();
         }
 
-        self.messages[self.messages.len() - limit..].to_vec()
+        let system_messages = self
+            .messages
+            .iter()
+            .filter(|message| message.role == LlmMessageRole::System);
+        let non_system_messages = self
+            .messages
+            .iter()
+            .filter(|message| message.role != LlmMessageRole::System)
+            .collect::<Vec<_>>();
+
+        let remaining = limit.saturating_sub(
+            self.messages
+                .iter()
+                .filter(|message| message.role == LlmMessageRole::System)
+                .count(),
+        );
+        let tail_start = non_system_messages.len().saturating_sub(remaining);
+
+        system_messages
+            .chain(non_system_messages[tail_start..].iter().copied())
+            .cloned()
+            .collect()
     }
 }
 
@@ -147,5 +168,63 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "message-1");
         assert_eq!(messages[1].content, "message-2");
+    }
+
+    #[test]
+    fn preserves_system_messages_before_limited_tail() {
+        let mut history = MessageHistory::new("run-0001");
+        history.append(
+            "turn-1",
+            LlmMessageRole::System,
+            LlmMessageVisibility::Internal,
+            "schema",
+        );
+        for index in 0..3 {
+            history.append(
+                "turn-1",
+                LlmMessageRole::User,
+                LlmMessageVisibility::UserVisible,
+                format!("message-{index}"),
+            );
+        }
+
+        let messages = history.for_request(Some(2));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, LlmMessageRole::System);
+        assert_eq!(messages[0].content, "schema");
+        assert_eq!(messages[1].content, "message-2");
+    }
+
+    #[test]
+    fn preserves_all_system_messages_even_when_they_exceed_limit() {
+        let mut history = MessageHistory::new("run-0001");
+        history.append(
+            "turn-1",
+            LlmMessageRole::System,
+            LlmMessageVisibility::Internal,
+            "schema",
+        );
+        history.append(
+            "turn-1",
+            LlmMessageRole::System,
+            LlmMessageVisibility::Internal,
+            "guardrails",
+        );
+        history.append(
+            "turn-1",
+            LlmMessageRole::User,
+            LlmMessageVisibility::UserVisible,
+            "message",
+        );
+
+        let messages = history.for_request(Some(1));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "schema");
+        assert_eq!(messages[1].content, "guardrails");
+        assert!(messages
+            .iter()
+            .all(|message| message.role == LlmMessageRole::System));
     }
 }

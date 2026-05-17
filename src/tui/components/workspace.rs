@@ -69,26 +69,12 @@ fn workspace_lines(workspace: &WorkspaceBuffer, width: u16) -> Vec<Line<'static>
                 path,
                 additions,
                 deletions,
-                expanded,
             } => {
-                let marker = if *expanded { "v" } else { ">" };
                 lines.push(Line::from(vec![
                     Span::styled("Change  ", style::cyan()),
-                    Span::styled(marker, style::muted()),
-                    Span::styled(" ", style::muted()),
                     Span::styled(path.clone(), style::panel()),
                     Span::styled(format!(" (+{additions} -{deletions})"), style::muted()),
                 ]));
-                if *expanded {
-                    lines.push(Line::from(vec![
-                        Span::styled("+ ", style::cyan()),
-                        Span::styled("inline diff added lines", style::panel()),
-                    ]));
-                    lines.push(Line::from(vec![
-                        Span::styled("- ", style::muted()),
-                        Span::styled("inline diff removed lines", style::muted()),
-                    ]));
-                }
             }
             WorkspaceItem::Result { text } => {
                 lines.push(Line::from(vec![
@@ -104,4 +90,27 @@ fn workspace_lines(workspace: &WorkspaceBuffer, width: u16) -> Vec<Line<'static>
 fn prompt_line(text: &str, width: u16) -> Line<'static> {
     let padded = format!("{text:<width$}", width = width as usize);
     Line::from(Span::styled(padded, style::prompt_background()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{workspace_lines, WorkspaceBuffer};
+
+    #[test]
+    fn diff_summary_renders_only_compact_data_without_placeholder_body() {
+        let mut workspace = WorkspaceBuffer::default();
+        workspace.push_diff_summary("src/main.rs", 3, 1);
+
+        let rendered = workspace_lines(&workspace, 120)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["Change  src/main.rs (+3 -1)"]);
+    }
 }
