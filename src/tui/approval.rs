@@ -46,20 +46,21 @@ impl ApprovalResult {
 }
 
 pub struct ApprovalRequest {
-    pub title: &'static str,
-    pub reason: &'static str,
-    pub action: &'static str,
-    pub details: &'static str,
+    pub title: String,
+    pub reason: String,
+    pub action: String,
+    pub details: String,
 }
 
 impl ApprovalRequest {
     pub fn shell() -> Self {
         Self {
-            title: "Approval required",
-            reason: "Permission shell is waiting for user decision.",
-            action: "pending tool action",
+            title: "Approval required".to_owned(),
+            reason: "Permission shell is waiting for user decision.".to_owned(),
+            action: "pending tool action".to_owned(),
             details:
-                "This shell is the TUI approval surface before the policy engine is connected.",
+                "This shell is the TUI approval surface before the policy engine is connected."
+                    .to_owned(),
         }
     }
 }

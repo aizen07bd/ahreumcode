@@ -58,10 +58,12 @@ fn workspace_lines(workspace: &WorkspaceBuffer, width: u16) -> Vec<Line<'static>
                     Span::styled("Evidence  ", style::cyan()),
                     Span::styled(title.clone(), style::panel_bold()),
                 ]));
-                lines.push(Line::from(vec![
-                    Span::styled("  ", style::muted()),
-                    Span::styled(body.clone(), style::muted()),
-                ]));
+                for line in body.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  ", style::muted()),
+                        Span::styled(line.to_owned(), style::muted()),
+                    ]));
+                }
             }
             WorkspaceItem::DiffSummary {
                 path,

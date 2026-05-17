@@ -16,10 +16,13 @@ pub fn render_approval_surface(frame: &mut Frame<'_>, area: Rect, approval: &App
     };
 
     let mut lines = vec![
-        Line::from(vec![Span::styled(request.title, style::panel_bold())]),
+        Line::from(vec![Span::styled(
+            request.title.clone(),
+            style::panel_bold(),
+        )]),
         Line::from(vec![
             Span::styled("Reason: ", style::muted()),
-            Span::styled(request.reason, style::panel()),
+            Span::styled(request.reason.clone(), style::panel()),
         ]),
     ];
 
@@ -34,7 +37,7 @@ pub fn render_approval_surface(frame: &mut Frame<'_>, area: Rect, approval: &App
     if approval.details_open {
         lines.push(Line::from(vec![
             Span::styled("Details: ", style::muted()),
-            Span::styled(request.details, style::panel()),
+            Span::styled(request.details.clone(), style::panel()),
         ]));
     }
 

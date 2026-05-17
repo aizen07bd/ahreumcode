@@ -4,6 +4,7 @@ mod config;
 mod llm;
 mod logging;
 mod product;
+mod tool;
 mod tui;
 
 fn main() -> std::io::Result<()> {

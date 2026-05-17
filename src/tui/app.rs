@@ -15,16 +15,20 @@ use serde_json::json;
 use crate::cli::{AppCommand, RunMode, SceneCommand};
 use crate::config::{ConfigLoadOutcome, ConfigLoadSource, RuntimeConfig};
 use crate::llm::{
-    attach_schema_prompt, parse_runtime_response, DecisionGate, LlmChatReport, LlmChatStatus,
-    LlmDiagnostics, LlmDiagnosticsRuntime, LlmDiagnosticsSnapshot, LlmDiagnosticsState,
-    LlmHealthReport, LlmHealthStatus, LlmMessage, LlmMessageRole, LlmMessageVisibility,
-    LlmProviderFactory, MessageHistory, ParsedRuntimeResponse, RepairLimitReached, RepairLoop,
-    RepairRequest, RuntimeDecision, RuntimeDecisionError, RuntimeResponseParseError,
-    RuntimeResponseParseErrorKind, SchemaPrompt, SchemaPromptBuilder,
+    attach_schema_prompt, parse_runtime_response, Activity, ChangePreview, DecisionGate,
+    LlmChatReport, LlmChatStatus, LlmDiagnostics, LlmDiagnosticsRuntime, LlmDiagnosticsSnapshot,
+    LlmDiagnosticsState, LlmHealthReport, LlmHealthStatus, LlmMessage, LlmMessageRole,
+    LlmMessageVisibility, LlmProviderFactory, MessageHistory, ParsedRuntimeResponse,
+    RepairLimitReached, RepairLoop, RepairRequest, RuntimeDecision, RuntimeDecisionError,
+    RuntimeResponseParseError, RuntimeResponseParseErrorKind, SchemaPrompt, SchemaPromptBuilder,
 };
 use crate::logging::{LogEvent, Logger};
+use crate::tool::{
+    ObservationStatus, PermissionDecision, PermissionDenial, PermissionGate, PermissionRequest,
+    ToolCall, ToolObservation, ToolRuntime,
+};
 
-use super::approval::ApprovalInputEvent;
+use super::approval::{ApprovalInputEvent, ApprovalRequest};
 use super::command::{CommandDispatch, CommandInputEvent, CommandRegistry};
 use super::event_log::{self, TUI_01_SCOPE, TUI_02_SCOPE, TUI_03_SCOPE};
 use super::expanded_form::ExpandedFormEvent;
@@ -35,7 +39,7 @@ use super::scenes::intro::{handle_intro_event, render_intro};
 use super::scenes::main::{handle_main_event, render_main};
 use super::state::{Scene, TuiState};
 use super::working_process::{WorkingPhase, WorkingProcessEvent, WorkingProcessEvents};
-use super::workspace::{WorkspaceEvent, WorkspaceEvents, WorkspaceRendered};
+use super::workspace::{ActivityGroup, WorkspaceEvent, WorkspaceEvents, WorkspaceRendered};
 
 const LLM_01_SCOPE: &str = "llm-01-config-runtime";
 const LLM_02_SCOPE: &str = "llm-02-provider-connection";
@@ -47,6 +51,9 @@ const LLM_07_SCOPE: &str = "llm-07-repair-request-loop";
 const LLM_08_SCOPE: &str = "llm-08-runtime-decision-gate";
 const LLM_09_SCOPE: &str = "llm-09-tui-process-binding";
 const LLM_10_SCOPE: &str = "llm-10-diagnostics-and-status";
+const TOOL_01_SCOPE: &str = "tool-01-explore-tool-runtime";
+const TOOL_03_SCOPE: &str = "tool-03-tool-loop-binding";
+const TOOL_04_SCOPE: &str = "tool-04-permission-branches";
 const EVENT_APP_STARTED: &str = "app_started";
 const EVENT_TERMINAL_ENTERED: &str = "terminal_entered";
 const EVENT_INTRO_RENDERED: &str = "intro_rendered";
@@ -94,6 +101,20 @@ const EVENT_RUNTIME_DECISION_STARTED: &str = "runtime_decision_started";
 const EVENT_RUNTIME_DECISION_RECORDED: &str = "runtime_decision_recorded";
 const EVENT_TOOL_CANDIDATE_CLASSIFIED: &str = "tool_candidate_classified";
 const EVENT_RUNTIME_DECISION_FAILED: &str = "runtime_decision_failed";
+const EVENT_TOOL_CALL_RECEIVED: &str = "tool_call_received";
+const EVENT_TOOL_ARGUMENT_RESOLVED: &str = "tool_argument_resolved";
+const EVENT_TOOL_PATH_BOUNDARY_CHECKED: &str = "tool_path_boundary_checked";
+const EVENT_TOOL_EXECUTION_STARTED: &str = "tool_execution_started";
+const EVENT_TOOL_EXECUTION_SUCCEEDED: &str = "tool_execution_succeeded";
+const EVENT_TOOL_EXECUTION_FAILED: &str = "tool_execution_failed";
+const EVENT_TOOL_OBSERVATION_RECORDED: &str = "tool_observation_recorded";
+const EVENT_TOOL_WORKSPACE_SUMMARY_RENDERED: &str = "tool_workspace_summary_rendered";
+const EVENT_TOOL_OBSERVATION_ATTACHED: &str = "tool_observation_attached";
+const EVENT_TOOL_LOOP_REQUEST_STARTED: &str = "tool_loop_request_started";
+const EVENT_TOOL_LOOP_LIMIT_REACHED: &str = "tool_loop_limit_reached";
+const EVENT_TOOL_PERMISSION_EVALUATED: &str = "tool_permission_evaluated";
+const EVENT_TOOL_PERMISSION_APPROVAL_OPENED: &str = "tool_permission_approval_opened";
+const EVENT_TOOL_PERMISSION_DENIED: &str = "tool_permission_denied";
 
 pub fn run_app(command: AppCommand) -> io::Result<()> {
     match (command.scene, command.run_mode) {
@@ -126,6 +147,7 @@ fn run_intro_terminal(command: AppCommand) -> io::Result<()> {
 
     let mut app = TuiApp::new(
         logger,
+        project_root,
         workspace,
         &config_outcome.config,
         config_outcome.source,
@@ -205,6 +227,7 @@ fn run_main_terminal(command: AppCommand) -> io::Result<()> {
 
     let mut app = TuiApp::new_main(
         logger,
+        project_root,
         workspace,
         &config_outcome.config,
         config_outcome.source,
@@ -256,6 +279,7 @@ fn run_epilogue_terminal(command: AppCommand) -> io::Result<()> {
     let config_outcome = load_runtime_config(&logger, &project_root)?;
     let app = TuiApp::new_epilogue(
         logger,
+        project_root,
         workspace,
         &config_outcome.config,
         config_outcome.source,
@@ -278,6 +302,7 @@ fn run_epilogue_smoke(command: AppCommand) -> io::Result<()> {
     let config_outcome = load_runtime_config(&logger, &project_root)?;
     let app = TuiApp::new_epilogue(
         logger,
+        project_root,
         workspace,
         &config_outcome.config,
         config_outcome.source,
@@ -304,6 +329,7 @@ struct TuiApp {
     state: TuiState,
     logger: Logger,
     runtime_config: RuntimeConfig,
+    tool_runtime: ToolRuntime,
     command_registry: CommandRegistry,
     llm_diagnostics: LlmDiagnosticsState,
     active_plain_request: Option<ActivePlainRequest>,
@@ -317,16 +343,19 @@ struct TuiApp {
 impl TuiApp {
     fn new(
         logger: Logger,
+        project_root: PathBuf,
         workspace: String,
         config: &RuntimeConfig,
         config_source: ConfigLoadSource,
         config_warning: Option<&str>,
         run_mode: &'static str,
     ) -> Self {
+        let artifact_root = logger.log_bucket_dir().join("artifacts/tool");
         Self {
             state: TuiState::intro(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            tool_runtime: ToolRuntime::new(project_root, artifact_root),
             command_registry: CommandRegistry::new(),
             llm_diagnostics: LlmDiagnosticsState::default(),
             active_plain_request: None,
@@ -340,16 +369,19 @@ impl TuiApp {
 
     fn new_main(
         logger: Logger,
+        project_root: PathBuf,
         workspace: String,
         config: &RuntimeConfig,
         config_source: ConfigLoadSource,
         config_warning: Option<&str>,
         run_mode: &'static str,
     ) -> Self {
+        let artifact_root = logger.log_bucket_dir().join("artifacts/tool");
         Self {
             state: TuiState::main(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            tool_runtime: ToolRuntime::new(project_root, artifact_root),
             command_registry: CommandRegistry::new(),
             llm_diagnostics: LlmDiagnosticsState::default(),
             active_plain_request: None,
@@ -363,16 +395,19 @@ impl TuiApp {
 
     fn new_epilogue(
         logger: Logger,
+        project_root: PathBuf,
         workspace: String,
         config: &RuntimeConfig,
         config_source: ConfigLoadSource,
         config_warning: Option<&str>,
         run_mode: &'static str,
     ) -> Self {
+        let artifact_root = logger.log_bucket_dir().join("artifacts/tool");
         Self {
             state: TuiState::epilogue(workspace, config, config_source, config_warning),
             logger,
             runtime_config: config.clone(),
+            tool_runtime: ToolRuntime::new(project_root, artifact_root),
             command_registry: CommandRegistry::new(),
             llm_diagnostics: LlmDiagnosticsState::default(),
             active_plain_request: None,
@@ -856,11 +891,52 @@ impl TuiApp {
                                     WorkingPhase::Execute,
                                     runtime_request::runtime_execute_detail(&decision),
                                 )?;
-                                self.set_runtime_working_phase(
-                                    WorkingPhase::Apply,
-                                    "결정 결과를 workspace에 반영합니다.",
+                                let permission =
+                                    PermissionGate::evaluate(&self.runtime_config, &decision);
+                                self.log_tool_permission_evaluated(
+                                    &active,
+                                    &decision,
+                                    &permission,
                                 )?;
-                                self.record_runtime_decision(&decision)
+                                match permission {
+                                    PermissionDecision::Allow => {
+                                        if matches!(
+                                            decision,
+                                            RuntimeDecision::ToolCandidatePending { .. }
+                                        ) {
+                                            self.set_runtime_working_phase(
+                                                WorkingPhase::Apply,
+                                                "도구 observation을 workspace와 history에 반영합니다.",
+                                            )?;
+                                            self.handle_tool_decision_loop(active, &decision)?;
+                                            return Ok(());
+                                        }
+
+                                        self.set_runtime_working_phase(
+                                            WorkingPhase::Apply,
+                                            "결정 결과를 workspace에 반영합니다.",
+                                        )?;
+                                        self.record_runtime_decision(&decision)
+                                    }
+                                    PermissionDecision::Ask(request) => {
+                                        self.set_runtime_working_phase(
+                                            WorkingPhase::Apply,
+                                            "승인 요청을 workspace와 approval surface에 반영합니다.",
+                                        )?;
+                                        self.open_permission_approval(
+                                            &active,
+                                            request,
+                                            decision_change_preview(&decision),
+                                        )?
+                                    }
+                                    PermissionDecision::Deny(denial) => {
+                                        self.set_runtime_working_phase(
+                                            WorkingPhase::Apply,
+                                            "권한 거부 결과를 workspace에 반영합니다.",
+                                        )?;
+                                        self.record_permission_denial(&active, denial)?
+                                    }
+                                }
                             }
                             Err(error) => {
                                 self.log_runtime_decision_failed(&active, &error)?;
@@ -1012,6 +1088,176 @@ impl TuiApp {
                 activity.as_str()
             )),
         }
+    }
+
+    fn open_permission_approval(
+        &mut self,
+        active: &ActivePlainRequest,
+        request: PermissionRequest,
+        change_preview: Option<ChangePreview>,
+    ) -> io::Result<WorkspaceEvents> {
+        let action = request.action.clone();
+        let reason = request.reason.clone();
+        self.state.approval_surface.open(ApprovalRequest {
+            title: request.title,
+            reason: request.reason,
+            action: request.action,
+            details: request.details,
+        });
+        self.log_approval_events(&[ApprovalInputEvent::SurfaceOpened])?;
+        self.log_tool_permission_approval_opened(active, &action, &reason)?;
+
+        let mut events = self
+            .state
+            .record_system_notice(format!("approval needed: {action}"));
+        events.extend(self.state.record_system_notice(reason));
+        if let Some(preview) = change_preview {
+            events.extend(self.state.workspace.push_diff_summary(
+                preview.target_path,
+                preview.additions,
+                preview.deletions,
+            ));
+        }
+        Ok(events)
+    }
+
+    fn record_permission_denial(
+        &mut self,
+        active: &ActivePlainRequest,
+        denial: PermissionDenial,
+    ) -> io::Result<WorkspaceEvents> {
+        self.log_tool_permission_denied(active, &denial.reason, &denial.message)?;
+        let mut events = self
+            .state
+            .record_system_notice(format!("permission denied: {}", denial.reason));
+        events.extend(self.state.record_system_notice(denial.message));
+        Ok(events)
+    }
+
+    fn handle_tool_decision_loop(
+        &mut self,
+        mut active: ActivePlainRequest,
+        decision: &RuntimeDecision,
+    ) -> io::Result<()> {
+        let RuntimeDecision::ToolCandidatePending {
+            activity,
+            tool_name,
+            arguments,
+            summary,
+        } = decision
+        else {
+            return Ok(());
+        };
+
+        let signature = tool_signature(tool_name, arguments);
+        if active.tool_call_count >= self.runtime_config.limits.max_tool_calls {
+            self.log_tool_loop_limit_reached(
+                &active,
+                "max_tool_calls",
+                active.tool_call_count,
+                self.runtime_config.limits.max_tool_calls,
+                &signature,
+            )?;
+            let events = self.record_tool_loop_limit("max_tool_calls");
+            self.finish_plain_request_with_events(
+                events,
+                "도구 루프 제한을 보고합니다.",
+                Some((&active.run_id, &active.turn_id)),
+            )?;
+            return Ok(());
+        }
+
+        let same_tool_repeat_count =
+            if active.last_tool_signature.as_deref() == Some(signature.as_str()) {
+                active.same_tool_repeat_count.saturating_add(1)
+            } else {
+                1
+            };
+        if same_tool_repeat_count > self.runtime_config.limits.max_same_tool_repeats {
+            self.log_tool_loop_limit_reached(
+                &active,
+                "max_same_tool_repeats",
+                same_tool_repeat_count,
+                self.runtime_config.limits.max_same_tool_repeats,
+                &signature,
+            )?;
+            let events = self.record_tool_loop_limit("max_same_tool_repeats");
+            self.finish_plain_request_with_events(
+                events,
+                "반복 도구 루프 제한을 보고합니다.",
+                Some((&active.run_id, &active.turn_id)),
+            )?;
+            return Ok(());
+        }
+
+        active.tool_call_count = active.tool_call_count.saturating_add(1);
+        active.last_tool_signature = Some(signature.clone());
+        active.same_tool_repeat_count = same_tool_repeat_count;
+
+        self.log_tool_call_received(&active, *activity, tool_name, summary, arguments)?;
+        let call = ToolCall::new(
+            active.run_id.clone(),
+            active.turn_id.clone(),
+            *activity,
+            tool_name.clone(),
+            arguments.clone(),
+        );
+        self.log_tool_execution_started(&active, &call)?;
+        let observation = self.tool_runtime.execute(call);
+        self.log_tool_observation(&active, &observation)?;
+
+        let observation_message = active.history.append(
+            active.turn_id.clone(),
+            LlmMessageRole::System,
+            LlmMessageVisibility::Internal,
+            observation.history_message(),
+        );
+        self.log_message_recorded(&active.history, &observation_message)?;
+        self.log_tool_observation_attached(&active, &observation_message)?;
+        self.log_tool_observation_recorded(&active, &observation)?;
+
+        let mut events = self
+            .state
+            .workspace
+            .push_work_output(ActivityGroup::Explore, observation.summary());
+        events.extend(
+            self.state
+                .workspace
+                .push_evidence(observation.tool_name.clone(), observation.preview_text()),
+        );
+        self.log_tool_workspace_summary_rendered(&active, &observation)?;
+        self.log_workspace_events(&events.events)?;
+
+        let next_turn_id = active.history.next_turn_id();
+        self.log_turn_id_assigned(&active.history, &next_turn_id)?;
+        let request_messages = active.history.for_request(None);
+        self.log_plain_request_started(&active.run_id, &next_turn_id, &active.prompt)?;
+        self.log_tool_loop_request_started(&active, &next_turn_id)?;
+        self.llm_diagnostics
+            .record_request_started(&active.run_id, &next_turn_id);
+        self.set_runtime_working_phase(
+            WorkingPhase::Interpret,
+            "도구 observation을 반영한 다음 LLM 응답을 기다립니다.",
+        )?;
+
+        active.turn_id = next_turn_id;
+        active.receiver =
+            runtime_request::spawn_chat_request(&self.runtime_config, request_messages);
+        active.repair_attempts = 0;
+        self.active_plain_request = Some(active);
+
+        Ok(())
+    }
+
+    fn record_tool_loop_limit(&mut self, reason: &str) -> WorkspaceEvents {
+        let mut events = self
+            .state
+            .record_system_notice(format!("tool loop stopped: {reason}"));
+        events.extend(
+            self.state
+                .record_system_notice("도구 반복 제한에 도달해 추가 LLM 요청을 보내지 않습니다."),
+        );
+        events
     }
 
     fn record_runtime_decision_error(&mut self, error: &RuntimeDecisionError) -> WorkspaceEvents {
@@ -1430,6 +1676,262 @@ impl TuiApp {
         ))
     }
 
+    fn log_tool_permission_evaluated(
+        &self,
+        active: &ActivePlainRequest,
+        decision: &RuntimeDecision,
+        permission: &PermissionDecision,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_04_SCOPE,
+            EVENT_TOOL_PERMISSION_EVALUATED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "decision": decision.kind(),
+                "activity": decision.activity().map(|activity| activity.as_str()),
+                "tool_name": decision.tool_name(),
+                "branch": permission.branch(),
+            }),
+        ))
+    }
+
+    fn log_tool_permission_approval_opened(
+        &self,
+        active: &ActivePlainRequest,
+        action: &str,
+        reason: &str,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_04_SCOPE,
+            EVENT_TOOL_PERMISSION_APPROVAL_OPENED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "action": action,
+                "reason": reason,
+            }),
+        ))
+    }
+
+    fn log_tool_permission_denied(
+        &self,
+        active: &ActivePlainRequest,
+        reason: &str,
+        message: &str,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_04_SCOPE,
+            EVENT_TOOL_PERMISSION_DENIED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "reason": reason,
+                "message": message,
+            }),
+        ))
+    }
+
+    fn log_tool_call_received(
+        &self,
+        active: &ActivePlainRequest,
+        activity: Activity,
+        tool_name: &str,
+        summary: &str,
+        arguments: &serde_json::Value,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_01_SCOPE,
+            EVENT_TOOL_CALL_RECEIVED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "activity": activity.as_str(),
+                "tool_name": tool_name,
+                "summary_chars": summary.chars().count(),
+                "argument_keys": argument_keys(arguments),
+            }),
+        ))
+    }
+
+    fn log_tool_execution_started(
+        &self,
+        active: &ActivePlainRequest,
+        call: &ToolCall,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_01_SCOPE,
+            EVENT_TOOL_EXECUTION_STARTED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "tool_name": &call.tool_name,
+                "activity": call.activity.as_str(),
+                "workspace_root": self.tool_runtime.workspace_root().display().to_string(),
+            }),
+        ))
+    }
+
+    fn log_tool_observation(
+        &self,
+        active: &ActivePlainRequest,
+        observation: &ToolObservation,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_01_SCOPE,
+            EVENT_TOOL_ARGUMENT_RESOLVED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "tool_name": &observation.tool_name,
+                "target_raw": &observation.target_raw,
+                "target_resolved": &observation.target_resolved,
+            }),
+        ))?;
+        self.logger.llm(LogEvent::ui(
+            TOOL_01_SCOPE,
+            EVENT_TOOL_PATH_BOUNDARY_CHECKED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "tool_name": &observation.tool_name,
+                "status": observation.status.as_str(),
+                "target_raw": &observation.target_raw,
+                "target_resolved": &observation.target_resolved,
+                "error_kind": observation.error_kind.map(|kind| kind.as_str()),
+            }),
+        ))?;
+
+        let event = match observation.status {
+            ObservationStatus::Succeeded => EVENT_TOOL_EXECUTION_SUCCEEDED,
+            ObservationStatus::Failed => EVENT_TOOL_EXECUTION_FAILED,
+        };
+        self.logger.llm(LogEvent::ui(
+            TOOL_01_SCOPE,
+            event,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "tool_name": &observation.tool_name,
+                "status": observation.status.as_str(),
+                "preview_lines": observation.preview.len(),
+                "total_lines": observation.total_lines,
+                "total_bytes": observation.total_bytes,
+                "truncated": observation.truncated,
+                "source_truncated": observation.source_truncated,
+                "preview_truncated": observation.preview_truncated,
+                "artifact_path": &observation.artifact_path,
+                "next_range_hint": &observation.next_range_hint,
+                "error_kind": observation.error_kind.map(|kind| kind.as_str()),
+                "message": &observation.message,
+            }),
+        ))
+    }
+
+    fn log_tool_observation_recorded(
+        &self,
+        active: &ActivePlainRequest,
+        observation: &ToolObservation,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_01_SCOPE,
+            EVENT_TOOL_OBSERVATION_RECORDED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "tool_name": &observation.tool_name,
+                "status": observation.status.as_str(),
+                "preview_lines": observation.preview.len(),
+                "total_lines": observation.total_lines,
+                "total_bytes": observation.total_bytes,
+                "truncated": observation.truncated,
+                "source_truncated": observation.source_truncated,
+                "preview_truncated": observation.preview_truncated,
+                "artifact_path": &observation.artifact_path,
+                "next_range_hint": &observation.next_range_hint,
+            }),
+        ))
+    }
+
+    fn log_tool_observation_attached(
+        &self,
+        active: &ActivePlainRequest,
+        message: &LlmMessage,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_03_SCOPE,
+            EVENT_TOOL_OBSERVATION_ATTACHED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "message_role": message.role.as_str(),
+                "message_visibility": message.visibility.as_str(),
+                "content_chars": message.content.chars().count(),
+                "tool_call_count": active.tool_call_count,
+                "same_tool_repeat_count": active.same_tool_repeat_count,
+            }),
+        ))
+    }
+
+    fn log_tool_loop_request_started(
+        &self,
+        active: &ActivePlainRequest,
+        next_turn_id: &str,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_03_SCOPE,
+            EVENT_TOOL_LOOP_REQUEST_STARTED,
+            json!({
+                "run_id": &active.run_id,
+                "previous_turn_id": &active.turn_id,
+                "next_turn_id": next_turn_id,
+                "tool_call_count": active.tool_call_count,
+                "same_tool_repeat_count": active.same_tool_repeat_count,
+            }),
+        ))
+    }
+
+    fn log_tool_loop_limit_reached(
+        &self,
+        active: &ActivePlainRequest,
+        reason: &str,
+        actual: u16,
+        limit: u16,
+        signature: &str,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_03_SCOPE,
+            EVENT_TOOL_LOOP_LIMIT_REACHED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "reason": reason,
+                "actual": actual,
+                "limit": limit,
+                "signature": signature,
+                "tool_call_count": active.tool_call_count,
+                "same_tool_repeat_count": active.same_tool_repeat_count,
+            }),
+        ))
+    }
+
+    fn log_tool_workspace_summary_rendered(
+        &self,
+        active: &ActivePlainRequest,
+        observation: &ToolObservation,
+    ) -> io::Result<()> {
+        self.logger.llm(LogEvent::ui(
+            TOOL_01_SCOPE,
+            EVENT_TOOL_WORKSPACE_SUMMARY_RENDERED,
+            json!({
+                "run_id": &active.run_id,
+                "turn_id": &active.turn_id,
+                "tool_name": &observation.tool_name,
+                "status": observation.status.as_str(),
+            }),
+        ))
+    }
+
     fn log_runtime_decision_failed(
         &self,
         active: &ActivePlainRequest,
@@ -1769,6 +2271,24 @@ fn current_workspace_path() -> io::Result<PathBuf> {
 
 fn workspace_display(path: &Path) -> String {
     path.display().to_string()
+}
+
+fn argument_keys(arguments: &serde_json::Value) -> Vec<String> {
+    arguments
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn tool_signature(tool_name: &str, arguments: &serde_json::Value) -> String {
+    format!("{tool_name}:{}", arguments)
+}
+
+fn decision_change_preview(decision: &RuntimeDecision) -> Option<ChangePreview> {
+    match decision {
+        RuntimeDecision::ApprovalNeeded { change_preview, .. } => change_preview.clone(),
+        _ => None,
+    }
 }
 
 struct TerminalSession {

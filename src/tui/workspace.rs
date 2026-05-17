@@ -74,7 +74,7 @@ impl WorkspaceItem {
             Self::SystemNotice { .. } => 1,
             Self::AssistantAnswer { text } => text.lines().count().max(1) + 1,
             Self::ActivityOutput { .. } => 1,
-            Self::EvidenceBlock { .. } => 2,
+            Self::EvidenceBlock { body, .. } => body.lines().count().max(1) + 1,
             Self::DiffSummary { expanded, .. } => {
                 if *expanded {
                     3
@@ -115,7 +115,6 @@ impl WorkspaceBuffer {
         self.push_output(WorkspaceItem::AssistantAnswer { text: text.into() })
     }
 
-    #[allow(dead_code)]
     pub fn push_work_output(
         &mut self,
         group: ActivityGroup,
@@ -127,7 +126,6 @@ impl WorkspaceBuffer {
         })
     }
 
-    #[allow(dead_code)]
     pub fn push_evidence(
         &mut self,
         title: impl Into<String>,

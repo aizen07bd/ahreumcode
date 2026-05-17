@@ -1,4 +1,5 @@
 use serde_json::{Map, Value};
+use std::path::{Component, Path};
 
 use super::response_parser::{
     Activity, ParsedRuntimeResponse, RuntimeAnswer, RuntimeResponse, RuntimeToolCandidate,
@@ -20,13 +21,55 @@ pub enum RuntimeDecision {
     ToolCandidatePending {
         activity: Activity,
         tool_name: String,
+        arguments: Value,
         summary: String,
     },
     ApprovalNeeded {
         activity: Activity,
         tool_name: String,
+        arguments: Value,
+        change_preview: Option<ChangePreview>,
         reason: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangePreview {
+    pub payload_id: String,
+    pub target_path: String,
+    pub operation: PatchOperation,
+    pub additions: u16,
+    pub deletions: u16,
+}
+
+impl ChangePreview {
+    pub fn details(&self) -> String {
+        format!(
+            "patch target: {}\noperation: {}\nadditions: {}\ndeletions: {}\npayload_id: {}",
+            self.target_path,
+            self.operation.as_str(),
+            self.additions,
+            self.deletions,
+            self.payload_id
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchOperation {
+    Add,
+    Update,
+    Delete,
+}
+
+impl PatchOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
 }
 
 impl RuntimeDecision {
@@ -151,12 +194,15 @@ fn classify_tool_candidate(
         Activity::Explore => Ok(RuntimeDecision::ToolCandidatePending {
             activity: candidate.activity,
             tool_name: candidate.tool_name.clone(),
+            arguments: candidate.arguments.clone(),
             summary: candidate.message.clone(),
         }),
         Activity::Change => classify_change_candidate(candidate, parsed),
         Activity::Execute | Activity::Configure => Ok(RuntimeDecision::ApprovalNeeded {
             activity: candidate.activity,
             tool_name: candidate.tool_name.clone(),
+            arguments: candidate.arguments.clone(),
+            change_preview: None,
             reason: candidate.reason.clone(),
         }),
         Activity::None | Activity::Ask => Err(RuntimeDecisionError::invalid_tool(format!(
@@ -170,6 +216,7 @@ fn classify_change_candidate(
     candidate: &RuntimeToolCandidate,
     parsed: &ParsedRuntimeResponse,
 ) -> Result<RuntimeDecision, RuntimeDecisionError> {
+    let mut change_preview = None;
     if candidate.tool_name == "apply_patch" {
         let payload_id = required_str(arguments_object(candidate)?, "payload_id")?;
         let payload = parsed
@@ -195,11 +242,14 @@ fn classify_change_candidate(
                 reason: format!("apply_patch target count was {target_count}"),
             });
         }
+        change_preview = Some(parse_apply_patch_preview(payload_id, &payload.body)?);
     }
 
     Ok(RuntimeDecision::ApprovalNeeded {
         activity: candidate.activity,
         tool_name: candidate.tool_name.clone(),
+        arguments: candidate.arguments.clone(),
+        change_preview,
         reason: candidate.reason.clone(),
     })
 }
@@ -235,34 +285,34 @@ fn validate_tool_arguments(candidate: &RuntimeToolCandidate) -> Result<(), Runti
         "list_files" => validate_arguments(
             candidate,
             &[
-                ArgumentRule::string("path"),
-                ArgumentRule::integer("max_depth"),
-                ArgumentRule::integer("max_entries"),
+                ArgumentRule::workspace_path("path"),
+                ArgumentRule::integer_range("max_depth", 1, 5),
+                ArgumentRule::integer_range("max_entries", 1, 500),
             ],
         ),
         "find_files" => validate_arguments(
             candidate,
             &[
-                ArgumentRule::string("path"),
-                ArgumentRule::string("pattern"),
-                ArgumentRule::integer("max_results"),
+                ArgumentRule::workspace_path("path"),
+                ArgumentRule::non_empty_string("pattern"),
+                ArgumentRule::integer_range("max_results", 1, 200),
             ],
         ),
         "search_text" => validate_arguments(
             candidate,
             &[
-                ArgumentRule::string("path"),
-                ArgumentRule::string("query"),
+                ArgumentRule::workspace_path("path"),
+                ArgumentRule::non_empty_string("query"),
                 ArgumentRule::boolean("use_regex"),
-                ArgumentRule::integer("max_results"),
+                ArgumentRule::integer_range("max_results", 1, 200),
             ],
         ),
         "read_file" => validate_arguments(
             candidate,
             &[
-                ArgumentRule::string("path"),
-                ArgumentRule::integer("start_line"),
-                ArgumentRule::integer("max_lines"),
+                ArgumentRule::workspace_path("path"),
+                ArgumentRule::integer_range("start_line", 1, i64::MAX),
+                ArgumentRule::integer_range("max_lines", 1, 300),
             ],
         ),
         "inspect_git" => validate_arguments(
@@ -275,38 +325,43 @@ fn validate_tool_arguments(candidate: &RuntimeToolCandidate) -> Result<(), Runti
         "web_search" => validate_arguments(
             candidate,
             &[
-                ArgumentRule::string("query"),
-                ArgumentRule::integer("max_results"),
+                ArgumentRule::non_empty_string("query"),
+                ArgumentRule::integer_range("max_results", 1, 10),
             ],
         ),
         "web_fetch" => validate_arguments(
             candidate,
             &[
-                ArgumentRule::string("url"),
-                ArgumentRule::integer("max_bytes"),
+                ArgumentRule::http_url("url"),
+                ArgumentRule::integer_range("max_bytes", 1, 200_000),
             ],
         ),
-        "apply_patch" => validate_arguments(candidate, &[ArgumentRule::string("payload_id")]),
+        "apply_patch" => {
+            validate_arguments(candidate, &[ArgumentRule::non_empty_string("payload_id")])
+        }
         "run_command" => validate_arguments(
             candidate,
             &[
-                ArgumentRule::string_array("argv"),
-                ArgumentRule::string("cwd"),
-                ArgumentRule::integer("timeout_ms"),
+                ArgumentRule::non_empty_string_array("argv"),
+                ArgumentRule::workspace_path("cwd"),
+                ArgumentRule::integer_range("timeout_ms", 1, i64::MAX),
             ],
         ),
         "add_provider" => validate_arguments(
             candidate,
             &[
-                ArgumentRule::string("provider_id"),
-                ArgumentRule::string("base_url"),
-                ArgumentRule::string("model"),
-                ArgumentRule::integer("context_tokens"),
+                ArgumentRule::config_key("provider_id"),
+                ArgumentRule::http_url("base_url"),
+                ArgumentRule::non_empty_string("model"),
+                ArgumentRule::integer_range("context_tokens", 1, i64::MAX),
             ],
         ),
         "update_config" => validate_arguments(
             candidate,
-            &[ArgumentRule::string("key_path"), ArgumentRule::any("value")],
+            &[
+                ArgumentRule::config_key("key_path"),
+                ArgumentRule::any("value"),
+            ],
         ),
         _ => Err(RuntimeDecisionError::invalid_tool(format!(
             "unknown tool: {}",
@@ -321,17 +376,38 @@ struct ArgumentRule<'a> {
 }
 
 impl<'a> ArgumentRule<'a> {
-    fn string(name: &'a str) -> Self {
+    fn non_empty_string(name: &'a str) -> Self {
         Self {
             name,
-            kind: ArgumentKind::String,
+            kind: ArgumentKind::NonEmptyString,
         }
     }
 
-    fn integer(name: &'a str) -> Self {
+    fn workspace_path(name: &'a str) -> Self {
         Self {
             name,
-            kind: ArgumentKind::Integer,
+            kind: ArgumentKind::WorkspacePath,
+        }
+    }
+
+    fn config_key(name: &'a str) -> Self {
+        Self {
+            name,
+            kind: ArgumentKind::ConfigKey,
+        }
+    }
+
+    fn http_url(name: &'a str) -> Self {
+        Self {
+            name,
+            kind: ArgumentKind::HttpUrl,
+        }
+    }
+
+    fn integer_range(name: &'a str, min: i64, max: i64) -> Self {
+        Self {
+            name,
+            kind: ArgumentKind::IntegerRange { min, max },
         }
     }
 
@@ -342,10 +418,10 @@ impl<'a> ArgumentRule<'a> {
         }
     }
 
-    fn string_array(name: &'a str) -> Self {
+    fn non_empty_string_array(name: &'a str) -> Self {
         Self {
             name,
-            kind: ArgumentKind::StringArray,
+            kind: ArgumentKind::NonEmptyStringArray,
         }
     }
 
@@ -365,10 +441,13 @@ impl<'a> ArgumentRule<'a> {
 }
 
 enum ArgumentKind<'a> {
-    String,
-    Integer,
+    NonEmptyString,
+    WorkspacePath,
+    ConfigKey,
+    HttpUrl,
+    IntegerRange { min: i64, max: i64 },
     Boolean,
-    StringArray,
+    NonEmptyStringArray,
     StringEnum(&'a [&'a str]),
     Any,
 }
@@ -401,12 +480,31 @@ fn validate_argument_value(
     value: &Value,
 ) -> Result<(), RuntimeDecisionError> {
     let valid = match rule.kind {
-        ArgumentKind::String => value.as_str().is_some(),
-        ArgumentKind::Integer => value.as_i64().is_some(),
+        ArgumentKind::NonEmptyString => value
+            .as_str()
+            .map(validate_non_empty_plain_string)
+            .unwrap_or(false),
+        ArgumentKind::WorkspacePath => value
+            .as_str()
+            .map(validate_workspace_relative_path)
+            .unwrap_or(false),
+        ArgumentKind::ConfigKey => value.as_str().map(validate_config_key).unwrap_or(false),
+        ArgumentKind::HttpUrl => value.as_str().map(validate_http_url).unwrap_or(false),
+        ArgumentKind::IntegerRange { min, max } => value
+            .as_i64()
+            .map(|actual| (min..=max).contains(&actual))
+            .unwrap_or(false),
         ArgumentKind::Boolean => value.as_bool().is_some(),
-        ArgumentKind::StringArray => value
+        ArgumentKind::NonEmptyStringArray => value
             .as_array()
-            .map(|items| items.iter().all(|item| item.as_str().is_some()))
+            .map(|items| {
+                !items.is_empty()
+                    && items.iter().all(|item| {
+                        item.as_str()
+                            .map(validate_non_empty_plain_string)
+                            .unwrap_or(false)
+                    })
+            })
             .unwrap_or(false),
         ArgumentKind::StringEnum(values) => value
             .as_str()
@@ -423,6 +521,57 @@ fn validate_argument_value(
             rule.name
         )))
     }
+}
+
+fn validate_non_empty_plain_string(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && !contains_control_char(value)
+}
+
+fn validate_workspace_relative_path(value: &str) -> bool {
+    if !validate_non_empty_plain_string(value) {
+        return false;
+    }
+
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return false;
+    }
+
+    path.components().all(|component| {
+        !matches!(
+            component,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+        )
+    })
+}
+
+fn validate_config_key(value: &str) -> bool {
+    validate_non_empty_plain_string(value)
+        && value.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+        })
+}
+
+fn validate_http_url(value: &str) -> bool {
+    if !validate_non_empty_plain_string(value) || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    let Some(rest) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+    else {
+        return false;
+    };
+
+    !rest.is_empty()
+}
+
+fn contains_control_char(value: &str) -> bool {
+    value.chars().any(char::is_control)
 }
 
 fn arguments_object(
@@ -453,11 +602,70 @@ fn count_apply_patch_targets(body: &str) -> usize {
         .count()
 }
 
+fn parse_apply_patch_preview(
+    payload_id: &str,
+    body: &str,
+) -> Result<ChangePreview, RuntimeDecisionError> {
+    let lines = body.lines().collect::<Vec<_>>();
+    if lines.first() != Some(&"*** Begin Patch") || lines.last() != Some(&"*** End Patch") {
+        return Err(RuntimeDecisionError::invalid_arguments(
+            "apply_patch payload must begin with *** Begin Patch and end with *** End Patch",
+        ));
+    }
+
+    let mut target = None;
+    for line in &lines {
+        let candidate = line
+            .strip_prefix("*** Add File: ")
+            .map(|path| (PatchOperation::Add, path))
+            .or_else(|| {
+                line.strip_prefix("*** Update File: ")
+                    .map(|path| (PatchOperation::Update, path))
+            })
+            .or_else(|| {
+                line.strip_prefix("*** Delete File: ")
+                    .map(|path| (PatchOperation::Delete, path))
+            });
+        if let Some((operation, path)) = candidate {
+            target = Some((operation, path.to_owned()));
+            break;
+        }
+    }
+
+    let Some((operation, target_path)) = target else {
+        return Err(RuntimeDecisionError::invalid_arguments(
+            "apply_patch payload target was not found",
+        ));
+    };
+    if !validate_workspace_relative_path(&target_path) {
+        return Err(RuntimeDecisionError::invalid_arguments(format!(
+            "apply_patch target must be workspace-relative: {target_path}"
+        )));
+    }
+
+    let additions = count_patch_lines(&lines, '+')?;
+    let deletions = count_patch_lines(&lines, '-')?;
+
+    Ok(ChangePreview {
+        payload_id: payload_id.to_owned(),
+        target_path,
+        operation,
+        additions,
+        deletions,
+    })
+}
+
+fn count_patch_lines(lines: &[&str], marker: char) -> Result<u16, RuntimeDecisionError> {
+    let count = lines.iter().filter(|line| line.starts_with(marker)).count();
+    u16::try_from(count)
+        .map_err(|_| RuntimeDecisionError::invalid_arguments("apply_patch line count too large"))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{DecisionGate, RuntimeDecision, RuntimeDecisionErrorKind};
+    use super::{DecisionGate, PatchOperation, RuntimeDecision, RuntimeDecisionErrorKind};
     use crate::llm::response_parser::{
         Activity, ParsedRuntimeResponse, RuntimeAnswer, RuntimeManifest, RuntimePayload,
         RuntimeResponse, RuntimeToolCandidate,
@@ -557,7 +765,73 @@ mod tests {
 
         let decision = DecisionGate::classify(&parsed).expect("change should classify");
 
-        assert_eq!(decision.kind(), "approval_needed");
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce approval with preview");
+        };
+        assert_eq!(preview.target_path, "src/main.rs");
+        assert_eq!(preview.operation, PatchOperation::Update);
+        assert_eq!(preview.additions, 0);
+        assert_eq!(preview.deletions, 0);
+    }
+
+    #[test]
+    fn extracts_apply_patch_preview_counts() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body:
+                    "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"
+                        .to_owned(),
+            }],
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("change should classify");
+
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce preview");
+        };
+        assert_eq!(preview.additions, 1);
+        assert_eq!(preview.deletions, 1);
+    }
+
+    #[test]
+    fn rejects_malformed_apply_patch_payload() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body: "*** Update File: src/main.rs\n*** End Patch".to_owned(),
+            }],
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("malformed patch should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
     }
 
     #[test]
@@ -594,6 +868,82 @@ mod tests {
         };
 
         let error = DecisionGate::classify(&parsed).expect_err("unknown argument should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+    }
+
+    #[test]
+    fn rejects_parent_directory_tool_path() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Explore,
+                message: "need file".to_owned(),
+                tool_name: "read_file".to_owned(),
+                arguments: json!({"path":"../outside.md","start_line":1,"max_lines":80}),
+                reason: "inspect".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("parent path should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+    }
+
+    #[test]
+    fn rejects_out_of_range_tool_limit() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Explore,
+                message: "need file".to_owned(),
+                tool_name: "read_file".to_owned(),
+                arguments: json!({"path":"README.md","start_line":1,"max_lines":301}),
+                reason: "inspect".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("limit should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+    }
+
+    #[test]
+    fn rejects_empty_command_argv() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Execute,
+                message: "run command".to_owned(),
+                tool_name: "run_command".to_owned(),
+                arguments: json!({"argv":[],"cwd":".","timeout_ms":30000}),
+                reason: "execute".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("empty argv should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+    }
+
+    #[test]
+    fn rejects_non_http_fetch_url() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Explore,
+                message: "fetch".to_owned(),
+                tool_name: "web_fetch".to_owned(),
+                arguments: json!({"url":"file:///etc/passwd","max_bytes":200000}),
+                reason: "fetch".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("file url should fail");
 
         assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
     }

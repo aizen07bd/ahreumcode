@@ -15,6 +15,9 @@ pub(super) struct ActivePlainRequest {
     pub(super) receiver: Receiver<LlmChatReport>,
     pub(super) cancelled: bool,
     pub(super) repair_attempts: u16,
+    pub(super) tool_call_count: u16,
+    pub(super) last_tool_signature: Option<String>,
+    pub(super) same_tool_repeat_count: u16,
 }
 
 impl ActivePlainRequest {
@@ -33,6 +36,9 @@ impl ActivePlainRequest {
             receiver,
             cancelled: false,
             repair_attempts: 0,
+            tool_call_count: 0,
+            last_tool_signature: None,
+            same_tool_repeat_count: 0,
         }
     }
 }
@@ -70,9 +76,7 @@ pub(super) fn runtime_execute_detail(decision: &RuntimeDecision) -> &'static str
         RuntimeDecision::Answer { .. }
         | RuntimeDecision::Clarify { .. }
         | RuntimeDecision::Blocked { .. } => "실행할 도구가 없어 실행 단계를 통과합니다.",
-        RuntimeDecision::ToolCandidatePending { .. } => {
-            "도구 후보를 실행하지 않고 다음 runtime 단계로 넘깁니다."
-        }
+        RuntimeDecision::ToolCandidatePending { .. } => "Explore 도구 후보를 실행합니다.",
         RuntimeDecision::ApprovalNeeded { .. } => {
             "승인이 필요한 후보이므로 직접 실행하지 않습니다."
         }
