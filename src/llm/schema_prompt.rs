@@ -1,4 +1,5 @@
 use super::history::{LlmMessage, LlmMessageRole, LlmMessageVisibility, MessageHistory};
+use super::response_parser::RESPONSE_ACTIVITY_PAIRS;
 use crate::tool::tool_argument_schema_lines;
 
 pub const TOOL_MANIFEST_ID: &str = "ahreumcode.local-llm.tool-manifest.v1";
@@ -6,6 +7,9 @@ pub const TOOL_MANIFEST_VERSION: &str = "1";
 
 const REQUIRED_SCHEMA_RULES: &[&str] = &[
     "Return exactly one next action candidate.",
+    "Workspace evidence rules:",
+    "Explore tool selection rules:",
+    "Tool path selection rules:",
     "response_type",
     "answer",
     "tool",
@@ -22,17 +26,68 @@ const REQUIRED_SCHEMA_RULES: &[&str] = &[
     "tool_manifest_version",
     "Unknown fields are rejected.",
     "Tool argument schemas:",
+    "Integer fields must be JSON numbers, not strings.",
+    "Omitted optional Explore bounds use runtime defaults",
     "workspace-relative path",
     "Do not ask the runtime to normalize",
     "http:// or https://",
+    "Output boundary rules:",
+    "The contract envelope must be the first non-whitespace text in the assistant response.",
+    "Natural language outside the contract envelope and payload blocks is invalid.",
     "Do not wrap JSON in markdown or code fences.",
-    "Use answer_payload_id and raw markdown payload blocks for code or markdown answers.",
+    "Payload block rules:",
+    "A response with AHREUM_PAYLOAD block(s) must use this exact order: one AHREUM_ACTION block first, then AHREUM_PAYLOAD block(s).",
+    "No text may appear before, between, or after contract blocks.",
+    "Use plain JSON without AHREUM_PAYLOAD for Explore tools and short answers.",
     "Do not put source, patch, or file body text inside JSON string fields.",
-    "Use payload_id and raw payload blocks for source, patch, or file body text.",
-    "If any AHREUM_PAYLOAD block is present, wrap the action JSON in AHREUM_ACTION tags.",
+    "answer_payload_id references exactly one AHREUM_PAYLOAD block with format=\"markdown\".",
+    "payload_id references exactly one AHREUM_PAYLOAD block for source, patch, or file body text.",
+    "Payload blocks without a matching payload id reference are invalid.",
     "<AHREUM_ACTION>",
     "</AHREUM_ACTION>",
 ];
+
+const RESPONSE_BOUNDARY_CONTRACT_LINES: &[&str] = &[
+    "Output boundary rules:",
+    "- The assistant response has one contract envelope and optional payload blocks.",
+    "- The contract envelope must be the first non-whitespace text in the assistant response.",
+    "- The contract envelope is either plain JSON or one AHREUM_ACTION block.",
+    "- If AHREUM_ACTION is used, the response must start with <AHREUM_ACTION>.",
+    "- Natural language outside the contract envelope and payload blocks is invalid.",
+    "- Markdown or code fences around the contract envelope are invalid.",
+];
+
+pub(crate) fn response_boundary_contract_lines() -> &'static [&'static str] {
+    RESPONSE_BOUNDARY_CONTRACT_LINES
+}
+
+const PAYLOAD_ORDERING_CONTRACT_LINES: &[&str] = &[
+    "Payload block rules:",
+    "- A response with AHREUM_PAYLOAD block(s) must use this exact order: one AHREUM_ACTION block first, then AHREUM_PAYLOAD block(s).",
+    "- No text may appear before, between, or after contract blocks.",
+    "- Use plain JSON without AHREUM_PAYLOAD for Explore tools and short answers.",
+    "- Use AHREUM_PAYLOAD only for markdown answer bodies, source text, patch text, or file body text that is referenced from the JSON envelope.",
+    "- answer_payload_id references exactly one AHREUM_PAYLOAD block with format=\"markdown\".",
+    "- payload_id references exactly one AHREUM_PAYLOAD block for source, patch, or file body text.",
+    "- Payload blocks without a matching payload id reference are invalid.",
+];
+
+pub(crate) fn payload_ordering_contract_lines() -> &'static [&'static str] {
+    PAYLOAD_ORDERING_CONTRACT_LINES
+}
+
+const TOOL_PATH_SELECTION_CONTRACT_LINES: &[&str] = &[
+    "Tool path selection rules:",
+    "- read_file path must be an exact workspace-relative path from the user request or a previous observation.",
+    "- If the target is a symbol, type, function, registry entry, tool mapping, or configuration key location, use search_text before read_file.",
+    "- If the target is current structure, a directory, an unknown filename location, or a filename that failed as a direct path, use list_files before read_file.",
+    "- If a previous observation reports path_not_found, not_a_file, or not_a_directory, do not retry the same path.",
+    "- The runtime does not fuzzy-match, rename, or correct guessed paths.",
+];
+
+pub(crate) fn tool_path_selection_contract_lines() -> &'static [&'static str] {
+    TOOL_PATH_SELECTION_CONTRACT_LINES
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchemaPrompt {
@@ -49,48 +104,105 @@ impl SchemaPromptBuilder {
             "You are AhreumCode local LLM runtime.",
             "",
             "Return exactly one next action candidate.",
-            "Return only the response contract. Do not mix unrelated prose before or after it.",
+            "Return only the response contract.",
             "",
-            "Required manifest fields:",
+            "Runtime manifest:",
         ]
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-        lines.push(format!("- tool_manifest_id: {TOOL_MANIFEST_ID}"));
-        lines.push(format!("- tool_manifest_version: {TOOL_MANIFEST_VERSION}"));
+        lines.push(format!(
+            "- tool_manifest_id is runtime-owned and resolves to: {TOOL_MANIFEST_ID}"
+        ));
+        lines.push(format!(
+            "- tool_manifest_version is runtime-owned and resolves to: {TOOL_MANIFEST_VERSION}"
+        ));
+        lines.push(
+            "- Every response must include tool_manifest_id and tool_manifest_version with those exact values."
+                .to_owned(),
+        );
+        lines.extend(
+            [
+                "",
+                "Allowed response_type values:",
+                "- answer",
+                "- tool",
+                "- clarify",
+                "- blocked",
+                "",
+                "Allowed activity values:",
+                "- None",
+                "- Explore",
+                "- Change",
+                "- Execute",
+                "- Configure",
+                "- Ask",
+                "",
+                "Allowed response_type/activity pairs:",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+
+        for pair in RESPONSE_ACTIVITY_PAIRS {
+            lines.push(format!("- {}", pair.rule_text()));
+        }
+
         lines.extend(
             [
             "",
-            "Allowed response_type values:",
-            "- answer",
-            "- tool",
-            "- clarify",
-            "- blocked",
-            "",
-            "Allowed activity values:",
-            "- None",
-            "- Explore",
-            "- Change",
-            "- Execute",
-            "- Configure",
-            "- Ask",
-            "",
             "Response shape rules:",
             "- Unknown fields are rejected.",
-            "- answer uses response_type, activity, message, optional answer_payload_id, tool_manifest_id, tool_manifest_version.",
-            "- tool uses response_type, activity, message, tool_name, arguments, reason, tool_manifest_id, tool_manifest_version.",
-            "- clarify uses response_type, activity, message, reason, tool_manifest_id, tool_manifest_version.",
-            "- blocked uses response_type, activity, message, reason, tool_manifest_id, tool_manifest_version.",
+            "- answer uses response_type, activity, message, tool_manifest_id, tool_manifest_version, and optional answer_payload_id.",
+            "- tool uses response_type, activity, message, tool_manifest_id, tool_manifest_version, tool_name, arguments, and optional reason.",
+            "- clarify uses response_type, activity, message, tool_manifest_id, tool_manifest_version, and optional reason.",
+            "- blocked uses response_type, activity, message, tool_manifest_id, tool_manifest_version, and optional reason.",
             "- One response cannot contain multiple tool candidates.",
             "- Do not invent tool names or argument fields.",
             "- Tool arguments must match the provided typed argument schema.",
+            "- Integer fields must be JSON numbers, not strings.",
+            "- Omitted optional Explore bounds use runtime defaults: read_file start_line=1 max_lines=120, search_text max_results=20, list_files max_depth=2 max_entries=100.",
+            "- HttpUrl fields must use http:// or https:// URLs.",
             "- Do not ask the runtime to normalize paths, URLs, command arguments, or payload ids.",
             "- Do not wrap JSON in markdown or code fences.",
-            "",
-            "Tool argument schemas:",
         ]
             .into_iter()
             .map(str::to_owned),
+        );
+        lines.extend(
+            response_boundary_contract_lines()
+                .iter()
+                .map(|line| line.to_string()),
+        );
+        lines.extend(
+            [
+            "",
+            "Workspace evidence rules:",
+            "- If the user asks about current workspace files, directories, code locations, implementations, dependencies, git state, configuration, or registered tools, do not answer from memory.",
+            "- If no relevant AHREUM_TOOL_OBSERVATION is available for a workspace fact request, return exactly one Explore tool candidate.",
+            "- If the user asks to create new self-contained content and does not ask to inspect existing workspace state, do not Explore first. Return exactly one Change tool candidate with an apply_patch payload for the requested file.",
+            "- Use answer with activity None only when no workspace evidence is needed, project context is sufficient, or the latest observation is enough evidence.",
+            "",
+            "Explore tool selection rules:",
+            "- Use read_file when the user names an exact workspace file path or when a previous observation identifies the file to read.",
+            "- Use list_files when the user asks for the current directory, project structure, or when a named file was not found at the direct path and its location must be discovered.",
+            "- Use search_text when the user asks where a symbol, type, function, implementation, registry entry, tool mapping, or configuration key is defined.",
+            "- After search_text returns candidate files or lines, use read_file if file content is needed before answering.",
+            "- Do not use clarify when safe bounded read/search can reduce uncertainty.",
+            "- Do not use list_files or search_text before a self-contained new-file Change unless existing workspace evidence is required to choose the target or content.",
+        ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        lines.extend(
+            tool_path_selection_contract_lines()
+                .iter()
+                .map(|line| line.to_string()),
+        );
+        lines.extend(
+            ["", "Tool argument schemas:"]
+                .into_iter()
+                .map(str::to_owned),
         );
 
         for schema_line in tool_argument_schema_lines() {
@@ -102,12 +214,27 @@ impl SchemaPromptBuilder {
             "- workspace-relative path means non-empty, not absolute, no '..', and no control characters.",
             "",
             "Raw payload rules:",
+            "- Plain JSON is preferred for Explore tools, clarify, blocked, and short answers.",
+            "- Explore tools must not include AHREUM_PAYLOAD blocks because read/search/list arguments fit in JSON.",
             "- Do not put code or markdown answer bodies inside message.",
-            "- Use answer_payload_id and raw markdown payload blocks for code or markdown answers.",
             "- Do not put source, patch, or file body text inside JSON string fields.",
-            "- Use payload_id and raw payload blocks for source, patch, or file body text.",
-            "- If any AHREUM_PAYLOAD block is present, wrap the action JSON in AHREUM_ACTION tags.",
-            "- A payload_id reference must have exactly one matching raw payload block.",
+        ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        lines.extend(
+            payload_ordering_contract_lines()
+                .iter()
+                .map(|line| line.to_string()),
+        );
+        lines.extend(
+            [
+            "",
+            "Example Explore tool:",
+            r#"{"response_type":"tool","activity":"Explore","message":"Read Cargo.toml to inspect the package name.","tool_name":"read_file","arguments":{"path":"Cargo.toml","start_line":1,"max_lines":120},"reason":"workspace file evidence is required","tool_manifest_id":"ahreumcode.local-llm.tool-manifest.v1","tool_manifest_version":"1"}"#,
+            "",
+            "Example short answer:",
+            r#"{"response_type":"answer","activity":"None","message":"The package name is ahreumcode.","tool_manifest_id":"ahreumcode.local-llm.tool-manifest.v1","tool_manifest_version":"1"}"#,
             "",
             "Example payload answer:",
             r#"<AHREUM_ACTION>"#,
@@ -163,10 +290,18 @@ pub struct SchemaPromptBuildError {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_schema_prompt, validate_schema_prompt, SchemaPromptBuilder, TOOL_MANIFEST_ID,
-        TOOL_MANIFEST_VERSION,
+        attach_schema_prompt, payload_ordering_contract_lines, response_boundary_contract_lines,
+        tool_path_selection_contract_lines, validate_schema_prompt, SchemaPromptBuilder,
+        TOOL_MANIFEST_ID, TOOL_MANIFEST_VERSION,
     };
     use crate::llm::{LlmMessageRole, LlmMessageVisibility, MessageHistory};
+
+    fn expected_pair_lines() -> Vec<String> {
+        super::RESPONSE_ACTIVITY_PAIRS
+            .iter()
+            .map(|pair| format!("- {}", pair.rule_text()))
+            .collect()
+    }
 
     #[test]
     fn builds_schema_prompt_with_manifest_and_contract_rules() {
@@ -181,13 +316,51 @@ mod tests {
         assert!(prompt.content.contains("payload_id"));
         assert!(prompt.content.contains("read_file arguments"));
         assert!(!prompt.content.contains("find_files arguments"));
-        assert!(!prompt.content.contains("web_search arguments"));
+        assert!(prompt.content.contains("web_search arguments"));
+        assert!(prompt.content.contains("web_fetch arguments"));
         assert!(!prompt.content.contains("use_regex"));
+        assert!(prompt
+            .content
+            .contains("Allowed response_type/activity pairs:"));
+        for pair_line in expected_pair_lines() {
+            assert!(prompt.content.contains(&pair_line));
+        }
+        assert!(prompt.content.contains("Workspace evidence rules:"));
+        assert!(prompt.content.contains("Explore tool selection rules:"));
+        assert!(prompt.content.contains("do not answer from memory"));
+        assert!(prompt.content.contains("create new self-contained content"));
+        assert!(prompt.content.contains("do not Explore first"));
+        assert!(prompt
+            .content
+            .contains("Use search_text when the user asks where a symbol"));
+        assert!(prompt
+            .content
+            .contains("Use read_file when the user names an exact workspace file path"));
+        assert!(prompt
+            .content
+            .contains("Use list_files when the user asks for the current directory"));
+        assert!(prompt
+            .content
+            .contains("named file was not found at the direct path"));
+        assert!(prompt
+            .content
+            .contains("Use plain JSON without AHREUM_PAYLOAD for Explore tools"));
+        assert!(prompt
+            .content
+            .contains("Explore tools must not include AHREUM_PAYLOAD blocks"));
+        assert!(prompt.content.contains("Example Explore tool:"));
+        assert!(prompt.content.contains("Example short answer:"));
         assert!(prompt.content.contains("<AHREUM_ACTION>"));
         assert!(prompt.content.contains("</AHREUM_ACTION>"));
-        assert!(prompt.content.contains(
-            "If any AHREUM_PAYLOAD block is present, wrap the action JSON in AHREUM_ACTION tags."
-        ));
+        for boundary_line in response_boundary_contract_lines() {
+            assert!(prompt.content.contains(boundary_line));
+        }
+        for payload_line in payload_ordering_contract_lines() {
+            assert!(prompt.content.contains(payload_line));
+        }
+        for path_line in tool_path_selection_contract_lines() {
+            assert!(prompt.content.contains(path_line));
+        }
     }
 
     #[test]

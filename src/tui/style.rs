@@ -28,14 +28,6 @@ pub fn panel_bold() -> Style {
     panel().add_modifier(Modifier::BOLD)
 }
 
-pub fn persona_lead() -> Style {
-    cyan().add_modifier(Modifier::BOLD)
-}
-
-pub fn persona_speaker() -> Style {
-    muted().add_modifier(Modifier::BOLD)
-}
-
 pub fn persona_time() -> Style {
     Style::default().fg(Color::Rgb(110, 110, 110))
 }

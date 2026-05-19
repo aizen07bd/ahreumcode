@@ -1,16 +1,26 @@
+mod change;
 mod command_policy;
+mod command_runtime;
+mod diagnostics;
 mod explore;
 mod observation;
 mod path;
 mod permission;
 mod registry;
 mod runtime;
+mod web;
 
+pub use change::{
+    apply_approved_change, capture_change_precondition, ApprovedChange, ChangePrecondition,
+};
 pub use command_policy::{CommandPolicy, CommandPolicyDecision};
-pub use observation::{ObservationStatus, ToolObservation};
+pub use command_runtime::{execute_approved_command, ApprovedCommand};
+pub use diagnostics::{run_post_edit_diagnostics, PostEditDiagnosticRequest};
+pub use observation::{ObservationStatus, ToolErrorKind, ToolObservation};
 pub use permission::{PermissionDecision, PermissionDenial, PermissionGate, PermissionRequest};
 pub use registry::{
-    tool_argument_schema_lines, tool_spec, validate_tool_arguments, ToolName, ToolPermission,
-    ToolRuntimeSupport,
+    normalize_tool_arguments, redacted_tool_arguments, tool_argument_schema_lines, tool_spec,
+    ToolName, ToolPermission, ToolRuntimeSupport,
 };
 pub use runtime::{ToolCall, ToolRuntime};
+pub use web::{execute_approved_web, ApprovedWebRequest};

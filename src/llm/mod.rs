@@ -7,7 +7,9 @@ mod repair;
 mod response_parser;
 mod schema_prompt;
 
-pub use decision::{ChangePreview, DecisionGate, RuntimeDecision, RuntimeDecisionError};
+pub use decision::{
+    ChangePreview, DecisionGate, PatchOperation, RuntimeDecision, RuntimeDecisionError,
+};
 pub use diagnostics::{
     LlmDiagnostics, LlmDiagnosticsRuntime, LlmDiagnosticsSnapshot, LlmDiagnosticsState,
 };
@@ -22,3 +24,7 @@ pub use response_parser::{
     RuntimeResponseParseErrorKind,
 };
 pub use schema_prompt::{attach_schema_prompt, SchemaPrompt, SchemaPromptBuilder};
+pub(crate) use schema_prompt::{
+    payload_ordering_contract_lines, response_boundary_contract_lines,
+    tool_path_selection_contract_lines,
+};

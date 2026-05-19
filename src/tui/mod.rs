@@ -5,6 +5,8 @@ mod components;
 mod event_log;
 mod expanded_form;
 mod persona;
+mod persona_prompt;
+mod persona_runtime;
 mod runtime_request;
 mod runtime_workspace;
 mod scenes;

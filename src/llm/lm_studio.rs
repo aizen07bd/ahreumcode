@@ -13,11 +13,14 @@ use super::provider::{
     LlmChatStatus, LlmHealthFailure, LlmHealthReport, LlmHealthStatus,
 };
 
+const MIN_CHAT_TIMEOUT_MS: u64 = 180_000;
+
 pub struct LmStudioProvider {
     provider: String,
     base_url: String,
     model: String,
-    timeout: Duration,
+    health_timeout: Duration,
+    chat_timeout: Duration,
 }
 
 impl LmStudioProvider {
@@ -26,7 +29,8 @@ impl LmStudioProvider {
             provider: config.provider.active.clone(),
             base_url: config.provider.base_url.clone(),
             model: config.provider.model.clone(),
-            timeout: Duration::from_millis(u64::from(config.limits.command_timeout_ms)),
+            health_timeout: Duration::from_millis(u64::from(config.limits.command_timeout_ms)),
+            chat_timeout: chat_timeout_from_config(config),
         }
     }
 
@@ -81,7 +85,9 @@ impl LmStudioProvider {
     }
 
     fn request_models(&self, models_url: &str) -> Result<Vec<String>, LlmHealthFailure> {
-        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
+        let agent = ureq::AgentBuilder::new()
+            .timeout(self.health_timeout)
+            .build();
         let response = agent.get(models_url).call().map_err(map_provider_error)?;
         let raw = response.into_string().map_err(|source| {
             LlmHealthFailure::new(
@@ -99,7 +105,7 @@ impl LmStudioProvider {
         messages: &[LlmMessage],
     ) -> Result<String, LlmChatFailure> {
         let body = build_chat_request_body(&self.model, messages)?;
-        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
+        let agent = ureq::AgentBuilder::new().timeout(self.chat_timeout).build();
         let response = agent
             .post(chat_url)
             .set("Content-Type", "application/json")
@@ -114,6 +120,10 @@ impl LmStudioProvider {
 
         parse_chat_response(&raw)
     }
+}
+
+fn chat_timeout_from_config(config: &RuntimeConfig) -> Duration {
+    Duration::from_millis(u64::from(config.limits.command_timeout_ms).max(MIN_CHAT_TIMEOUT_MS))
 }
 
 pub fn build_models_request(base_url: &str) -> String {
@@ -270,11 +280,12 @@ struct ChatMessage {
 mod tests {
     use serde_json::Value;
 
+    use crate::config::RuntimeConfig;
     use crate::llm::{LlmMessage, LlmMessageRole, LlmMessageVisibility};
 
     use super::{
-        build_chat_request, build_chat_request_body, build_models_request, parse_chat_response,
-        parse_models_response,
+        build_chat_request, build_chat_request_body, build_models_request,
+        chat_timeout_from_config, parse_chat_response, parse_models_response, MIN_CHAT_TIMEOUT_MS,
     };
 
     #[test]
@@ -347,5 +358,15 @@ mod tests {
                 .expect_err("empty assistant content should fail");
 
         assert_eq!(failure.kind.as_str(), "model_empty_response");
+    }
+
+    #[test]
+    fn chat_timeout_has_local_llm_floor() {
+        let config = RuntimeConfig::default_local(".ahreumcode/config.toml".into());
+
+        assert_eq!(
+            chat_timeout_from_config(&config).as_millis(),
+            u128::from(MIN_CHAT_TIMEOUT_MS)
+        );
     }
 }

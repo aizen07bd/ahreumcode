@@ -28,6 +28,10 @@ pub enum ToolErrorKind {
     PathNotFound,
     NotAFile,
     NotADirectory,
+    PermissionError,
+    ExecutionError,
+    Timeout,
+    NetworkError,
     IoError,
     GitError,
 }
@@ -42,6 +46,10 @@ impl ToolErrorKind {
             Self::PathNotFound => "path_not_found",
             Self::NotAFile => "not_a_file",
             Self::NotADirectory => "not_a_directory",
+            Self::PermissionError => "permission_error",
+            Self::ExecutionError => "execution_error",
+            Self::Timeout => "timeout",
+            Self::NetworkError => "network_error",
             Self::IoError => "io_error",
             Self::GitError => "git_error",
         }
@@ -205,16 +213,35 @@ impl ToolObservation {
                 "next_range_hint: {}",
                 self.next_range_hint.as_deref().unwrap_or("-")
             ),
+            format!(
+                "error_kind: {}",
+                self.error_kind.map(|kind| kind.as_str()).unwrap_or("-")
+            ),
             format!("message: {}", self.message),
             "preview:".to_owned(),
         ];
         lines.extend(self.preview.iter().cloned());
         lines.push("</AHREUM_TOOL_OBSERVATION>".to_owned());
-        lines.push(
-            "Use this observation. Return answer if enough; otherwise return exactly one next tool candidate."
-                .to_owned(),
-        );
+        lines.push(self.follow_up_instruction().to_owned());
         lines.join("\n")
+    }
+
+    fn follow_up_instruction(&self) -> &'static str {
+        match (self.status, self.error_kind) {
+            (
+                ObservationStatus::Failed,
+                Some(
+                    ToolErrorKind::PathNotFound
+                    | ToolErrorKind::NotAFile
+                    | ToolErrorKind::NotADirectory,
+                ),
+            ) => {
+                "Path selection failed. Do not retry the same target_raw. Use list_files to discover filename/path candidates or structure; use search_text only for symbols, content, or configuration key locations before read_file."
+            }
+            _ => {
+                "Use this observation. Return answer if enough; otherwise return exactly one next tool candidate. If more of the same file is needed, use next_range_hint instead of repeating the same arguments."
+            }
+        }
     }
 }
 
@@ -228,7 +255,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::ToolObservation;
+    use super::{ToolErrorKind, ToolObservation};
 
     #[test]
     fn output_policy_writes_artifact_when_preview_is_truncated() {
@@ -281,6 +308,23 @@ mod tests {
         assert!(message.contains("tool_name: search_text"));
         assert!(message.contains("preview:\nREADME.md:1: hello"));
         assert!(message.contains("</AHREUM_TOOL_OBSERVATION>"));
+    }
+
+    #[test]
+    fn path_failure_history_message_directs_search_or_list_recovery() {
+        let observation = ToolObservation::failed(
+            "read_file",
+            Some("src/missing.rs".to_owned()),
+            ToolErrorKind::PathNotFound,
+            "path cannot be resolved",
+        );
+
+        let message = observation.history_message();
+
+        assert!(message.contains("error_kind: path_not_found"));
+        assert!(message.contains("Do not retry the same target_raw"));
+        assert!(message.contains("list_files"));
+        assert!(message.contains("search_text"));
     }
 
     fn test_artifact_root(name: &str) -> PathBuf {

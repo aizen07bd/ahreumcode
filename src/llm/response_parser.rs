@@ -30,10 +30,105 @@ const FORBIDDEN_RAW_ARGUMENT_FIELDS: &[&str] = &[
     "command_body",
 ];
 
+pub const RESPONSE_ACTIVITY_PAIRS: &[ResponseActivityPair] = &[
+    ResponseActivityPair {
+        response_type: "answer",
+        activities: &[Activity::None],
+    },
+    ResponseActivityPair {
+        response_type: "tool",
+        activities: &[
+            Activity::Explore,
+            Activity::Change,
+            Activity::Execute,
+            Activity::Configure,
+        ],
+    },
+    ResponseActivityPair {
+        response_type: "clarify",
+        activities: &[Activity::Ask],
+    },
+    ResponseActivityPair {
+        response_type: "blocked",
+        activities: &[Activity::None, Activity::Ask],
+    },
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResponseActivityPair {
+    pub response_type: &'static str,
+    pub activities: &'static [Activity],
+}
+
+impl ResponseActivityPair {
+    pub fn rule_text(self) -> String {
+        let activities = self
+            .activities
+            .iter()
+            .map(|activity| activity.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{} -> activity {}", self.response_type, activities)
+    }
+
+    fn allows(self, response_type: &str, activity: Activity) -> bool {
+        self.response_type == response_type && self.activities.contains(&activity)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedRuntimeResponse {
     pub response: RuntimeResponse,
     pub payloads: Vec<RuntimePayload>,
+}
+
+impl ParsedRuntimeResponse {
+    pub fn tool_candidate_for_logging(&self) -> Option<RuntimeToolCandidateLog<'_>> {
+        let RuntimeResponse::Tool(candidate) = &self.response else {
+            return None;
+        };
+        Some(RuntimeToolCandidateLog {
+            tool_name: &candidate.tool_name,
+            arguments: &candidate.arguments,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeToolCandidateLog<'a> {
+    pub tool_name: &'a str,
+    pub arguments: &'a Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeResponseEnvelopeDiagnostic {
+    pub(crate) response_type: Option<String>,
+    pub(crate) activity: Option<String>,
+    pub(crate) tool_name: Option<String>,
+}
+
+pub(crate) fn parse_runtime_response_envelope_diagnostic(
+    raw: &str,
+) -> Option<RuntimeResponseEnvelopeDiagnostic> {
+    let unwrapped = unwrap_whole_markdown_fence(raw.trim());
+    let (json_raw, _) = split_action_and_payloads(unwrapped).ok()?;
+    let value = serde_json::from_str::<Value>(json_raw.trim()).ok()?;
+    let envelope = value.as_object()?;
+
+    Some(RuntimeResponseEnvelopeDiagnostic {
+        response_type: envelope
+            .get("response_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        activity: envelope
+            .get("activity")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        tool_name: envelope
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,12 +344,7 @@ fn unwrap_whole_markdown_fence(raw: &str) -> &str {
 fn split_action_and_payloads(raw: &str) -> Result<(&str, &str), RuntimeResponseParseError> {
     let trimmed = raw.trim();
     if trimmed.starts_with(ACTION_OPEN) {
-        let close_index = trimmed
-            .find(ACTION_CLOSE)
-            .ok_or_else(|| RuntimeResponseParseError::partial("missing AHREUM_ACTION close tag"))?;
-        let json_raw = &trimmed[ACTION_OPEN.len()..close_index];
-        let payload_raw = &trimmed[close_index + ACTION_CLOSE.len()..];
-        return Ok((json_raw, payload_raw));
+        return split_leading_action(trimmed);
     }
 
     if trimmed.contains(ACTION_OPEN)
@@ -268,6 +358,15 @@ fn split_action_and_payloads(raw: &str) -> Result<(&str, &str), RuntimeResponseP
     }
 
     Ok((trimmed, ""))
+}
+
+fn split_leading_action(raw: &str) -> Result<(&str, &str), RuntimeResponseParseError> {
+    let close_index = raw
+        .find(ACTION_CLOSE)
+        .ok_or_else(|| RuntimeResponseParseError::partial("missing AHREUM_ACTION close tag"))?;
+    let json_raw = &raw[ACTION_OPEN.len()..close_index];
+    let payload_raw = &raw[close_index + ACTION_CLOSE.len()..];
+    Ok((json_raw, payload_raw))
 }
 
 fn parse_runtime_payloads(raw: &str) -> Result<Vec<RuntimePayload>, RuntimeResponseParseError> {
@@ -383,14 +482,10 @@ fn to_runtime_response(
     envelope: &Map<String, Value>,
     payloads: &[RuntimePayload],
 ) -> Result<RuntimeResponse, RuntimeResponseParseError> {
-    validate_manifest(envelope)?;
     let response_type = required_str(envelope, "response_type")?;
     let activity = Activity::parse(required_str(envelope, "activity")?)?;
     let message = required_str(envelope, "message")?.to_owned();
-    let manifest = RuntimeManifest {
-        tool_manifest_id: required_str(envelope, "tool_manifest_id")?.to_owned(),
-        tool_manifest_version: required_str(envelope, "tool_manifest_version")?.to_owned(),
-    };
+    let manifest = manifest_from_envelope(envelope)?;
 
     match response_type {
         "answer" => {
@@ -414,7 +509,7 @@ fn to_runtime_response(
                 message,
                 tool_name: required_str(envelope, "tool_name")?.to_owned(),
                 arguments,
-                reason: required_str(envelope, "reason")?.to_owned(),
+                reason: optional_str(envelope, "reason")?.unwrap_or("").to_owned(),
                 manifest,
             }))
         }
@@ -425,7 +520,7 @@ fn to_runtime_response(
             Ok(RuntimeResponse::Clarify(RuntimeClarification {
                 activity,
                 message,
-                reason: required_str(envelope, "reason")?.to_owned(),
+                reason: optional_str(envelope, "reason")?.unwrap_or("").to_owned(),
                 manifest,
             }))
         }
@@ -436,7 +531,7 @@ fn to_runtime_response(
             Ok(RuntimeResponse::Blocked(RuntimeBlocked {
                 activity,
                 message,
-                reason: required_str(envelope, "reason")?.to_owned(),
+                reason: optional_str(envelope, "reason")?.unwrap_or("").to_owned(),
                 manifest,
             }))
         }
@@ -446,7 +541,9 @@ fn to_runtime_response(
     }
 }
 
-fn validate_manifest(envelope: &Map<String, Value>) -> Result<(), RuntimeResponseParseError> {
+fn manifest_from_envelope(
+    envelope: &Map<String, Value>,
+) -> Result<RuntimeManifest, RuntimeResponseParseError> {
     let manifest_id = required_str(envelope, "tool_manifest_id")?;
     let manifest_version = required_str(envelope, "tool_manifest_version")?;
 
@@ -461,7 +558,10 @@ fn validate_manifest(envelope: &Map<String, Value>) -> Result<(), RuntimeRespons
         )));
     }
 
-    Ok(())
+    Ok(RuntimeManifest {
+        tool_manifest_id: manifest_id.to_owned(),
+        tool_manifest_version: manifest_version.to_owned(),
+    })
 }
 
 fn validate_allowed_fields(
@@ -484,18 +584,7 @@ fn validate_activity_pair(
     response_type: &str,
     activity: Activity,
 ) -> Result<(), RuntimeResponseParseError> {
-    let valid = match response_type {
-        "answer" => activity == Activity::None,
-        "tool" => matches!(
-            activity,
-            Activity::Explore | Activity::Change | Activity::Execute | Activity::Configure
-        ),
-        "clarify" => activity == Activity::Ask,
-        "blocked" => matches!(activity, Activity::None | Activity::Ask),
-        _ => false,
-    };
-
-    if valid {
+    if activity_pair_allowed(response_type, activity) {
         Ok(())
     } else {
         Err(RuntimeResponseParseError::schema(format!(
@@ -503,6 +592,12 @@ fn validate_activity_pair(
             activity.as_str()
         )))
     }
+}
+
+fn activity_pair_allowed(response_type: &str, activity: Activity) -> bool {
+    RESPONSE_ACTIVITY_PAIRS
+        .iter()
+        .any(|pair| pair.allows(response_type, activity))
 }
 
 fn validate_payload_reference(
@@ -653,7 +748,10 @@ fn required_object_value<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_runtime_response, Activity, RuntimeResponse, RuntimeResponseParseErrorKind};
+    use super::{
+        parse_runtime_response, parse_runtime_response_envelope_diagnostic, Activity,
+        RuntimeResponse, RuntimeResponseParseErrorKind,
+    };
 
     fn manifest_fields() -> &'static str {
         r#""tool_manifest_id":"ahreumcode.local-llm.tool-manifest.v1","tool_manifest_version":"1""#
@@ -675,6 +773,70 @@ mod tests {
         assert_eq!(answer.message, "ready");
         assert_eq!(answer.answer_payload_id, None);
         assert!(parsed.payloads.is_empty());
+    }
+
+    #[test]
+    fn parses_clarify_with_ask_activity() {
+        let raw = format!(
+            r#"{{"response_type":"clarify","activity":"Ask","message":"Which file should I inspect?","reason":"target is ambiguous",{}}}"#,
+            manifest_fields()
+        );
+
+        let parsed = parse_runtime_response(&raw).expect("clarify should parse");
+
+        let RuntimeResponse::Clarify(clarify) = parsed.response else {
+            panic!("expected clarify");
+        };
+        assert_eq!(clarify.activity, Activity::Ask);
+        assert_eq!(clarify.message, "Which file should I inspect?");
+        assert_eq!(clarify.reason, "target is ambiguous");
+    }
+
+    #[test]
+    fn rejects_missing_manifest_fields() {
+        let raw = r#"{"response_type":"answer","activity":"None","message":"ready"}"#;
+
+        let error = parse_runtime_response(raw).expect_err("manifest echo is required");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::SchemaValidationFailed
+        );
+        assert!(error.message.contains("missing field: tool_manifest_id"));
+    }
+
+    #[test]
+    fn parses_tool_without_reason_as_empty_metadata() {
+        let raw = format!(
+            r#"{{"response_type":"tool","activity":"Explore","message":"read","tool_name":"read_file","arguments":{{"path":"Cargo.toml","start_line":1,"max_lines":80}},{}}}"#,
+            manifest_fields()
+        );
+
+        let parsed = parse_runtime_response(&raw).expect("reason is metadata");
+
+        let RuntimeResponse::Tool(candidate) = parsed.response else {
+            panic!("expected tool candidate");
+        };
+        assert_eq!(candidate.reason, "");
+    }
+
+    #[test]
+    fn rejects_clarify_with_none_activity() {
+        let raw = format!(
+            r#"{{"response_type":"clarify","activity":"None","message":"Which file should I inspect?","reason":"target is ambiguous",{}}}"#,
+            manifest_fields()
+        );
+
+        let error = parse_runtime_response(&raw).expect_err("clarify/None should fail");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::SchemaValidationFailed
+        );
+        assert_eq!(
+            error.message,
+            "invalid response_type/activity pair: clarify/None"
+        );
     }
 
     #[test]
@@ -701,6 +863,28 @@ console.log(greeting);
         assert_eq!(answer.answer_payload_id.as_deref(), Some("answer_001"));
         assert_eq!(parsed.payloads[0].format, "markdown");
         assert!(parsed.payloads[0].body.contains("Hello, World!"));
+    }
+
+    #[test]
+    fn rejects_action_block_after_leading_text() {
+        let raw = format!(
+            r#"Here is the contract:
+<AHREUM_ACTION>
+{{"response_type":"answer","activity":"None","message":"ready",{} }}
+</AHREUM_ACTION>"#,
+            manifest_fields()
+        );
+
+        let error = parse_runtime_response(&raw).expect_err("leading text should fail");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::SchemaValidationFailed
+        );
+        assert_eq!(
+            error.message,
+            "framed response must start with AHREUM_ACTION"
+        );
     }
 
     #[test]
@@ -744,6 +928,31 @@ body
             RuntimeResponseParseErrorKind::PayloadValidationFailed
         );
         assert!(error.message.contains("markdown"));
+    }
+
+    #[test]
+    fn rejects_text_between_action_and_payload_blocks() {
+        let raw = format!(
+            r#"<AHREUM_ACTION>
+{{"response_type":"answer","activity":"None","message":"summary","answer_payload_id":"answer_001",{} }}
+</AHREUM_ACTION>
+summary:
+<AHREUM_PAYLOAD id="answer_001" format="markdown">
+body
+</AHREUM_PAYLOAD>"#,
+            manifest_fields()
+        );
+
+        let error = parse_runtime_response(&raw).expect_err("text between blocks should fail");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::PayloadValidationFailed
+        );
+        assert_eq!(
+            error.message,
+            "unexpected text outside AHREUM_PAYLOAD block"
+        );
     }
 
     #[test]
@@ -847,6 +1056,31 @@ body
             RuntimeResponseParseErrorKind::PayloadValidationFailed
         );
         assert!(error.message.contains("without payload_id"));
+    }
+
+    #[test]
+    fn extracts_envelope_diagnostic_from_payload_invalid_response() {
+        let raw = format!(
+            r#"<AHREUM_ACTION>
+{{"response_type":"tool","activity":"Explore","message":"read","tool_name":"read_file","arguments":{{"path":"Cargo.toml","start_line":1,"max_lines":120}},{} }}
+</AHREUM_ACTION>
+<AHREUM_PAYLOAD id="orphan" format="markdown">
+unused
+</AHREUM_PAYLOAD>"#,
+            manifest_fields()
+        );
+
+        let diagnostic = parse_runtime_response_envelope_diagnostic(&raw)
+            .expect("envelope diagnostic should parse");
+
+        assert_eq!(diagnostic.response_type.as_deref(), Some("tool"));
+        assert_eq!(diagnostic.activity.as_deref(), Some("Explore"));
+        assert_eq!(diagnostic.tool_name.as_deref(), Some("read_file"));
+        let error = parse_runtime_response(&raw).expect_err("payload remains invalid");
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::PayloadValidationFailed
+        );
     }
 
     #[test]

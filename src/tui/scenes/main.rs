@@ -20,7 +20,7 @@ use super::super::style;
 use super::super::working_process::WorkingProcessEvents;
 use super::super::workspace::WorkspaceEvents;
 use super::approval::handle_approval_event;
-use super::prompt::handle_prompt_event;
+use super::prompt::{handle_prompt_event, is_enter_event};
 
 pub struct MainAction {
     pub command_outcome: CommandInputOutcome,
@@ -94,7 +94,9 @@ pub fn handle_main_event(
         };
     }
 
-    if state.command_surface.open && !event.modifiers.contains(KeyModifiers::CONTROL) {
+    if state.command_surface.open
+        && (!event.modifiers.contains(KeyModifiers::CONTROL) || is_enter_event(&event))
+    {
         let command_outcome = handle_prompt_event(
             event,
             &mut state.main_input,
@@ -121,7 +123,7 @@ pub fn handle_main_event(
             MainAction::none()
         }
         KeyCode::Esc => MainAction::none(),
-        KeyCode::Enter => {
+        _ if is_enter_event(&event) => {
             if state.main_input.trim().is_empty() {
                 MainAction::none()
             } else {
@@ -152,6 +154,14 @@ pub fn handle_main_event(
             persona_events: PersonaEvents::none(),
             expanded_form_events: ExpandedFormEvents::none(),
         },
+        KeyCode::PageUp => {
+            state.scroll_persona(5);
+            MainAction::none()
+        }
+        KeyCode::PageDown => {
+            state.scroll_persona(-5);
+            MainAction::none()
+        }
         _ => {
             let command_outcome = handle_prompt_event(
                 event,
@@ -358,8 +368,17 @@ fn persona_panel_width(total_width: u16) -> u16 {
 }
 
 fn current_terminal_width() -> u16 {
-    crossterm::terminal::size()
+    let width = crossterm::terminal::size()
         .map(|(width, _)| width)
+        .unwrap_or_default();
+    if width > 0 {
+        return width;
+    }
+
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|width| *width > 0)
         .unwrap_or(MIN_PERSONA_TERMINAL_WIDTH)
 }
 

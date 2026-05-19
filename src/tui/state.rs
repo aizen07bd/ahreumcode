@@ -9,8 +9,8 @@ use super::expanded_form::{
     ExpandedFormEvents, ExpandedFormKind, ExpandedFormState, ExpandedFormSubmit,
 };
 use super::persona::{
-    PersonaBuffer, PersonaEvent, PersonaEvents, PersonaMessage, PersonaRendered,
-    MIN_PERSONA_TERMINAL_WIDTH,
+    runtime_event_catalog_is_complete, PersonaBuffer, PersonaEvent, PersonaEvents, PersonaMessage,
+    PersonaRendered, PersonaRuntimeEvent, MIN_PERSONA_TERMINAL_WIDTH,
 };
 use super::working_process::{WorkingPhase, WorkingProcessEvents, WorkingProcessState};
 use super::workspace::{WorkspaceBuffer, WorkspaceEvents, WorkspaceRendered};
@@ -57,6 +57,7 @@ impl TuiState {
         config_source: ConfigLoadSource,
         config_warning: Option<&str>,
     ) -> Self {
+        debug_assert!(runtime_event_catalog_is_complete());
         Self {
             scene: Scene::Intro,
             intro_input: String::new(),
@@ -247,6 +248,12 @@ impl TuiState {
         self.workspace.scroll(delta)
     }
 
+    pub fn scroll_persona(&mut self, delta: isize) {
+        if self.persona_panel == PersonaPanelState::Full {
+            self.persona.scroll(delta);
+        }
+    }
+
     pub fn take_workspace_render_event(&mut self) -> Option<WorkspaceRendered> {
         self.workspace.take_render_event()
     }
@@ -302,6 +309,29 @@ impl TuiState {
 
     pub fn take_persona_render_event(&mut self) -> Option<PersonaRendered> {
         self.persona.take_render_event()
+    }
+
+    pub fn record_persona_runtime_event(&mut self, event: PersonaRuntimeEvent) {
+        let _ = event;
+    }
+
+    #[cfg(test)]
+    pub fn record_persona_conversation(&mut self, messages: Vec<PersonaMessage>) {
+        if self.persona_panel != PersonaPanelState::Full {
+            return;
+        }
+
+        for message in messages {
+            self.persona.push_message(message);
+        }
+    }
+
+    pub fn record_persona_message(&mut self, message: PersonaMessage) {
+        if self.persona_panel != PersonaPanelState::Full {
+            return;
+        }
+
+        self.persona.push_message(message);
     }
 
     fn open_expanded_form(&mut self, kind: ExpandedFormKind) -> CommandDispatchOutcome {
@@ -407,11 +437,6 @@ impl TuiState {
             self.workspace
                 .push_manager_message("요청을 작업 흐름으로 정리했습니다."),
         );
-        if self.persona_panel == PersonaPanelState::Full {
-            self.persona.push_message(PersonaMessage::team_lead(
-                "요청을 확인했습니다. 작업 흐름은 왼쪽 기록과 분리해서 지켜보겠습니다.",
-            ));
-        }
 
         PromptSubmitOutcome {
             working_process_events,
@@ -587,5 +612,133 @@ fn provider_display_name(provider: &str) -> &str {
         product::DEFAULT_PROVIDER_DISPLAY
     } else {
         provider
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::tui::persona::{PersonaRuntimeEvent, PersonaSpeaker, PersonaSpeakerRole};
+
+    fn state_with_persona() -> TuiState {
+        let config = RuntimeConfig::default_local(PathBuf::from(".ahreumcode/config.toml"));
+        let mut state = TuiState::main(
+            "workspace".to_owned(),
+            &config,
+            ConfigLoadSource::DefaultApplied,
+            None,
+        );
+        state.persona_panel = PersonaPanelState::Full;
+        state
+    }
+
+    #[test]
+    fn persona_does_not_convert_working_events_to_messages() {
+        let mut state = state_with_persona();
+        state.pending_prompt = Some("Cargo.toml을 확인해줘".to_owned());
+
+        state.start_working_process_for_prompt();
+        state.set_working_process_phase(WorkingPhase::Validate, "runtime validation");
+        state.complete_working_process();
+
+        assert!(state.persona.messages().is_empty());
+        assert!(state.take_persona_render_event().is_none());
+    }
+
+    #[test]
+    fn persona_records_fixed_team_conversation_only_when_provided() {
+        let mut state = state_with_persona();
+
+        state.record_persona_conversation(vec![
+            PersonaMessage::from_speaker(PersonaSpeaker::Lead, "요청을 먼저 정리하겠습니다."),
+            PersonaMessage::from_speaker(PersonaSpeaker::Planning, "범위를 확인하겠습니다."),
+            PersonaMessage::from_speaker(
+                PersonaSpeaker::Documentation,
+                "결정 사항만 기록하겠습니다.",
+            ),
+        ]);
+
+        let messages = state.persona.messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role(), PersonaSpeakerRole::Lead);
+        assert_eq!(messages[1].role(), PersonaSpeakerRole::Member);
+        assert_eq!(messages[1].speaker, PersonaSpeaker::Planning);
+        assert_eq!(messages[2].speaker, PersonaSpeaker::Documentation);
+        assert!(state.take_persona_render_event().is_some());
+    }
+
+    #[test]
+    fn persona_stays_silent_when_panel_is_off() {
+        let config = RuntimeConfig::default_local(PathBuf::from(".ahreumcode/config.toml"));
+        let mut state = TuiState::main(
+            "workspace".to_owned(),
+            &config,
+            ConfigLoadSource::DefaultApplied,
+            None,
+        );
+        state.pending_prompt = Some("상태를 알려줘".to_owned());
+
+        state.start_working_process_for_prompt();
+        state.set_working_process_phase(WorkingPhase::Execute, "tool execution");
+        state.complete_working_process();
+
+        assert!(state.persona.messages().is_empty());
+        assert!(state.take_persona_render_event().is_none());
+    }
+
+    #[test]
+    fn persona_records_llm_and_repair_runtime_events() {
+        let mut state = state_with_persona();
+
+        state.record_persona_runtime_event(PersonaRuntimeEvent::LlmRequestStarted);
+        state.record_persona_runtime_event(PersonaRuntimeEvent::RuntimeResponseParsed);
+        state.record_persona_runtime_event(PersonaRuntimeEvent::RepairRequestStarted);
+
+        assert!(state.persona.messages().is_empty());
+        assert!(state.take_persona_render_event().is_none());
+    }
+
+    #[test]
+    fn persona_ignores_runtime_events_that_must_stay_in_logs() {
+        let mut state = state_with_persona();
+
+        state.record_persona_runtime_event(PersonaRuntimeEvent::RawResponseReceived);
+        state.record_persona_runtime_event(PersonaRuntimeEvent::FinalAnswerRecorded);
+        state.record_persona_runtime_event(PersonaRuntimeEvent::ToolObservationAttached);
+
+        assert!(state.persona.messages().is_empty());
+        assert!(state.take_persona_render_event().is_none());
+    }
+
+    #[test]
+    fn persona_records_tool_and_permission_runtime_events() {
+        let mut state = state_with_persona();
+
+        state.record_persona_runtime_event(PersonaRuntimeEvent::ToolCandidateClassified);
+        state.record_persona_runtime_event(PersonaRuntimeEvent::ToolPermissionAllowed);
+        state.record_persona_runtime_event(PersonaRuntimeEvent::ToolExecutionSucceeded);
+        state.record_persona_runtime_event(PersonaRuntimeEvent::ToolLoopDuplicateRedirected);
+
+        assert!(state.persona.messages().is_empty());
+        assert!(state.take_persona_render_event().is_none());
+    }
+
+    #[test]
+    fn persona_runtime_events_stay_silent_when_panel_is_off() {
+        let config = RuntimeConfig::default_local(PathBuf::from(".ahreumcode/config.toml"));
+        let mut state = TuiState::main(
+            "workspace".to_owned(),
+            &config,
+            ConfigLoadSource::DefaultApplied,
+            None,
+        );
+
+        state.record_persona_runtime_event(PersonaRuntimeEvent::LlmResponseReceived);
+        state.record_persona_runtime_event(PersonaRuntimeEvent::RepairLimitReached);
+
+        assert!(state.persona.messages().is_empty());
+        assert!(state.take_persona_render_event().is_none());
     }
 }

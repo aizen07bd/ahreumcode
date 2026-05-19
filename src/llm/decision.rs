@@ -1,12 +1,8 @@
-use serde_json::{Map, Value};
-use std::path::{Component, Path};
-
 use super::response_parser::{
     Activity, ParsedRuntimeResponse, RuntimeAnswer, RuntimeResponse, RuntimeToolCandidate,
 };
-use crate::tool::{
-    tool_spec, validate_tool_arguments as validate_registry_tool_arguments, ToolName,
-};
+use crate::tool::{normalize_tool_arguments, tool_spec, ToolName};
+use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeDecision {
@@ -44,6 +40,7 @@ pub struct ChangePreview {
     pub operation: PatchOperation,
     pub additions: u16,
     pub deletions: u16,
+    pub payload_body: String,
 }
 
 impl ChangePreview {
@@ -194,20 +191,20 @@ fn classify_tool_candidate(
     parsed: &ParsedRuntimeResponse,
 ) -> Result<RuntimeDecision, RuntimeDecisionError> {
     validate_tool_activity(candidate)?;
-    validate_tool_arguments(candidate)?;
+    let arguments = normalize_candidate_arguments(candidate)?;
 
     match candidate.activity {
         Activity::Explore => Ok(RuntimeDecision::ToolCandidatePending {
             activity: candidate.activity,
             tool_name: candidate.tool_name.clone(),
-            arguments: candidate.arguments.clone(),
+            arguments,
             summary: candidate.message.clone(),
         }),
-        Activity::Change => classify_change_candidate(candidate, parsed),
+        Activity::Change => classify_change_candidate(candidate, parsed, arguments),
         Activity::Execute | Activity::Configure => Ok(RuntimeDecision::ApprovalNeeded {
             activity: candidate.activity,
             tool_name: candidate.tool_name.clone(),
-            arguments: candidate.arguments.clone(),
+            arguments,
             change_preview: None,
             reason: candidate.reason.clone(),
         }),
@@ -221,10 +218,11 @@ fn classify_tool_candidate(
 fn classify_change_candidate(
     candidate: &RuntimeToolCandidate,
     parsed: &ParsedRuntimeResponse,
+    arguments: Value,
 ) -> Result<RuntimeDecision, RuntimeDecisionError> {
     let mut change_preview = None;
     if candidate.tool_name == ToolName::ApplyPatch.as_str() {
-        let payload_id = required_str(arguments_object(candidate)?, "payload_id")?;
+        let payload_id = required_str(arguments_value_object(&arguments)?, "payload_id")?;
         let payload = parsed
             .payloads
             .iter()
@@ -254,7 +252,7 @@ fn classify_change_candidate(
     Ok(RuntimeDecision::ApprovalNeeded {
         activity: candidate.activity,
         tool_name: candidate.tool_name.clone(),
-        arguments: candidate.arguments.clone(),
+        arguments,
         change_preview,
         reason: candidate.reason.clone(),
     })
@@ -275,7 +273,9 @@ fn validate_tool_activity(candidate: &RuntimeToolCandidate) -> Result<(), Runtim
     Ok(())
 }
 
-fn validate_tool_arguments(candidate: &RuntimeToolCandidate) -> Result<(), RuntimeDecisionError> {
+fn normalize_candidate_arguments(
+    candidate: &RuntimeToolCandidate,
+) -> Result<Value, RuntimeDecisionError> {
     let Some(tool_name) = ToolName::parse(candidate.tool_name.as_str()) else {
         return Err(RuntimeDecisionError::invalid_tool(format!(
             "unknown tool: {}",
@@ -283,7 +283,7 @@ fn validate_tool_arguments(candidate: &RuntimeToolCandidate) -> Result<(), Runti
         )));
     };
 
-    validate_registry_tool_arguments(tool_name, &candidate.arguments)
+    normalize_tool_arguments(tool_name, &candidate.arguments)
         .map_err(RuntimeDecisionError::invalid_arguments)
 }
 
@@ -291,32 +291,12 @@ fn validate_non_empty_plain_string(value: &str) -> bool {
     !value.is_empty() && value.trim() == value && !contains_control_char(value)
 }
 
-fn validate_workspace_relative_path(value: &str) -> bool {
-    if !validate_non_empty_plain_string(value) {
-        return false;
-    }
-
-    let path = Path::new(value);
-    if path.is_absolute() {
-        return false;
-    }
-
-    path.components().all(|component| {
-        !matches!(
-            component,
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir
-        )
-    })
-}
-
 fn contains_control_char(value: &str) -> bool {
     value.chars().any(char::is_control)
 }
 
-fn arguments_object(
-    candidate: &RuntimeToolCandidate,
-) -> Result<&Map<String, Value>, RuntimeDecisionError> {
-    candidate.arguments.as_object().ok_or_else(|| {
+fn arguments_value_object(arguments: &Value) -> Result<&Map<String, Value>, RuntimeDecisionError> {
+    arguments.as_object().ok_or_else(|| {
         RuntimeDecisionError::invalid_arguments("tool arguments must be a JSON object")
     })
 }
@@ -376,9 +356,9 @@ fn parse_apply_patch_preview(
             "apply_patch payload target was not found",
         ));
     };
-    if !validate_workspace_relative_path(&target_path) {
+    if !validate_non_empty_plain_string(&target_path) {
         return Err(RuntimeDecisionError::invalid_arguments(format!(
-            "apply_patch target must be workspace-relative: {target_path}"
+            "apply_patch target must be a non-empty path string: {target_path}"
         )));
     }
 
@@ -391,6 +371,7 @@ fn parse_apply_patch_preview(
         operation,
         additions,
         deletions,
+        payload_body: body.to_owned(),
     })
 }
 
@@ -484,6 +465,51 @@ mod tests {
         let decision = DecisionGate::classify(&parsed).expect("tool should classify");
 
         assert_eq!(decision.kind(), "tool_candidate_pending");
+    }
+
+    #[test]
+    fn rejects_integer_string_tool_arguments_before_runtime() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Explore,
+                message: "search".to_owned(),
+                tool_name: "search_text".to_owned(),
+                arguments: json!({"path":"src","query":"RuntimeDecision","max_results":"20"}),
+                reason: "inspect".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("numeric string should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+        assert_eq!(error.message, "invalid argument type or value: max_results");
+    }
+
+    #[test]
+    fn fills_explore_bound_defaults_before_runtime() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Explore,
+                message: "read".to_owned(),
+                tool_name: "read_file".to_owned(),
+                arguments: json!({"path":"Cargo.toml"}),
+                reason: "inspect".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("bounds should default");
+
+        let RuntimeDecision::ToolCandidatePending { arguments, .. } = decision else {
+            panic!("expected pending tool");
+        };
+        assert_eq!(
+            arguments,
+            json!({"path":"Cargo.toml","start_line":1,"max_lines":120})
+        );
     }
 
     #[test]
@@ -614,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_parent_directory_tool_path() {
+    fn preserves_parent_directory_tool_path_for_permission_policy() {
         let parsed = ParsedRuntimeResponse {
             response: RuntimeResponse::Tool(RuntimeToolCandidate {
                 activity: Activity::Explore,
@@ -627,9 +653,10 @@ mod tests {
             payloads: Vec::new(),
         };
 
-        let error = DecisionGate::classify(&parsed).expect_err("parent path should fail");
+        let decision =
+            DecisionGate::classify(&parsed).expect("external path policy should classify later");
 
-        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+        assert_eq!(decision.kind(), "tool_candidate_pending");
     }
 
     #[test]
@@ -690,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unregistered_web_tool() {
+    fn classifies_registered_web_tool_as_pending() {
         let parsed = ParsedRuntimeResponse {
             response: RuntimeResponse::Tool(RuntimeToolCandidate {
                 activity: Activity::Explore,
@@ -703,9 +730,9 @@ mod tests {
             payloads: Vec::new(),
         };
 
-        let error = DecisionGate::classify(&parsed).expect_err("unregistered tool should fail");
+        let decision = DecisionGate::classify(&parsed).expect("registered web tool should pass");
 
-        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidToolCandidate);
+        assert_eq!(decision.kind(), "tool_candidate_pending");
     }
 
     #[test]

@@ -103,11 +103,16 @@ pub(super) fn record_runtime_decision(
     }
 }
 
-pub(super) fn record_tool_loop_limit(state: &mut TuiState, reason: &str) -> WorkspaceEvents {
+pub(super) fn record_tool_loop_limit(
+    state: &mut TuiState,
+    reason: &str,
+    diagnosis: &str,
+) -> WorkspaceEvents {
     let mut events = state.record_system_notice(format!("tool loop stopped: {reason}"));
     events.extend(
         state.record_system_notice("도구 반복 제한에 도달해 추가 LLM 요청을 보내지 않습니다."),
     );
+    events.extend(state.record_system_notice(format!("tool loop diagnosis: {diagnosis}")));
     events
 }
 

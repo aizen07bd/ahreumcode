@@ -232,7 +232,16 @@ fn centered_width(area: Rect, max_width: u16) -> Rect {
 }
 
 fn current_terminal_width() -> u16 {
-    crossterm::terminal::size()
+    let width = crossterm::terminal::size()
         .map(|(width, _)| width)
+        .unwrap_or_default();
+    if width > 0 {
+        return width;
+    }
+
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|width| *width > 0)
         .unwrap_or(MIN_PERSONA_TERMINAL_WIDTH)
 }
