@@ -11,7 +11,8 @@ mod runtime;
 mod web;
 
 pub use change::{
-    apply_approved_change, capture_change_precondition, ApprovedChange, ChangePrecondition,
+    apply_approved_change, capture_change_precondition, validate_approved_change, ApprovedChange,
+    ChangePrecondition,
 };
 pub use command_policy::{CommandPolicy, CommandPolicyDecision};
 pub use command_runtime::{execute_approved_command, ApprovedCommand};

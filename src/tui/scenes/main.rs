@@ -62,18 +62,6 @@ pub fn handle_main_event(
     state: &mut TuiState,
     registry: &CommandRegistry,
 ) -> MainAction {
-    if state.working_process.is_active() && matches!(event.code, KeyCode::Esc) {
-        let runtime_outcome = state.cancel_working_process();
-        return MainAction {
-            command_outcome: CommandInputOutcome::none(),
-            approval_outcome: ApprovalInputOutcome::none(),
-            working_process_events: runtime_outcome.working_process_events,
-            workspace_events: runtime_outcome.workspace_events,
-            persona_events: PersonaEvents::none(),
-            expanded_form_events: ExpandedFormEvents::none(),
-        };
-    }
-
     if state.expanded_form.open && !event.modifiers.contains(KeyModifiers::CONTROL) {
         return handle_expanded_form_event(event, state);
     }
@@ -89,6 +77,18 @@ pub fn handle_main_event(
             approval_outcome,
             working_process_events: WorkingProcessEvents::none(),
             workspace_events,
+            persona_events: PersonaEvents::none(),
+            expanded_form_events: ExpandedFormEvents::none(),
+        };
+    }
+
+    if state.working_process.is_active() && matches!(event.code, KeyCode::Esc) {
+        let runtime_outcome = state.cancel_working_process();
+        return MainAction {
+            command_outcome: CommandInputOutcome::none(),
+            approval_outcome: ApprovalInputOutcome::none(),
+            working_process_events: runtime_outcome.working_process_events,
+            workspace_events: runtime_outcome.workspace_events,
             persona_events: PersonaEvents::none(),
             expanded_form_events: ExpandedFormEvents::none(),
         };

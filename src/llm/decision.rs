@@ -1,5 +1,8 @@
+use std::borrow::Cow;
+
 use super::response_parser::{
-    Activity, ParsedRuntimeResponse, RuntimeAnswer, RuntimeResponse, RuntimeToolCandidate,
+    unwrap_whole_markdown_fence, Activity, ParsedRuntimeResponse, RuntimeAnswer, RuntimeResponse,
+    RuntimeToolCandidate,
 };
 use crate::tool::{normalize_tool_arguments, tool_spec, ToolName};
 use serde_json::{Map, Value};
@@ -239,14 +242,14 @@ fn classify_change_candidate(
             )));
         }
 
-        let target_count = count_apply_patch_targets(&payload.body);
+        let patch_body = normalize_apply_patch_payload_body(&payload.body);
+        let target_count = count_apply_patch_targets(patch_body.as_ref());
         if target_count != 1 {
-            return Ok(RuntimeDecision::Clarify {
-                message: "Patch target must be exactly one file before approval.".to_owned(),
-                reason: format!("apply_patch target count was {target_count}"),
-            });
+            return Err(RuntimeDecisionError::invalid_arguments(format!(
+                "apply_patch target count must be exactly one, got {target_count}"
+            )));
         }
-        change_preview = Some(parse_apply_patch_preview(payload_id, &payload.body)?);
+        change_preview = Some(parse_apply_patch_preview(payload_id, patch_body.as_ref())?);
     }
 
     Ok(RuntimeDecision::ApprovalNeeded {
@@ -321,6 +324,41 @@ fn count_apply_patch_targets(body: &str) -> usize {
         .count()
 }
 
+fn normalize_apply_patch_payload_body(body: &str) -> Cow<'_, str> {
+    let trimmed = unwrap_whole_markdown_fence(body.trim()).trim();
+    let Some(start) = trimmed.find("*** Begin Patch") else {
+        let Some(target_start) = first_apply_patch_target_index(trimmed) else {
+            return Cow::Borrowed(trimmed);
+        };
+        let patch_body = if let Some(end_start) = trimmed[target_start..].rfind("*** End Patch") {
+            let end = target_start + end_start;
+            trimmed[target_start..end].trim()
+        } else {
+            trimmed[target_start..].trim()
+        };
+        if count_apply_patch_targets(patch_body) == 1 {
+            return Cow::Owned(format!("*** Begin Patch\n{patch_body}\n*** End Patch"));
+        }
+        return Cow::Borrowed(trimmed);
+    };
+    let Some(end_start) = trimmed[start..].rfind("*** End Patch") else {
+        let patch_body = trimmed[start..].trim();
+        if count_apply_patch_targets(patch_body) == 1 {
+            return Cow::Owned(format!("{patch_body}\n*** End Patch"));
+        }
+        return Cow::Borrowed(trimmed);
+    };
+    let end = start + end_start + "*** End Patch".len();
+    Cow::Borrowed(trimmed[start..end].trim())
+}
+
+fn first_apply_patch_target_index(body: &str) -> Option<usize> {
+    ["*** Add File: ", "*** Update File: ", "*** Delete File: "]
+        .into_iter()
+        .filter_map(|marker| body.find(marker))
+        .min()
+}
+
 fn parse_apply_patch_preview(
     payload_id: &str,
     body: &str,
@@ -333,7 +371,7 @@ fn parse_apply_patch_preview(
     }
 
     let mut target = None;
-    for line in &lines {
+    for (index, line) in lines.iter().enumerate() {
         let candidate = line
             .strip_prefix("*** Add File: ")
             .map(|path| (PatchOperation::Add, path))
@@ -346,12 +384,12 @@ fn parse_apply_patch_preview(
                     .map(|path| (PatchOperation::Delete, path))
             });
         if let Some((operation, path)) = candidate {
-            target = Some((operation, path.to_owned()));
+            target = Some((operation, path.to_owned(), index));
             break;
         }
     }
 
-    let Some((operation, target_path)) = target else {
+    let Some((operation, target_path, target_index)) = target else {
         return Err(RuntimeDecisionError::invalid_arguments(
             "apply_patch payload target was not found",
         ));
@@ -364,6 +402,12 @@ fn parse_apply_patch_preview(
 
     let additions = count_patch_lines(&lines, '+')?;
     let deletions = count_patch_lines(&lines, '-')?;
+    if operation == PatchOperation::Update && additions == 0 && deletions == 0 {
+        return Err(RuntimeDecisionError::invalid_arguments(
+            "Update File patch must include at least one added or removed line",
+        ));
+    }
+    validate_apply_patch_operation_body(operation, &lines, target_index)?;
 
     Ok(ChangePreview {
         payload_id: payload_id.to_owned(),
@@ -373,6 +417,23 @@ fn parse_apply_patch_preview(
         deletions,
         payload_body: body.to_owned(),
     })
+}
+
+fn validate_apply_patch_operation_body(
+    operation: PatchOperation,
+    lines: &[&str],
+    target_index: usize,
+) -> Result<(), RuntimeDecisionError> {
+    if operation != PatchOperation::Delete {
+        return Ok(());
+    }
+    let body_lines = &lines[target_index + 1..lines.len() - 1];
+    if body_lines.is_empty() {
+        return Ok(());
+    }
+    Err(RuntimeDecisionError::invalid_arguments(
+        "Delete File patch must not include patch body lines",
+    ))
 }
 
 fn count_patch_lines(lines: &[&str], marker: char) -> Result<u16, RuntimeDecisionError> {
@@ -526,7 +587,9 @@ mod tests {
             payloads: vec![RuntimePayload {
                 id: "patch_001".to_owned(),
                 format: "apply_patch".to_owned(),
-                body: "*** Begin Patch\n*** Update File: src/main.rs\n*** End Patch".to_owned(),
+                body:
+                    "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"
+                        .to_owned(),
             }],
         };
 
@@ -541,8 +604,8 @@ mod tests {
         };
         assert_eq!(preview.target_path, "src/main.rs");
         assert_eq!(preview.operation, PatchOperation::Update);
-        assert_eq!(preview.additions, 0);
-        assert_eq!(preview.deletions, 0);
+        assert_eq!(preview.additions, 1);
+        assert_eq!(preview.deletions, 1);
     }
 
     #[test]
@@ -579,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_apply_patch_payload() {
+    fn rejects_noop_update_patch_before_approval() {
         let parsed = ParsedRuntimeResponse {
             response: RuntimeResponse::Tool(RuntimeToolCandidate {
                 activity: Activity::Change,
@@ -592,13 +655,306 @@ mod tests {
             payloads: vec![RuntimePayload {
                 id: "patch_001".to_owned(),
                 format: "apply_patch".to_owned(),
-                body: "*** Update File: src/main.rs\n*** End Patch".to_owned(),
+                body: concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: sample.txt\n",
+                    "@@\n",
+                    " existing line\n",
+                    "*** End Patch"
+                )
+                .to_owned(),
             }],
         };
 
-        let error = DecisionGate::classify(&parsed).expect_err("malformed patch should fail");
+        let error = DecisionGate::classify(&parsed).expect_err("noop update should fail");
 
         assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+        assert!(error.message.contains("at least one added or removed line"));
+    }
+
+    #[test]
+    fn trims_apply_patch_payload_outer_whitespace_before_preview() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body:
+                    "\n  *** Begin Patch\n*** Add File: fixture-target.txt\n+hello\n*** End Patch  \n"
+                        .to_owned(),
+            }],
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("change should classify");
+
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce preview");
+        };
+        assert_eq!(preview.target_path, "fixture-target.txt");
+        assert!(preview.payload_body.starts_with("*** Begin Patch"));
+        assert!(preview.payload_body.ends_with("*** End Patch"));
+    }
+
+    #[test]
+    fn unwraps_apply_patch_payload_whole_markdown_fence_before_preview() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body: concat!(
+                    "```patch\n",
+                    "*** Begin Patch\n",
+                    "*** Add File: fixture-target.txt\n",
+                    "+hello\n",
+                    "*** End Patch\n",
+                    "```"
+                )
+                .to_owned(),
+            }],
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("change should classify");
+
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce preview");
+        };
+        assert_eq!(preview.target_path, "fixture-target.txt");
+        assert!(preview.payload_body.starts_with("*** Begin Patch"));
+    }
+
+    #[test]
+    fn extracts_apply_patch_marker_segment_from_payload_wrapper_text() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body: concat!(
+                    "patch body:\n",
+                    "*** Begin Patch\n",
+                    "*** Add File: fixture-target.txt\n",
+                    "+hello\n",
+                    "*** End Patch\n",
+                    "done"
+                )
+                .to_owned(),
+            }],
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("change should classify");
+
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce preview");
+        };
+        assert_eq!(preview.target_path, "fixture-target.txt");
+        assert_eq!(
+            preview.payload_body,
+            "*** Begin Patch\n*** Add File: fixture-target.txt\n+hello\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn wraps_single_target_apply_patch_payload_body_without_outer_markers() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body: concat!("*** Add File: fixture-target.txt\n", "+hello\n", "+world")
+                    .to_owned(),
+            }],
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("change should classify");
+
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce preview");
+        };
+        assert_eq!(preview.target_path, "fixture-target.txt");
+        assert_eq!(preview.additions, 2);
+        assert_eq!(
+            preview.payload_body,
+            "*** Begin Patch\n*** Add File: fixture-target.txt\n+hello\n+world\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn wraps_single_target_apply_patch_payload_body_missing_begin_marker() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body: "*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch".to_owned(),
+            }],
+        };
+
+        let decision =
+            DecisionGate::classify(&parsed).expect("single target patch should classify");
+
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce preview");
+        };
+        assert_eq!(
+            preview.payload_body,
+            "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn completes_single_target_apply_patch_payload_body_missing_end_marker() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body: "*** Begin Patch\n*** Add File: fixture-target.txt\n+hello".to_owned(),
+            }],
+        };
+
+        let decision =
+            DecisionGate::classify(&parsed).expect("single target patch should classify");
+
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce preview");
+        };
+        assert_eq!(
+            preview.payload_body,
+            "*** Begin Patch\n*** Add File: fixture-target.txt\n+hello\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn rejects_multi_target_apply_patch_as_repairable_arguments() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body: concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: src/main.rs\n",
+                    "@@\n",
+                    "-old\n",
+                    "+new\n",
+                    "*** Update File: src/lib.rs\n",
+                    "@@\n",
+                    "-old\n",
+                    "+new\n",
+                    "*** End Patch"
+                )
+                .to_owned(),
+            }],
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("multi target patch should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+        assert!(error.message.contains("target count must be exactly one"));
+    }
+
+    #[test]
+    fn rejects_delete_patch_with_body_lines_before_approval() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body: concat!(
+                    "*** Begin Patch\n",
+                    "*** Delete File: src/main.rs\n",
+                    "-old\n",
+                    "*** End Patch"
+                )
+                .to_owned(),
+            }],
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("delete body should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+        assert!(error.message.contains("must not include patch body lines"));
     }
 
     #[test]

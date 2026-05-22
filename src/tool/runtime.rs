@@ -99,11 +99,12 @@ impl ToolRuntime {
             ),
         };
         let artifact_name = call.artifact_name();
-        if let Err(error) = observation.apply_output_policy(
-            self.limits.preview_line_limit,
-            &self.artifact_root,
-            &artifact_name,
-        ) {
+        let preview_line_limit = self
+            .limits
+            .preview_line_limit_for_tool(&observation.tool_name);
+        if let Err(error) =
+            observation.apply_output_policy(preview_line_limit, &self.artifact_root, &artifact_name)
+        {
             return ToolObservation::failed(
                 observation.tool_name,
                 observation.target_raw,
@@ -217,12 +218,24 @@ impl ToolRuntime {
 #[derive(Clone)]
 struct ToolRuntimeLimits {
     preview_line_limit: usize,
+    list_files_preview_line_limit: usize,
 }
 
 impl Default for ToolRuntimeLimits {
     fn default() -> Self {
         Self {
             preview_line_limit: DEFAULT_PREVIEW_LINE_LIMIT,
+            list_files_preview_line_limit: 120,
+        }
+    }
+}
+
+impl ToolRuntimeLimits {
+    fn preview_line_limit_for_tool(&self, tool_name: &str) -> usize {
+        if tool_name == ToolName::ListFiles.as_str() {
+            self.list_files_preview_line_limit
+        } else {
+            self.preview_line_limit
         }
     }
 }

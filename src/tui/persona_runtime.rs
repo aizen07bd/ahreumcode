@@ -546,6 +546,7 @@ impl PersonaRuntime {
         &self.team_tasks
     }
 
+    #[cfg(test)]
     pub fn has_pending_turns(&self) -> bool {
         !self.pending_turns.is_empty()
     }
@@ -677,6 +678,9 @@ impl PersonaRuntime {
             if scheduled.len() >= 4 {
                 break;
             }
+        }
+        if scheduled.is_empty() {
+            scheduled.extend(fixed_member_speakers());
         }
 
         for speaker in scheduled {
@@ -873,6 +877,15 @@ impl PersonaRuntime {
             session.status = PersonaSessionStatus::WaitingForModel;
         }
     }
+}
+
+fn fixed_member_speakers() -> [PersonaSpeaker; 4] {
+    [
+        PersonaSpeaker::Planning,
+        PersonaSpeaker::Implementation,
+        PersonaSpeaker::Verification,
+        PersonaSpeaker::Documentation,
+    ]
 }
 
 fn fixed_team_sessions() -> Vec<PersonaSession> {
@@ -1805,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn kickoff_without_member_requests_still_closes_with_lead_summary() {
+    fn kickoff_without_member_requests_still_runs_fixed_team_before_summary() {
         let mut runtime = PersonaRuntime::new();
 
         let lead = runtime.start_kickoff("task-a");
@@ -1814,6 +1827,19 @@ mod tests {
             &lead,
             PersonaTurnOutcome::Spoken(message(PersonaSpeaker::Lead, "body-a")),
         );
+
+        for speaker in [
+            PersonaSpeaker::Planning,
+            PersonaSpeaker::Implementation,
+            PersonaSpeaker::Verification,
+            PersonaSpeaker::Documentation,
+        ] {
+            let member = runtime.pop_next_turn().expect("fixed member turn");
+            assert_eq!(member.speaker, speaker);
+            assert_eq!(member.kind, PersonaTurnKind::MemberResponse);
+            assert_eq!(member.stage, PersonaRuntimeStage::Kickoff);
+            runtime.record_turn_result(&member, PersonaTurnOutcome::Passed { speaker });
+        }
 
         let summary = runtime.pop_next_turn().expect("kickoff summary");
         assert_eq!(summary.speaker, PersonaSpeaker::Lead);

@@ -15,8 +15,8 @@ pub use diagnostics::{
 };
 pub use history::{LlmMessage, LlmMessageRole, LlmMessageVisibility, MessageHistory};
 pub use provider::{
-    LlmChatReport, LlmChatRequest, LlmChatStatus, LlmHealthReport, LlmHealthStatus,
-    LlmProviderFactory,
+    ChatFailureKind, LlmChatFailure, LlmChatReport, LlmChatRequest, LlmChatStatus, LlmHealthReport,
+    LlmHealthStatus, LlmProviderFactory,
 };
 pub use repair::{RepairLimitReached, RepairLoop, RepairRequest};
 pub use response_parser::{

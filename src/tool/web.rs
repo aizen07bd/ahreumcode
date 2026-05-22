@@ -38,6 +38,14 @@ pub fn execute_approved_web(request: ApprovedWebRequest) -> ToolObservation {
             "web runtime is disabled by configuration",
         );
     }
+    if request.timeout_ms == 0 {
+        return ToolObservation::failed(
+            tool_name.as_str(),
+            web_target_from_arguments(tool_name, &request.arguments),
+            ToolErrorKind::InvalidArguments,
+            "web timeout_ms must be greater than zero",
+        );
+    }
 
     let arguments = match normalize_tool_arguments(tool_name, &request.arguments) {
         Ok(arguments) => arguments,
@@ -159,11 +167,12 @@ fn fetch_url(
 }
 
 fn web_search_preview(query: &str, max_results: i64, raw: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+    let json_text = web_response_body_from_preview(raw);
+    let Ok(value) = serde_json::from_str::<Value>(&json_text) else {
         return vec![
             format!("query: {query}"),
             "result_parse: failed".to_owned(),
-            raw.to_owned(),
+            json_text,
         ];
     };
     let mut lines = vec![format!("query: {query}")];
@@ -194,6 +203,13 @@ fn web_search_preview(query: &str, max_results: i64, raw: &str) -> Vec<String> {
         lines.push("results: none".to_owned());
     }
     lines
+}
+
+fn web_response_body_from_preview(raw: &str) -> String {
+    raw.lines()
+        .filter(|line| !line.starts_with("status: ") && !line.starts_with("content_type: "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn map_web_error(tool_name: &str, target_raw: &str, error: ureq::Error) -> ToolObservation {
@@ -276,24 +292,46 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{execute_approved_web, form_encode, ApprovedWebRequest};
+    use super::{execute_approved_web, form_encode, web_search_preview, ApprovedWebRequest};
 
     #[test]
-    fn disabled_web_returns_permission_observation() {
-        let observation = execute_approved_web(ApprovedWebRequest {
-            tool_name: "web_fetch".to_owned(),
-            arguments: json!({"url":"https://example.com","max_bytes":1000}),
-            web_enabled: false,
-            timeout_ms: 1000,
-        });
+    fn rejects_web_runtime_boundaries_before_network() {
+        let cases = [
+            (false, 1000, "permission_error"),
+            (true, 0, "invalid_arguments"),
+        ];
 
-        assert_eq!(observation.status.as_str(), "failed");
-        assert_eq!(observation.error_kind.unwrap().as_str(), "permission_error");
+        for (web_enabled, timeout_ms, expected_error) in cases {
+            let observation = execute_approved_web(ApprovedWebRequest {
+                tool_name: "web_fetch".to_owned(),
+                arguments: json!({"url":"https://example.com","max_bytes":1000}),
+                web_enabled,
+                timeout_ms,
+            });
+
+            assert_eq!(observation.status.as_str(), "failed");
+            assert_eq!(observation.error_kind.unwrap().as_str(), expected_error);
+        }
     }
 
     #[test]
-    fn web_search_query_encoding_is_not_prompt_specific() {
+    fn web_search_formats_query_and_parses_response_body() {
         assert_eq!(form_encode("rust 1.80 + cargo"), "rust+1.80+%2B+cargo");
+
+        let preview = web_search_preview(
+            "rust",
+            1,
+            concat!(
+                "status: 200\n",
+                "content_type: application/json\n",
+                r#"{"RelatedTopics":[{"Text":"Rust language","FirstURL":"https://example.test/rust"}]}"#
+            ),
+        );
+
+        assert_eq!(preview[0], "query: rust");
+        assert!(preview
+            .iter()
+            .any(|line| line.contains("Rust language | https://example.test/rust")));
     }
 
     #[test]

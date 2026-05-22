@@ -23,6 +23,30 @@ pub struct ApprovedChange {
     pub precondition: ChangePrecondition,
 }
 
+pub fn validate_approved_change(change: &ApprovedChange) -> Result<(), ToolObservation> {
+    verify_precondition(&change.preview, &change.precondition)?;
+    match change.preview.operation {
+        PatchOperation::Add => {
+            parse_add_content(&change.preview)?;
+        }
+        PatchOperation::Update => {
+            let original =
+                fs::read_to_string(&change.precondition.target_resolved).map_err(|error| {
+                    change_failure(
+                        &change.preview,
+                        ToolErrorKind::IoError,
+                        format!("update target could not be read: {error}"),
+                    )
+                })?;
+            apply_update_hunks(&change.preview, &original)?;
+        }
+        PatchOperation::Delete => {
+            validate_delete_patch_body(&change.preview)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn capture_change_precondition(
     workspace_root: &Path,
     preview: &ChangePreview,
@@ -46,7 +70,7 @@ pub fn capture_change_precondition(
         (PatchOperation::Add, Some(_)) => {
             return Err(change_failure(
                 preview,
-                ToolErrorKind::InvalidArguments,
+                ToolErrorKind::TargetAlreadyExists,
                 "add patch target already exists",
             ));
         }
@@ -96,7 +120,10 @@ pub fn capture_change_precondition(
 
 pub fn apply_approved_change(workspace_root: &Path, change: ApprovedChange) -> ToolObservation {
     let preview = change.preview;
-    if let Err(observation) = verify_precondition(&preview, &change.precondition) {
+    if let Err(observation) = validate_approved_change(&ApprovedChange {
+        preview: preview.clone(),
+        precondition: change.precondition.clone(),
+    }) {
         return observation;
     }
 
@@ -132,6 +159,15 @@ fn apply_add(
     precondition: &ChangePrecondition,
 ) -> Result<Vec<String>, ToolObservation> {
     let content = parse_add_content(preview)?;
+    if let Some(parent) = precondition.target_resolved.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            change_failure(
+                preview,
+                ToolErrorKind::IoError,
+                format!("add patch target parent could not be created: {error}"),
+            )
+        })?;
+    }
     fs::write(&precondition.target_resolved, content.as_bytes()).map_err(|error| {
         change_failure(
             preview,
@@ -174,6 +210,7 @@ fn apply_delete(
     preview: &ChangePreview,
     precondition: &ChangePrecondition,
 ) -> Result<Vec<String>, ToolObservation> {
+    validate_delete_patch_body(preview)?;
     fs::remove_file(&precondition.target_resolved).map_err(|error| {
         change_failure(
             preview,
@@ -182,6 +219,23 @@ fn apply_delete(
         )
     })?;
     Ok(vec![format!("deleted {}", precondition.display)])
+}
+
+fn validate_delete_patch_body(preview: &ChangePreview) -> Result<(), ToolObservation> {
+    for line in preview.payload_body.lines() {
+        if line == "*** Begin Patch"
+            || line == "*** End Patch"
+            || line.starts_with("*** Delete File: ")
+        {
+            continue;
+        }
+        return Err(change_failure(
+            preview,
+            ToolErrorKind::InvalidArguments,
+            "Delete File patch must not include patch body lines",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_precondition(
@@ -312,7 +366,7 @@ fn parse_add_content(preview: &ChangePreview) -> Result<String, ToolObservation>
 }
 
 fn apply_update_hunks(preview: &ChangePreview, original: &str) -> Result<String, ToolObservation> {
-    let mut current = split_lines(original);
+    let mut current = TextLines::from_text(original);
     let mut cursor = 0usize;
     let hunks = parse_update_hunks(preview)?;
     for hunk in hunks {
@@ -324,19 +378,20 @@ fn apply_update_hunks(preview: &ChangePreview, original: &str) -> Result<String,
                 "update hunk has no context or removal lines",
             ));
         }
-        let Some(index) = find_unique_sequence(&current, &old_lines, cursor) else {
-            return Err(change_failure(
+        let Some(index) = find_unique_sequence(&current.lines, &old_lines, cursor) else {
+            return Err(change_failure_with_preview(
                 preview,
                 ToolErrorKind::InvalidArguments,
                 "update hunk did not match the target exactly once",
+                mismatch_preview_lines(&old_lines, &new_lines),
             ));
         };
         let end = index + old_lines.len();
-        current.splice(index..end, new_lines);
+        current.splice(index, end, new_lines);
         cursor = index.saturating_add(1);
     }
 
-    Ok(join_lines_with_trailing_newline(&current))
+    Ok(current.into_text())
 }
 
 fn parse_update_hunks(preview: &ChangePreview) -> Result<Vec<UpdateHunk>, ToolObservation> {
@@ -440,8 +495,106 @@ fn find_unique_sequence(lines: &[String], needle: &[String], start: usize) -> Op
     Some(first)
 }
 
-fn split_lines(value: &str) -> Vec<String> {
-    value.lines().map(str::to_owned).collect()
+struct TextLines {
+    lines: Vec<String>,
+    endings: Vec<&'static str>,
+}
+
+impl TextLines {
+    fn from_text(value: &str) -> Self {
+        let mut lines = Vec::new();
+        let mut endings = Vec::new();
+        let bytes = value.as_bytes();
+        let mut start = 0usize;
+        let mut index = 0usize;
+
+        while index < bytes.len() {
+            if bytes[index] == b'\n' {
+                let has_cr = index > start && bytes[index - 1] == b'\r';
+                let content_end = if has_cr { index - 1 } else { index };
+                lines.push(value[start..content_end].to_owned());
+                endings.push(if has_cr { "\r\n" } else { "\n" });
+                index += 1;
+                start = index;
+                continue;
+            }
+            index += 1;
+        }
+
+        if start < value.len() {
+            lines.push(value[start..].to_owned());
+            endings.push("");
+        }
+
+        Self { lines, endings }
+    }
+
+    fn splice(&mut self, start: usize, end: usize, new_lines: Vec<String>) {
+        let old_endings = self.endings[start..end].to_vec();
+        let replacement_endings =
+            self.replacement_endings(start, end, &old_endings, new_lines.len());
+        self.lines.splice(start..end, new_lines);
+        self.endings.splice(start..end, replacement_endings);
+    }
+
+    fn replacement_endings(
+        &self,
+        start: usize,
+        end: usize,
+        old_endings: &[&'static str],
+        count: usize,
+    ) -> Vec<&'static str> {
+        let default_ending = self.default_line_ending(start, end, old_endings);
+        let old_block_ended_line = old_endings.last().is_some_and(|ending| !ending.is_empty());
+        (0..count)
+            .map(|index| {
+                old_endings.get(index).copied().unwrap_or_else(|| {
+                    if index + 1 == count && !old_block_ended_line {
+                        ""
+                    } else {
+                        default_ending
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn default_line_ending(
+        &self,
+        start: usize,
+        end: usize,
+        old_endings: &[&'static str],
+    ) -> &'static str {
+        old_endings
+            .iter()
+            .copied()
+            .find(|ending| !ending.is_empty())
+            .or_else(|| {
+                start
+                    .checked_sub(1)
+                    .and_then(|index| self.endings.get(index).copied())
+                    .filter(|ending| !ending.is_empty())
+            })
+            .or_else(|| {
+                self.endings
+                    .get(end..)
+                    .and_then(|endings| endings.iter().copied().find(|ending| !ending.is_empty()))
+            })
+            .unwrap_or("\n")
+    }
+
+    fn into_text(self) -> String {
+        if self.lines.is_empty() {
+            return String::new();
+        }
+
+        let mut text = String::new();
+        for (line, ending) in self.lines.into_iter().zip(self.endings) {
+            text.push_str(&line);
+            text.push_str(ending);
+        }
+        text
+    }
 }
 
 fn join_lines_with_trailing_newline(lines: &[String]) -> String {
@@ -464,15 +617,21 @@ fn resolve_workspace_target(root: &Path, raw: &str) -> Result<WorkspaceTarget, C
         message: format!("workspace root cannot be resolved: {source}"),
     })?;
     let candidate = root.join(raw);
-    let parent = candidate.parent().unwrap_or(root.as_path());
-    let resolved_parent = parent.canonicalize().map_err(|source| ChangePathError {
+    let anchor = existing_path_anchor(candidate.parent().unwrap_or(root.as_path()));
+    let resolved_anchor = anchor.canonicalize().map_err(|source| ChangePathError {
         kind: ToolErrorKind::PathNotFound,
-        message: format!("target parent cannot be resolved: {source}"),
+        message: format!("target path anchor cannot be resolved: {source}"),
     })?;
-    if !resolved_parent.starts_with(&root) {
+    if !resolved_anchor.starts_with(&root) {
         return Err(ChangePathError {
             kind: ToolErrorKind::PathOutsideWorkspace,
-            message: "target parent resolved outside workspace".to_owned(),
+            message: "target path anchor resolved outside workspace".to_owned(),
+        });
+    }
+    if !resolved_anchor.is_dir() {
+        return Err(ChangePathError {
+            kind: ToolErrorKind::NotADirectory,
+            message: "target path anchor is not a directory".to_owned(),
         });
     }
     let resolved = if candidate.exists() {
@@ -524,6 +683,17 @@ fn validate_workspace_relative_path(raw: &str) -> Result<(), ChangePathError> {
     Ok(())
 }
 
+fn existing_path_anchor(path: &Path) -> &Path {
+    let mut candidate = path;
+    while !candidate.exists() {
+        let Some(parent) = candidate.parent() else {
+            return candidate;
+        };
+        candidate = parent;
+    }
+    candidate
+}
+
 struct ChangePathError {
     kind: ToolErrorKind,
     message: String,
@@ -542,6 +712,51 @@ fn change_failure(
     )
 }
 
+fn change_failure_with_preview(
+    preview: &ChangePreview,
+    error_kind: ToolErrorKind,
+    message: impl Into<String>,
+    diagnostic_preview: Vec<String>,
+) -> ToolObservation {
+    ToolObservation::failed_with_preview(
+        "apply_patch",
+        Some(preview.target_path.clone()),
+        error_kind,
+        message,
+        diagnostic_preview,
+    )
+}
+
+fn mismatch_preview_lines(old_lines: &[String], new_lines: &[String]) -> Vec<String> {
+    const LIMIT: usize = 12;
+    let mut lines = vec![
+        "attempted_old_lines:".to_owned(),
+        "These lines were the exact context/removal text the patch tried to match.".to_owned(),
+    ];
+    lines.extend(
+        old_lines
+            .iter()
+            .take(LIMIT)
+            .enumerate()
+            .map(|(index, line)| format!("old[{}]: {}", index + 1, line)),
+    );
+    if old_lines.len() > LIMIT {
+        lines.push(format!("old_truncated_after: {LIMIT}"));
+    }
+    lines.push("attempted_new_lines:".to_owned());
+    lines.extend(
+        new_lines
+            .iter()
+            .take(LIMIT)
+            .enumerate()
+            .map(|(index, line)| format!("new[{}]: {}", index + 1, line)),
+    );
+    if new_lines.len() > LIMIT {
+        lines.push(format!("new_truncated_after: {LIMIT}"));
+    }
+    lines
+}
+
 fn fnv1a_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in bytes {
@@ -557,7 +772,10 @@ mod tests {
 
     use crate::llm::{ChangePreview, PatchOperation};
 
-    use super::{apply_approved_change, capture_change_precondition, ApprovedChange};
+    use super::{
+        apply_approved_change, capture_change_precondition, validate_approved_change,
+        ApprovedChange,
+    };
 
     fn root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -581,27 +799,42 @@ mod tests {
     }
 
     #[test]
-    fn applies_single_file_update_after_precondition_match() {
-        let root = root("update");
-        fs::write(root.join("sample.txt"), "one\ntwo\n").expect("write");
-        let body =
-            "*** Begin Patch\n*** Update File: sample.txt\n@@\n one\n-two\n+three\n*** End Patch";
-        let preview = preview(body, PatchOperation::Update, "sample.txt");
-        let precondition = capture_change_precondition(&root, &preview).expect("precondition");
+    fn applies_update_preserving_text_boundaries() {
+        let cases = [
+            ("update", "one\ntwo\n", "three", "one\nthree\n"),
+            ("update-no-final-newline", "one\ntwo", "three", "one\nthree"),
+            ("update-crlf", "one\r\ntwo\r\n", "three", "one\r\nthree\r\n"),
+            (
+                "update-mixed-line-endings",
+                "one\r\ntwo\nthree",
+                "changed",
+                "one\r\nchanged\nthree",
+            ),
+        ];
 
-        let observation = apply_approved_change(
-            &root,
-            ApprovedChange {
-                preview,
-                precondition,
-            },
-        );
+        for (name, original, replacement, expected) in cases {
+            let root = root(name);
+            fs::write(root.join("sample.txt"), original).expect("write");
+            let body = format!(
+                "*** Begin Patch\n*** Update File: sample.txt\n@@\n one\n-two\n+{replacement}\n*** End Patch"
+            );
+            let preview = preview(&body, PatchOperation::Update, "sample.txt");
+            let precondition = capture_change_precondition(&root, &preview).expect("precondition");
 
-        assert_eq!(observation.status.as_str(), "succeeded");
-        assert_eq!(
-            fs::read_to_string(root.join("sample.txt")).unwrap(),
-            "one\nthree\n"
-        );
+            let observation = apply_approved_change(
+                &root,
+                ApprovedChange {
+                    preview,
+                    precondition,
+                },
+            );
+
+            assert_eq!(observation.status.as_str(), "succeeded");
+            assert_eq!(
+                fs::read_to_string(root.join("sample.txt")).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -630,6 +863,54 @@ mod tests {
     }
 
     #[test]
+    fn failed_update_mismatch_reports_attempted_lines() {
+        let root = root("update-mismatch");
+        fs::write(root.join("sample.txt"), "one\ntwo\n").expect("write");
+        let body =
+            "*** Begin Patch\n*** Update File: sample.txt\n@@\n one\n-missing\n+three\n*** End Patch";
+        let preview = preview(body, PatchOperation::Update, "sample.txt");
+        let precondition = capture_change_precondition(&root, &preview).expect("precondition");
+
+        let observation = apply_approved_change(
+            &root,
+            ApprovedChange {
+                preview,
+                precondition,
+            },
+        );
+
+        assert_eq!(observation.status.as_str(), "failed");
+        assert!(observation.preview_text().contains("attempted_old_lines:"));
+        assert!(observation.preview_text().contains("old[2]: missing"));
+        assert!(observation
+            .history_message()
+            .contains("latest read_file observation"));
+    }
+
+    #[test]
+    fn validates_update_hunk_before_approval_without_mutating_target() {
+        let root = root("preapproval-update-mismatch");
+        fs::write(root.join("sample.txt"), "alpha\n").expect("write");
+        let body =
+            "*** Begin Patch\n*** Update File: sample.txt\n@@\n- alpha\n+beta\n*** End Patch";
+        let preview = preview(body, PatchOperation::Update, "sample.txt");
+        let precondition = capture_change_precondition(&root, &preview).expect("precondition");
+
+        let observation = validate_approved_change(&ApprovedChange {
+            preview,
+            precondition,
+        })
+        .expect_err("mismatched update should fail before approval");
+
+        assert_eq!(observation.status.as_str(), "failed");
+        assert!(observation.preview_text().contains("attempted_old_lines:"));
+        assert_eq!(
+            fs::read_to_string(root.join("sample.txt")).unwrap(),
+            "alpha\n"
+        );
+    }
+
+    #[test]
     fn applies_single_file_add() {
         let root = root("add");
         let body = "*** Begin Patch\n*** Add File: created.txt\n+hello\n+world\n*** End Patch";
@@ -652,6 +933,64 @@ mod tests {
     }
 
     #[test]
+    fn applies_single_file_add_with_missing_parent_directories() {
+        let root = root("add-parent");
+        let body =
+            "*** Begin Patch\n*** Add File: nested/pages/index.html\n+<main>Hello</main>\n*** End Patch";
+        let preview = preview(body, PatchOperation::Add, "nested/pages/index.html");
+        let precondition = capture_change_precondition(&root, &preview).expect("precondition");
+
+        let observation = apply_approved_change(
+            &root,
+            ApprovedChange {
+                preview,
+                precondition,
+            },
+        );
+
+        assert_eq!(observation.status.as_str(), "succeeded");
+        assert_eq!(
+            fs::read_to_string(root.join("nested/pages/index.html")).unwrap(),
+            "<main>Hello</main>\n"
+        );
+    }
+
+    #[test]
+    fn rejects_add_when_existing_path_anchor_is_file() {
+        let root = root("add-parent-file");
+        fs::write(root.join("nested"), "not a directory\n").expect("write");
+        let body =
+            "*** Begin Patch\n*** Add File: nested/pages/index.html\n+<main>Hello</main>\n*** End Patch";
+        let preview = preview(body, PatchOperation::Add, "nested/pages/index.html");
+
+        let observation =
+            capture_change_precondition(&root, &preview).expect_err("file anchor should fail");
+
+        assert_eq!(observation.status.as_str(), "failed");
+        assert_eq!(observation.error_kind.unwrap().as_str(), "not_a_directory");
+    }
+
+    #[test]
+    fn rejects_add_when_target_exists_with_specific_error_kind() {
+        let root = root("add-existing");
+        fs::write(root.join("created.txt"), "old\n").expect("write");
+        let body = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
+        let preview = preview(body, PatchOperation::Add, "created.txt");
+
+        let observation = capture_change_precondition(&root, &preview)
+            .expect_err("existing add target should fail");
+
+        assert_eq!(observation.status.as_str(), "failed");
+        assert_eq!(
+            observation.error_kind.unwrap().as_str(),
+            "target_already_exists"
+        );
+        assert!(observation
+            .history_message()
+            .contains("Do not retry Add File for the same target"));
+    }
+
+    #[test]
     fn applies_single_file_delete() {
         let root = root("delete");
         fs::write(root.join("old.txt"), "remove me\n").expect("write");
@@ -669,5 +1008,29 @@ mod tests {
 
         assert_eq!(observation.status.as_str(), "succeeded");
         assert!(!root.join("old.txt").exists());
+    }
+
+    #[test]
+    fn rejects_delete_patch_with_body_lines_at_execution_boundary() {
+        let root = root("delete-with-body");
+        fs::write(root.join("old.txt"), "remove me\n").expect("write");
+        let body = "*** Begin Patch\n*** Delete File: old.txt\n-remove me\n*** End Patch";
+        let preview = preview(body, PatchOperation::Delete, "old.txt");
+        let precondition = capture_change_precondition(&root, &preview).expect("precondition");
+
+        let observation = apply_approved_change(
+            &root,
+            ApprovedChange {
+                preview,
+                precondition,
+            },
+        );
+
+        assert_eq!(observation.status.as_str(), "failed");
+        assert!(root.join("old.txt").exists());
+        assert_eq!(
+            observation.error_kind.unwrap().as_str(),
+            "invalid_arguments"
+        );
     }
 }

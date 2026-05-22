@@ -15,6 +15,7 @@ pub const MAX_REPAIR_ATTEMPTS: u16 = 2;
 pub struct RepairRequest {
     pub attempt: u16,
     pub max_attempts: u16,
+    pub source: &'static str,
     pub failure_signature: String,
     pub prompt: String,
 }
@@ -97,6 +98,7 @@ impl RepairLoop {
         Ok(RepairRequest {
             attempt,
             max_attempts: self.max_attempts,
+            source: diagnostic.source,
             failure_signature,
             prompt: build_repair_prompt_from_diagnostic(&diagnostic, attempt, self.max_attempts),
         })
@@ -187,7 +189,54 @@ impl RepairDiagnostic {
     fn failure_signature(&self) -> String {
         format!("{}:{}", self.failure_kind, self.failure_message)
     }
+
+    fn required_activity(&self) -> Option<String> {
+        if self.failure_kind == "invalid_tool_candidate"
+            && self.failure_message.contains("tool/activity mismatch")
+        {
+            return self
+                .tool_name
+                .as_deref()
+                .and_then(tool_spec)
+                .map(|spec| spec.activity.as_str().to_owned())
+                .or_else(|| self.activity.clone());
+        }
+
+        self.activity.clone()
+    }
 }
+
+const APPLY_PATCH_REPAIR_CONTRACT_LINES: &[&str] = &[
+    "Apply_patch repair focus:",
+    "- Keep the failed response tool shape: response_type=tool, activity=Change, tool_name=apply_patch.",
+    "- The JSON arguments object for apply_patch must contain payload_id only.",
+    "- Do not put target path, patch operation, patch text, or file body text in JSON arguments.",
+    "- Keep the existing payload_id when one was present; otherwise choose one payload id and use it in both arguments and AHREUM_PAYLOAD.",
+    "- Do not remove arguments.payload_id or switch away from apply_patch to avoid repairing the patch payload.",
+    "- The same payload_id must appear in arguments.payload_id and exactly one AHREUM_PAYLOAD id.",
+    "- The AHREUM_PAYLOAD format must be \"apply_patch\".",
+    "- The repaired response must start with <AHREUM_ACTION>, then the JSON envelope, then </AHREUM_ACTION>, then the matching AHREUM_PAYLOAD block.",
+    "- The payload body must be one complete patch document beginning with *** Begin Patch and ending with *** End Patch.",
+    "- The payload body must contain exactly one target header: Add File, Update File, or Delete File.",
+    "- Encode the target path and operation only in that patch target header.",
+    "- The payload body is the patch wrapper, not the final file body by itself.",
+    "- Required payload skeleton, with placeholders replaced by the actual target and lines:",
+    "<AHREUM_PAYLOAD id=\"patch_001\" format=\"apply_patch\">",
+    "*** Begin Patch",
+    "*** Update File: path/from/observed/request",
+    "@@",
+    " exact existing context line",
+    "-exact old line",
+    "+exact new line",
+    "*** End Patch",
+    "</AHREUM_PAYLOAD>",
+    "- For a new file, use *** Add File: <requested workspace path> and prefix every created content line with +.",
+    "- For Update File, each hunk must include at least one matching existing context line prefixed with space or one removal line prefixed with -; a hunk with only + lines is invalid.",
+    "- For Update File, bare content lines are invalid. Use exactly one line marker per hunk line: space for existing context, - for removed existing text, + for added replacement text, or @@ for the hunk boundary.",
+    "- The space, -, and + markers are the first character of the patch line, not separators. Do not add an extra space after - or + unless the file line itself starts with a space.",
+    "- Do not wrap the patch body in markdown fences.",
+    "- Preserve the intended patch operation unless the parser failure proves that operation invalid for the observed file state.",
+];
 
 #[cfg(test)]
 fn build_repair_prompt(
@@ -214,6 +263,7 @@ fn build_repair_prompt_from_diagnostic(
         "Repair constraints:",
         "- Return exactly one response contract.",
         "- Return only valid JSON, or one AHREUM_ACTION block plus required AHREUM_PAYLOAD blocks.",
+        "- Repair the exact failed response shown below; do not infer a fresh plan from the user prompt.",
         "- Do not add unknown fields.",
         "- Prefer plain JSON when the candidate is an Explore tool, clarify, blocked, or a short answer.",
         "- Explore tool candidates must not include AHREUM_PAYLOAD blocks.",
@@ -224,7 +274,11 @@ fn build_repair_prompt_from_diagnostic(
         "- For payload reference failures, do not change existing non-payload tool arguments.",
         "- If the previous response already has response_type, activity, or tool_name, keep them unless the failure says that exact field is invalid.",
         "- Do not switch a tool candidate to clarify, blocked, or answer to avoid fixing validation errors.",
+        "- Do not go backward to an earlier evidence-gathering tool when the failed response attempted a later Change, Execute, or Configure candidate.",
         "- For tool argument errors, keep the same tool_name and repair only arguments, message, or reason as needed.",
+        "- For apply_patch repairs, do not return plain JSON alone; return one AHREUM_ACTION block plus exactly one matching AHREUM_PAYLOAD id with format=\"apply_patch\".",
+        "- For apply_patch target-count errors, the payload body must contain exactly one Add File, Update File, or Delete File target header inside the patch document.",
+        "- For apply_patch target-count errors, do not preserve a bare file body; convert it into a patch document with the target header and patch line prefixes.",
         "- If a workspace fact can be checked by a safe Explore tool, do not use clarify.",
         "",
     ]
@@ -274,17 +328,38 @@ fn build_repair_prompt_from_diagnostic(
         if let Some(response_type) = &diagnostic.response_type {
             lines.push(format!("- response_type: {response_type}"));
         }
-        if let Some(activity) = &diagnostic.activity {
+        let required_activity = diagnostic.required_activity();
+        if let Some(activity) = &required_activity {
             lines.push(format!("- activity: {activity}"));
         }
         if let Some(tool_name) = &diagnostic.tool_name {
             lines.push(format!("- tool_name: {tool_name}"));
+        }
+        if diagnostic.activity.as_ref() != required_activity.as_ref()
+            && diagnostic
+                .failure_message
+                .contains("tool/activity mismatch")
+        {
+            lines.push(format!(
+                "- previous activity {} is invalid for tool {}; use the registry activity {}.",
+                diagnostic.activity.as_deref().unwrap_or("-"),
+                diagnostic.tool_name.as_deref().unwrap_or("-"),
+                required_activity.as_deref().unwrap_or("-")
+            ));
         }
     }
 
     if let Some(schema_line) = diagnostic.tool_schema_line {
         lines.push("Exact tool argument schema for this repair:".to_owned());
         lines.push(format!("- {schema_line}"));
+    }
+
+    if diagnostic.tool_name.as_deref() == Some("apply_patch") {
+        lines.extend(
+            APPLY_PATCH_REPAIR_CONTRACT_LINES
+                .iter()
+                .map(|line| line.to_string()),
+        );
     }
 
     if matches!(
@@ -355,6 +430,8 @@ mod tests {
         let prompt = build_repair_prompt(&parse_error(), 1, 1);
 
         assert!(prompt.contains("same user intent"));
+        assert!(prompt.contains("Repair the exact failed response"));
+        assert!(prompt.contains("do not infer a fresh plan"));
         assert!(prompt.contains("Failure kind: json_parse_failed"));
         assert!(prompt.contains("Failure message: expected value"));
         assert!(prompt.contains("Repair attempt: 1/1"));
@@ -442,6 +519,40 @@ mod tests {
     }
 
     #[test]
+    fn payload_parse_repair_reconstructs_apply_patch_payload_contract() {
+        let error = RuntimeResponseParseError {
+            kind: RuntimeResponseParseErrorKind::PayloadValidationFailed,
+            message: "missing payload block: change_001".to_owned(),
+        };
+        let raw = r#"<AHREUM_ACTION>
+{"response_type":"tool","activity":"Change","message":"create file","tool_name":"apply_patch","arguments":{"payload_id":"change_001"}}
+</AHREUM_ACTION>"#;
+        let loop_state = RepairLoop::default_local();
+
+        let request = loop_state
+            .next_request_with_raw(0, &error, Some(raw))
+            .expect("payload repair should be allowed");
+
+        assert_eq!(request.source, "response_parse");
+        assert!(request.prompt.contains("Payload repair focus:"));
+        assert!(request.prompt.contains("- tool_name: apply_patch"));
+        assert!(request
+            .prompt
+            .contains("The same payload_id must appear in arguments.payload_id"));
+        assert!(request.prompt.contains("format=\"apply_patch\""));
+        assert!(request.prompt.contains("*** Begin Patch"));
+        assert!(request.prompt.contains("*** End Patch"));
+        assert!(request
+            .prompt
+            .contains("Do not remove arguments.payload_id or switch away from apply_patch"));
+        assert!(request.prompt.contains("payload body is the patch wrapper"));
+        assert!(request
+            .prompt
+            .contains("prefix every created content line with +"));
+        assert!(request.prompt.contains("missing payload block: change_001"));
+    }
+
+    #[test]
     fn runtime_decision_repair_preserves_tool_shape_and_schema() {
         let parsed = ParsedRuntimeResponse {
             response: RuntimeResponse::Tool(RuntimeToolCandidate {
@@ -464,6 +575,7 @@ mod tests {
             .next_request_for_runtime_decision(0, &parsed, &error, r#"{"response_type":"tool"}"#)
             .expect("runtime decision repair should be allowed");
 
+        assert_eq!(request.source, "runtime_decision");
         assert!(request.prompt.contains("Repair source: runtime_decision"));
         assert!(request.prompt.contains("- response_type: tool"));
         assert!(request.prompt.contains("- activity: Explore"));
@@ -472,5 +584,94 @@ mod tests {
         assert!(request
             .prompt
             .contains("Do not switch a tool candidate to clarify"));
+        assert!(request
+            .prompt
+            .contains("Do not go backward to an earlier evidence-gathering tool"));
+    }
+
+    #[test]
+    fn runtime_decision_repair_enforces_apply_patch_split_contract() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "create file".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({
+                    "payload_id":"patch_001",
+                    "path":"fixture-target.txt",
+                    "operation":"add"
+                }),
+                reason: "change requested".to_owned(),
+                manifest: RuntimeManifest {
+                    tool_manifest_id: "ahreumcode.local-llm.tool-manifest.v1".to_owned(),
+                    tool_manifest_version: "1".to_owned(),
+                },
+            }),
+            payloads: Vec::new(),
+        };
+        let error = DecisionGate::classify(&parsed).expect_err("unknown fields should fail");
+        let loop_state = RepairLoop::default_local();
+
+        let request = loop_state
+            .next_request_for_runtime_decision(
+                0,
+                &parsed,
+                &error,
+                r#"{"response_type":"tool","activity":"Change","tool_name":"apply_patch","arguments":{"payload_id":"patch_001","path":"fixture-target.txt","operation":"add"}}"#,
+            )
+            .expect("runtime decision repair should be allowed");
+
+        assert!(request.prompt.contains("Apply_patch repair focus:"));
+        assert!(request
+            .prompt
+            .contains("apply_patch must contain payload_id only"));
+        assert!(request
+            .prompt
+            .contains("target path, patch operation, patch text, or file body text"));
+        assert!(request
+            .prompt
+            .contains("Encode the target path and operation only in that patch target header"));
+        assert!(request
+            .prompt
+            .contains("exactly one target header: Add File, Update File, or Delete File"));
+        assert!(request.prompt.contains("do not preserve a bare file body"));
+        assert!(request
+            .prompt
+            .contains("Do not wrap the patch body in markdown fences"));
+    }
+
+    #[test]
+    fn runtime_decision_repair_corrects_tool_activity_mismatch() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Execute,
+                message: "change file".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: RuntimeManifest {
+                    tool_manifest_id: "ahreumcode.local-llm.tool-manifest.v1".to_owned(),
+                    tool_manifest_version: "1".to_owned(),
+                },
+            }),
+            payloads: Vec::new(),
+        };
+        let error = DecisionGate::classify(&parsed).expect_err("activity mismatch should fail");
+        let loop_state = RepairLoop::default_local();
+
+        let request = loop_state
+            .next_request_for_runtime_decision(
+                0,
+                &parsed,
+                &error,
+                r#"{"response_type":"tool","activity":"Execute","tool_name":"apply_patch","arguments":{"payload_id":"patch_001"}}"#,
+            )
+            .expect("runtime decision repair should be allowed");
+
+        assert!(request.prompt.contains("- activity: Change"));
+        assert!(request
+            .prompt
+            .contains("previous activity Execute is invalid for tool apply_patch"));
+        assert!(!request.prompt.contains("- activity: Execute"));
     }
 }

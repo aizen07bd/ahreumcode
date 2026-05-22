@@ -29,6 +29,14 @@ pub fn execute_approved_command(
             );
         }
     };
+    if command.max_timeout_ms == 0 {
+        return ToolObservation::failed(
+            "run_command",
+            target_from_arguments(&arguments),
+            ToolErrorKind::InvalidArguments,
+            "max_timeout_ms must be greater than zero",
+        );
+    }
     let policy = CommandPolicy::evaluate(&arguments);
     if let CommandPolicyDecision::ManualOnly { capability, reason } = policy {
         return ToolObservation::failed(
@@ -283,6 +291,7 @@ fn validate_workspace_relative_path(raw: &str) -> Result<(), ToolObservation> {
     let path = Path::new(raw);
     if raw.is_empty()
         || raw.trim() != raw
+        || raw.chars().any(char::is_control)
         || path.is_absolute()
         || path.components().any(|component| {
             matches!(
@@ -375,33 +384,47 @@ mod tests {
     }
 
     #[test]
-    fn refuses_manual_only_command_at_execution_boundary() {
-        let root = root("manual");
+    fn rejects_invalid_command_execution_boundaries() {
+        let cases = [
+            (
+                "manual",
+                json!({"argv":["rm","-rf","target"],"cwd":".","timeout_ms":30000}),
+                30000,
+                "permission_error",
+            ),
+            (
+                "cwd-parent",
+                json!({"argv":["cargo","--version"],"cwd":"..","timeout_ms":30000}),
+                30000,
+                "path_outside_workspace",
+            ),
+            (
+                "cwd-control",
+                json!({"argv":["pwd"],"cwd":"bad\npath","timeout_ms":30000}),
+                30000,
+                "path_outside_workspace",
+            ),
+            (
+                "zero-timeout",
+                json!({"argv":["pwd"],"cwd":".","timeout_ms":30000}),
+                0,
+                "invalid_arguments",
+            ),
+        ];
 
-        let observation = execute_approved_command(
-            &root,
-            ApprovedCommand {
-                arguments: json!({"argv":["rm","-rf","target"],"cwd":".","timeout_ms":30000}),
-                max_timeout_ms: 30000,
-            },
-        );
+        for (name, arguments, max_timeout_ms, expected_error) in cases {
+            let root = root(name);
 
-        assert_eq!(observation.status.as_str(), "failed");
-        assert_eq!(observation.error_kind.unwrap().as_str(), "permission_error");
-    }
+            let observation = execute_approved_command(
+                &root,
+                ApprovedCommand {
+                    arguments,
+                    max_timeout_ms,
+                },
+            );
 
-    #[test]
-    fn rejects_cwd_outside_workspace() {
-        let root = root("cwd");
-
-        let observation = execute_approved_command(
-            &root,
-            ApprovedCommand {
-                arguments: json!({"argv":["cargo","--version"],"cwd":"..","timeout_ms":30000}),
-                max_timeout_ms: 30000,
-            },
-        );
-
-        assert_eq!(observation.status.as_str(), "failed");
+            assert_eq!(observation.status.as_str(), "failed");
+            assert_eq!(observation.error_kind.unwrap().as_str(), expected_error);
+        }
     }
 }

@@ -187,7 +187,24 @@ pub fn search_text(root: &Path, args: SearchTextArgs) -> ToolObservation {
 pub fn read_file(root: &Path, args: ReadFileArgs) -> ToolObservation {
     let target = match resolve_existing_workspace_path(root, &args.path) {
         Ok(target) => target,
-        Err(error) => return path_failure(READ_FILE, Some(args.path), error.kind, error.message),
+        Err(error) => {
+            if error.kind == ToolErrorKind::PathNotFound {
+                let candidates = workspace_path_candidates(root, &args.path, CandidateKind::File);
+                if !candidates.is_empty() {
+                    return ToolObservation::failed_with_preview(
+                        READ_FILE,
+                        Some(args.path),
+                        error.kind,
+                        error.message,
+                        candidates
+                            .into_iter()
+                            .map(|path| format!("candidate_path: {path}"))
+                            .collect(),
+                    );
+                }
+            }
+            return path_failure(READ_FILE, Some(args.path), error.kind, error.message);
+        }
     };
 
     if !target.resolved.is_file() {
@@ -374,6 +391,87 @@ fn display_relative(root: &Path, path: &Path) -> String {
         .to_owned()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateKind {
+    File,
+}
+
+fn workspace_path_candidates(root: &Path, raw: &str, kind: CandidateKind) -> Vec<String> {
+    let Ok(root) = root.canonicalize() else {
+        return Vec::new();
+    };
+    let requested = normalized_components(raw);
+    if requested.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    collect_path_candidates(&root, &root, &requested, kind, &mut candidates);
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(20);
+    candidates
+}
+
+fn collect_path_candidates(
+    root: &Path,
+    current: &Path,
+    requested: &[String],
+    kind: CandidateKind,
+    candidates: &mut Vec<String>,
+) {
+    if candidates.len() >= 20 {
+        return;
+    }
+
+    let Ok(children) = fs::read_dir(current) else {
+        return;
+    };
+    let mut children = children.filter_map(Result::ok).collect::<Vec<_>>();
+    children.sort_by_key(|entry| entry.path());
+
+    for entry in children {
+        if candidates.len() >= 20 {
+            break;
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if file_type.is_dir() {
+            collect_path_candidates(root, &path, requested, kind, candidates);
+            continue;
+        }
+
+        if kind == CandidateKind::File && file_type.is_file() {
+            let display = display_relative(root, &path);
+            if candidate_path_matches_request(&display, requested) {
+                candidates.push(display);
+            }
+        }
+    }
+}
+
+fn normalized_components(raw: &str) -> Vec<String> {
+    raw.split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .map(str::to_owned)
+        .collect()
+}
+
+fn candidate_path_matches_request(candidate: &str, requested: &[String]) -> bool {
+    let candidate_components = normalized_components(candidate);
+    if candidate_components.len() < requested.len() {
+        return false;
+    }
+    candidate_components
+        .iter()
+        .rev()
+        .zip(requested.iter().rev())
+        .all(|(candidate, requested)| candidate == requested)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -382,7 +480,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{list_files, read_file, search_text, ListFilesArgs, ReadFileArgs, SearchTextArgs};
+    use super::{
+        inspect_git_status, list_files, read_file, search_text, ListFilesArgs, ReadFileArgs,
+        SearchTextArgs,
+    };
 
     fn test_workspace(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -425,6 +526,8 @@ mod tests {
         let root = test_workspace("list");
         fs::create_dir(root.join("src")).expect("mkdir");
         fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("write");
+        fs::write(root.join("a.txt"), "a\n").expect("write");
+        fs::write(root.join("b.txt"), "b\n").expect("write");
         let args = ListFilesArgs::from_value(&json!({
             "path": ".",
             "max_depth": 2,
@@ -437,13 +540,29 @@ mod tests {
         assert_eq!(observation.status.as_str(), "succeeded");
         assert!(observation.preview.iter().any(|line| line == "src/"));
         assert!(observation.preview.iter().any(|line| line == "src/main.rs"));
+        let truncated_args = ListFilesArgs::from_value(&json!({
+            "path": ".",
+            "max_depth": 1,
+            "max_entries": 1
+        }))
+        .expect("args");
+
+        let observation = list_files(&root, truncated_args);
+
+        assert_eq!(observation.status.as_str(), "succeeded");
+        assert_eq!(observation.preview.len(), 1);
+        assert!(observation.truncated);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn search_text_returns_literal_matches() {
         let root = test_workspace("search");
-        fs::write(root.join("README.md"), "alpha\nbeta\n").expect("write");
+        fs::write(
+            root.join("README.md"),
+            "alpha\nbeta\nneedle one\nneedle two\n",
+        )
+        .expect("write");
         let args = SearchTextArgs::from_value(&json!({
             "path": ".",
             "query": "beta",
@@ -455,6 +574,55 @@ mod tests {
 
         assert_eq!(observation.status.as_str(), "succeeded");
         assert_eq!(observation.preview, vec!["README.md:2: beta"]);
+        let truncated_args = SearchTextArgs::from_value(&json!({
+            "path": ".",
+            "query": "needle",
+            "max_results": 1
+        }))
+        .expect("args");
+
+        let observation = search_text(&root, truncated_args);
+
+        assert_eq!(observation.status.as_str(), "succeeded");
+        assert_eq!(observation.preview.len(), 1);
+        assert!(observation.truncated);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn read_file_path_not_found_returns_matching_file_candidates() {
+        let root = test_workspace("read-candidates");
+        fs::create_dir(root.join("nested")).expect("mkdir");
+        fs::write(root.join("nested/settings.local"), "mode = \"local\"\n").expect("write");
+        let args = ReadFileArgs::from_value(&json!({
+            "path": "settings.local",
+            "start_line": 1,
+            "max_lines": 120
+        }))
+        .expect("args");
+
+        let observation = read_file(&root, args);
+
+        assert_eq!(observation.status.as_str(), "failed");
+        assert_eq!(
+            observation.error_kind.expect("kind").as_str(),
+            "path_not_found"
+        );
+        assert_eq!(
+            observation.preview,
+            vec!["candidate_path: nested/settings.local"]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn inspect_git_status_reports_git_failure_without_panicking() {
+        let root = test_workspace("git-status");
+
+        let observation = inspect_git_status(&root);
+
+        assert_eq!(observation.status.as_str(), "failed");
+        assert_eq!(observation.error_kind.expect("kind").as_str(), "git_error");
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -15,19 +15,20 @@ use serde_json::{json, Value};
 use crate::cli::{AppCommand, RunMode, SceneCommand};
 use crate::config::{ConfigLoadOutcome, ConfigLoadSource, RuntimeConfig};
 use crate::llm::{
-    attach_schema_prompt, parse_runtime_response, Activity, ChangePreview, DecisionGate,
-    LlmChatReport, LlmChatStatus, LlmDiagnostics, LlmDiagnosticsRuntime, LlmDiagnosticsSnapshot,
-    LlmDiagnosticsState, LlmHealthReport, LlmHealthStatus, LlmMessage, LlmMessageRole,
-    LlmMessageVisibility, LlmProviderFactory, MessageHistory, ParsedRuntimeResponse,
-    RepairLimitReached, RepairLoop, RepairRequest, RuntimeDecision, RuntimeDecisionError,
-    RuntimeResponseParseError, RuntimeResponseParseErrorKind, SchemaPrompt, SchemaPromptBuilder,
+    attach_schema_prompt, parse_runtime_response, Activity, ChangePreview, ChatFailureKind,
+    DecisionGate, LlmChatFailure, LlmChatReport, LlmChatStatus, LlmDiagnostics,
+    LlmDiagnosticsRuntime, LlmDiagnosticsSnapshot, LlmDiagnosticsState, LlmHealthReport,
+    LlmHealthStatus, LlmMessage, LlmMessageRole, LlmMessageVisibility, LlmProviderFactory,
+    MessageHistory, ParsedRuntimeResponse, RepairLimitReached, RepairLoop, RepairRequest,
+    RuntimeDecision, RuntimeDecisionError, RuntimeResponseParseError,
+    RuntimeResponseParseErrorKind, SchemaPrompt, SchemaPromptBuilder,
 };
 use crate::logging::{LogEvent, Logger};
 use crate::tool::{
-    apply_approved_change, capture_change_precondition, redacted_tool_arguments, ApprovedChange,
-    ChangePrecondition, ObservationStatus, PermissionDecision, PermissionDenial, PermissionGate,
-    PermissionRequest, PostEditDiagnosticRequest, ToolCall, ToolErrorKind, ToolName,
-    ToolObservation, ToolRuntime,
+    apply_approved_change, capture_change_precondition, redacted_tool_arguments,
+    validate_approved_change, ApprovedChange, ChangePrecondition, ObservationStatus,
+    PermissionDecision, PermissionDenial, PermissionGate, PermissionRequest,
+    PostEditDiagnosticRequest, ToolCall, ToolErrorKind, ToolName, ToolObservation, ToolRuntime,
 };
 
 use super::approval::{ApprovalInputEvent, ApprovalRequest, ApprovalResult};
@@ -36,8 +37,8 @@ use super::event_log::{self, TUI_01_SCOPE, TUI_02_SCOPE, TUI_03_SCOPE};
 use super::expanded_form::ExpandedFormEvent;
 use super::persona::{PersonaEvent, PersonaRendered, PersonaRuntimeEvent};
 use super::persona_runtime::{
-    parse_persona_turn_result_for_turn, PersonaRuntime, PersonaRuntimeMode, PersonaRuntimeStage,
-    PersonaTurn, PersonaTurnKind, PersonaTurnOutcome, PersonaTurnPrompt,
+    parse_persona_turn_result_for_turn, PersonaRuntime, PersonaRuntimeMode, PersonaTurn,
+    PersonaTurnKind, PersonaTurnOutcome, PersonaTurnPrompt,
 };
 use super::runtime_request::{self, ActivePlainRequest};
 use super::runtime_workspace;
@@ -371,6 +372,7 @@ struct PendingChangeApproval {
     active: ActivePlainRequest,
     tool_name: String,
     arguments: Value,
+    signature: String,
     preview: ChangePreview,
     precondition: ChangePrecondition,
 }
@@ -392,12 +394,14 @@ enum PendingChangePreparation {
     Pending {
         tool_name: String,
         arguments: Value,
+        signature: String,
         preview: ChangePreview,
         precondition: ChangePrecondition,
     },
     Failed {
         tool_name: String,
         arguments: Value,
+        signature: String,
         observation: ToolObservation,
     },
 }
@@ -406,6 +410,7 @@ enum PendingChangePreparation {
 struct ConversationTaskFrame {
     user_prompt: String,
     task_state_summary: String,
+    runtime_context_summary: String,
 }
 
 impl TuiApp {
@@ -970,20 +975,18 @@ impl TuiApp {
         self.persona_runtime
             .record_turn_result(&active.turn, outcome);
 
-        let persona_kickoff_ready_for_main = active.start_plain_after
-            && active.turn.stage == PersonaRuntimeStage::Kickoff
-            && (active.turn.kind == PersonaTurnKind::LeadSummary
-                || !self.persona_runtime.has_pending_turns());
-        if persona_kickoff_ready_for_main && self.active_plain_request.is_none() {
-            self.start_plain_prompt_request(active.prompt.clone(), active.persona_context_start)?;
-        }
-
-        if self.active_persona_request.is_none() {
-            self.start_next_persona_turn_request(
-                active.prompt,
+        if self.active_persona_request.is_none()
+            && self.start_next_persona_turn_request(
+                active.prompt.clone(),
                 active.start_plain_after,
                 active.persona_context_start,
-            );
+            )
+        {
+            return Ok(());
+        }
+
+        if active.start_plain_after && self.active_plain_request.is_none() {
+            self.start_plain_prompt_request(active.prompt, active.persona_context_start)?;
         }
 
         Ok(())
@@ -1063,6 +1066,63 @@ impl TuiApp {
             return Ok(());
         };
 
+        let request_timeout = runtime_request::effective_chat_timeout(&self.runtime_config);
+        if active.request_timed_out(request_timeout) {
+            let Some(mut active) = self.active_plain_request.take() else {
+                return Ok(());
+            };
+            if let Some(final_decision) =
+                runtime_request::completed_tool_fallback_final_decision(&active, "timeout")
+            {
+                active.record_final_decision(&final_decision);
+                let events =
+                    runtime_workspace::record_runtime_decision(&mut self.state, &final_decision);
+                self.finish_plain_request_with_events(
+                    events,
+                    "성공한 도구 observation으로 요청 시간 초과를 종료합니다.",
+                    Some((&active.run_id, &active.turn_id)),
+                    active.persona_context_start,
+                    persona_task_state_summary(
+                        &active,
+                        "completed",
+                        "tool observation succeeded before model follow-up timed out",
+                    ),
+                    Some(runtime_request::conversation_task_context_summary(&active)),
+                )?;
+                return Ok(());
+            }
+            let report = plain_request_timeout_report(&self.runtime_config, &active);
+            self.llm_diagnostics.record_request_report(&report);
+            let failure_message = active.history.append(
+                active.turn_id.clone(),
+                LlmMessageRole::System,
+                LlmMessageVisibility::Internal,
+                "request_failed:timeout",
+            );
+            self.log_message_recorded(&active.history, &failure_message)?;
+            self.log_plain_request_failed(&active, &report)?;
+            self.state
+                .record_persona_runtime_event(PersonaRuntimeEvent::LlmRequestFailed);
+            self.set_runtime_working_phase(
+                WorkingPhase::Execute,
+                "요청 시간이 초과되어 실행하지 않습니다.",
+            )?;
+            self.set_runtime_working_phase(
+                WorkingPhase::Apply,
+                "요청 시간 초과를 workspace에 반영합니다.",
+            )?;
+            let events = runtime_workspace::record_plain_chat_failure(&mut self.state, &report);
+            self.finish_plain_request_with_events(
+                events,
+                "요청 시간 초과를 보고합니다.",
+                Some((&active.run_id, &active.turn_id)),
+                active.persona_context_start,
+                persona_task_state_summary(&active, "request_failed", "timeout"),
+                Some(runtime_request::conversation_task_context_summary(&active)),
+            )?;
+            return Ok(());
+        }
+
         let result = match active.receiver.try_recv() {
             Ok(report) => Some(report),
             Err(TryRecvError::Empty) => None,
@@ -1105,6 +1165,7 @@ impl TuiApp {
                         "request_failed",
                         "runtime channel disconnected",
                     ),
+                    Some(runtime_request::conversation_task_context_summary(&active)),
                 )?;
                 return Ok(());
             }
@@ -1175,12 +1236,202 @@ impl TuiApp {
                         self.log_runtime_decision_started(&active, &parsed)?;
                         match DecisionGate::classify(&parsed) {
                             Ok(decision) => {
+                                let decision =
+                                    runtime_request::apply_final_answer_evidence_boundary(
+                                        &active, decision,
+                                    );
+                                if let Some(target) = runtime_request::change_target_requiring_read(
+                                    &active, &decision,
+                                ) {
+                                    active.pending_change_after_read_target = Some(target);
+                                }
+                                let decision = runtime_request::apply_change_evidence_boundary(
+                                    &active, decision,
+                                );
                                 self.log_runtime_decision_recorded(&active, &decision)?;
                                 self.llm_diagnostics.record_decision(
                                     decision.kind(),
                                     decision.activity().map(|activity| activity.as_str()),
                                     decision.tool_name(),
                                 );
+                                if let RuntimeDecision::ApprovalNeeded {
+                                    tool_name: _,
+                                    arguments: _,
+                                    ..
+                                } = &decision
+                                {
+                                    if let Some(final_decision) =
+                                        runtime_request::repeated_completed_add_change_final_decision(
+                                            &active, &decision,
+                                        )
+                                    {
+                                        active.record_final_decision(&final_decision);
+                                        let events = runtime_workspace::record_runtime_decision(
+                                            &mut self.state,
+                                            &final_decision,
+                                        );
+                                        self.finish_plain_request_with_events(
+                                            events,
+                                            "기존 observation으로 반복 파일 추가 후보를 종료합니다.",
+                                            Some((&active.run_id, &active.turn_id)),
+                                            active.persona_context_start,
+                                            persona_task_state_summary(
+                                                &active,
+                                                "completed",
+                                                "repeated add-file change candidate finalized from existing observation",
+                                            ),
+                                            Some(
+                                                runtime_request::conversation_task_context_summary(
+                                                    &active,
+                                                ),
+                                            ),
+                                        )?;
+                                        return Ok(());
+                                    }
+                                    let signature = approval_signature(&decision);
+                                    if let Some((redirect, execution_record)) =
+                                        runtime_request::duplicate_approval_repeat_redirect(
+                                            &active, &signature,
+                                        )
+                                    {
+                                        let duplicate_redirect_count = active
+                                            .duplicate_redirect_count_for_signature(&signature);
+                                        if should_finalize_duplicate_approval_redirect(
+                                            redirect,
+                                            duplicate_redirect_count,
+                                            self.runtime_config.limits.max_same_tool_repeats,
+                                        ) {
+                                            let final_decision =
+                                                runtime_request::duplicate_approval_final_decision(
+                                                    &active, &signature,
+                                                )
+                                                .expect(
+                                                    "duplicate approval should have a final decision",
+                                                );
+                                            active.record_final_decision(&final_decision);
+                                            let events = runtime_workspace::record_runtime_decision(
+                                                &mut self.state,
+                                                &final_decision,
+                                            );
+                                            self.finish_plain_request_with_events(
+                                                events,
+                                                "반복 승인 후보를 기존 observation으로 종료합니다.",
+                                                Some((&active.run_id, &active.turn_id)),
+                                                active.persona_context_start,
+                                                persona_task_state_summary(
+                                                    &active,
+                                                    "completed",
+                                                    "duplicate approval candidate finalized after retry guidance",
+                                                ),
+                                                Some(
+                                                    runtime_request::conversation_task_context_summary(
+                                                        &active,
+                                                    ),
+                                                ),
+                                            )?;
+                                            return Ok(());
+                                        }
+
+                                        active.last_tool_signature = Some(signature.clone());
+                                        active.duplicate_redirect_count =
+                                            duplicate_redirect_count.saturating_add(1);
+                                        let next_turn_id = active.history.next_turn_id();
+                                        self.log_turn_id_assigned(&active.history, &next_turn_id)?;
+                                        let request_messages = match redirect {
+                                            runtime_request::ToolLoopRepeatRedirect::SettledDuplicate => {
+                                                runtime_request::tool_repeat_answer_request_messages(
+                                                    &active.schema_message,
+                                                    &active.user_message,
+                                                    &execution_record,
+                                                    &active.executed_tool_records,
+                                                    &active.executed_tool_signatures,
+                                                    &next_turn_id,
+                                                )
+                                            }
+                                            runtime_request::ToolLoopRepeatRedirect::TruncatedContinuation => {
+                                                runtime_request::tool_repeat_continuation_request_messages(
+                                                    &active.schema_message,
+                                                    &active.user_message,
+                                                    &execution_record,
+                                                    &active.executed_tool_records,
+                                                    &active.executed_tool_signatures,
+                                                    &next_turn_id,
+                                                )
+                                            }
+                                            runtime_request::ToolLoopRepeatRedirect::FailedDuplicate => {
+                                                runtime_request::tool_repeat_failure_request_messages(
+                                                    &active.schema_message,
+                                                    &active.user_message,
+                                                    &execution_record,
+                                                    &active.executed_tool_records,
+                                                    &active.executed_tool_signatures,
+                                                    &next_turn_id,
+                                                )
+                                            }
+                                        };
+                                        self.log_plain_request_started(
+                                            &active.run_id,
+                                            &next_turn_id,
+                                            &active.prompt,
+                                        )?;
+                                        self.state.record_persona_runtime_event(
+                                            PersonaRuntimeEvent::LlmRequestStarted,
+                                        );
+                                        self.log_tool_loop_duplicate_redirected(
+                                            &active,
+                                            &next_turn_id,
+                                            &signature,
+                                            redirect.as_str(),
+                                        )?;
+                                        self.state.record_persona_runtime_event(
+                                            PersonaRuntimeEvent::ToolLoopDuplicateRedirected,
+                                        );
+                                        self.llm_diagnostics
+                                            .record_request_started(&active.run_id, &next_turn_id);
+                                        self.set_runtime_working_phase(
+                                            WorkingPhase::Interpret,
+                                            "반복 승인 후보를 재승인하지 않고 기존 observation을 반영한 다음 응답을 요청합니다.",
+                                        )?;
+
+                                        active.turn_id = next_turn_id;
+                                        active.receiver = runtime_request::spawn_chat_request(
+                                            &self.runtime_config,
+                                            request_messages,
+                                        );
+                                        active.reset_request_timer();
+                                        active.reset_repair_state();
+                                        self.active_plain_request = Some(active);
+                                        return Ok(());
+                                    }
+                                    if let Some(final_decision) =
+                                        runtime_request::duplicate_approval_final_decision(
+                                            &active, &signature,
+                                        )
+                                    {
+                                        active.record_final_decision(&final_decision);
+                                        let events = runtime_workspace::record_runtime_decision(
+                                            &mut self.state,
+                                            &final_decision,
+                                        );
+                                        self.finish_plain_request_with_events(
+                                            events,
+                                            "기존 observation으로 반복 승인 후보를 종료합니다.",
+                                            Some((&active.run_id, &active.turn_id)),
+                                            active.persona_context_start,
+                                            persona_task_state_summary(
+                                                &active,
+                                                "completed",
+                                                "duplicate approval candidate finalized from existing observation",
+                                            ),
+                                            Some(
+                                                runtime_request::conversation_task_context_summary(
+                                                    &active,
+                                                ),
+                                            ),
+                                        )?;
+                                        return Ok(());
+                                    }
+                                }
                                 if decision.tool_name().is_some() {
                                     self.log_tool_candidate_classified(&active, &decision)?;
                                     self.state.record_persona_runtime_event(
@@ -1221,6 +1472,7 @@ impl TuiApp {
                                             WorkingPhase::Apply,
                                             "결정 결과를 workspace에 반영합니다.",
                                         )?;
+                                        active.record_final_decision(&decision);
                                         runtime_workspace::record_runtime_decision(
                                             &mut self.state,
                                             &decision,
@@ -1243,6 +1495,7 @@ impl TuiApp {
                                         if let PendingChangePreparation::Failed {
                                             tool_name,
                                             arguments,
+                                            signature,
                                             observation,
                                         } = pending_change
                                         {
@@ -1250,6 +1503,7 @@ impl TuiApp {
                                                 active,
                                                 tool_name,
                                                 arguments,
+                                                signature,
                                                 observation,
                                                 None,
                                                 "change_preview_precondition_failed",
@@ -1264,6 +1518,7 @@ impl TuiApp {
                                         if let PendingChangePreparation::Pending {
                                             tool_name,
                                             arguments,
+                                            signature,
                                             preview,
                                             precondition,
                                         } = pending_change
@@ -1273,6 +1528,7 @@ impl TuiApp {
                                                     active,
                                                     tool_name,
                                                     arguments,
+                                                    signature,
                                                     preview,
                                                     precondition,
                                                 });
@@ -1347,7 +1603,7 @@ impl TuiApp {
                                 self.llm_diagnostics
                                     .record_decision_failure(error.kind.as_str());
                                 match RepairLoop::default_local().next_request_for_runtime_decision(
-                                    active.repair_attempts,
+                                    active.repair_attempts_for_source("runtime_decision"),
                                     &parsed,
                                     &error,
                                     answer,
@@ -1402,8 +1658,33 @@ impl TuiApp {
                         ));
                         self.llm_diagnostics
                             .record_parse_failure(error.kind.as_str());
+                        if let Some(final_decision) =
+                            runtime_request::completed_tool_fallback_final_decision(
+                                &active,
+                                error.kind.as_str(),
+                            )
+                        {
+                            active.record_final_decision(&final_decision);
+                            let events = runtime_workspace::record_runtime_decision(
+                                &mut self.state,
+                                &final_decision,
+                            );
+                            self.finish_plain_request_with_events(
+                                events,
+                                "성공한 도구 observation으로 파싱 실패를 종료합니다.",
+                                Some((&active.run_id, &active.turn_id)),
+                                active.persona_context_start,
+                                persona_task_state_summary(
+                                    &active,
+                                    "completed",
+                                    "tool observation succeeded before model follow-up parse failure",
+                                ),
+                                Some(runtime_request::conversation_task_context_summary(&active)),
+                            )?;
+                            return Ok(());
+                        }
                         match RepairLoop::default_local().next_request_with_raw(
-                            active.repair_attempts,
+                            active.repair_attempts_for_source("response_parse"),
                             &error,
                             Some(answer),
                         ) {
@@ -1444,6 +1725,31 @@ impl TuiApp {
                 }
             }
             LlmChatStatus::Failed(failure) => {
+                if let Some(final_decision) =
+                    runtime_request::completed_tool_fallback_final_decision(
+                        &active,
+                        failure.kind.as_str(),
+                    )
+                {
+                    active.record_final_decision(&final_decision);
+                    let events = runtime_workspace::record_runtime_decision(
+                        &mut self.state,
+                        &final_decision,
+                    );
+                    self.finish_plain_request_with_events(
+                        events,
+                        "성공한 도구 observation으로 요청 실패를 종료합니다.",
+                        Some((&active.run_id, &active.turn_id)),
+                        active.persona_context_start,
+                        persona_task_state_summary(
+                            &active,
+                            "completed",
+                            "tool observation succeeded before model follow-up request failure",
+                        ),
+                        Some(runtime_request::conversation_task_context_summary(&active)),
+                    )?;
+                    return Ok(());
+                }
                 self.llm_diagnostics.record_request_report(&report);
                 let failure_message = active.history.append(
                     active.turn_id.clone(),
@@ -1472,6 +1778,7 @@ impl TuiApp {
             Some((&active.run_id, &active.turn_id)),
             active.persona_context_start,
             persona_task_state_summary(&active, "completed", "main runtime reached answer phase"),
+            Some(runtime_request::conversation_task_context_summary(&active)),
         )
     }
 
@@ -1558,17 +1865,34 @@ impl TuiApp {
         if tool_name != "apply_patch" {
             return Ok(PendingChangePreparation::NotChange);
         }
+        let signature = change_approval_signature(tool_name, arguments, preview);
 
         match capture_change_precondition(self.tool_runtime.workspace_root(), preview) {
-            Ok(precondition) => Ok(PendingChangePreparation::Pending {
-                tool_name: tool_name.clone(),
-                arguments: arguments.clone(),
-                preview: preview.clone(),
-                precondition,
-            }),
+            Ok(precondition) => {
+                let approved = ApprovedChange {
+                    preview: preview.clone(),
+                    precondition,
+                };
+                if let Err(observation) = validate_approved_change(&approved) {
+                    return Ok(PendingChangePreparation::Failed {
+                        tool_name: tool_name.clone(),
+                        arguments: arguments.clone(),
+                        signature,
+                        observation,
+                    });
+                }
+                Ok(PendingChangePreparation::Pending {
+                    tool_name: tool_name.clone(),
+                    arguments: arguments.clone(),
+                    signature,
+                    preview: approved.preview,
+                    precondition: approved.precondition,
+                })
+            }
             Err(observation) => Ok(PendingChangePreparation::Failed {
                 tool_name: tool_name.clone(),
                 arguments: arguments.clone(),
+                signature,
                 observation,
             }),
         }
@@ -1606,6 +1930,7 @@ impl TuiApp {
             active,
             tool_name,
             arguments,
+            signature,
             preview,
             precondition,
         } = pending;
@@ -1620,6 +1945,7 @@ impl TuiApp {
             active,
             tool_name,
             arguments,
+            signature,
             observation,
             Some(preview.target_path),
             "approved_change_observation_recorded",
@@ -1636,10 +1962,13 @@ impl TuiApp {
             ToolErrorKind::PermissionError,
             "change approval was denied by the user",
         );
+        let signature =
+            change_approval_signature(&pending.tool_name, &pending.arguments, &pending.preview);
         self.handle_change_observation_after_approval(
             pending.active,
             pending.tool_name,
             pending.arguments,
+            signature,
             observation,
             None,
             "change_approval_denied",
@@ -1776,11 +2105,11 @@ impl TuiApp {
         mut active: ActivePlainRequest,
         tool_name: String,
         arguments: Value,
+        signature: String,
         observation: ToolObservation,
         diagnostic_target: Option<String>,
         persona_status: &str,
     ) -> io::Result<()> {
-        let signature = tool_signature(&tool_name, &arguments);
         active.tool_call_count = active.tool_call_count.saturating_add(1);
         active.last_tool_signature = Some(signature.clone());
         active.same_tool_repeat_count = 1;
@@ -1798,7 +2127,7 @@ impl TuiApp {
         self.enqueue_persona_progress_request(persona_task_state_summary(
             &active,
             persona_status,
-            "main runtime recorded an approved change observation and is asking the model to continue from that evidence",
+            "main runtime recorded a change observation and is asking the model to continue from that evidence",
         ));
 
         let mut workspace_events = self
@@ -1856,6 +2185,7 @@ impl TuiApp {
             &active.schema_message,
             &active.user_message,
             &observation_message,
+            &active.executed_tool_records,
             &active.executed_tool_signatures,
             &next_turn_id,
         );
@@ -1867,13 +2197,14 @@ impl TuiApp {
             .record_request_started(&active.run_id, &next_turn_id);
         self.set_runtime_working_phase(
             WorkingPhase::Interpret,
-            "승인된 변경 observation을 반영한 다음 LLM 응답을 기다립니다.",
+            "변경 observation을 반영한 다음 LLM 응답을 기다립니다.",
         )?;
 
         active.turn_id = next_turn_id;
         active.receiver =
             runtime_request::spawn_chat_request(&self.runtime_config, request_messages);
-        active.repair_attempts = 0;
+        active.reset_request_timer();
+        active.reset_repair_state();
         self.active_plain_request = Some(active);
 
         Ok(())
@@ -1925,6 +2256,7 @@ impl TuiApp {
             &active.schema_message,
             &active.user_message,
             &observation_message,
+            &active.executed_tool_records,
             &active.executed_tool_signatures,
             &next_turn_id,
         );
@@ -1942,7 +2274,8 @@ impl TuiApp {
         active.turn_id = next_turn_id;
         active.receiver =
             runtime_request::spawn_chat_request(&self.runtime_config, request_messages);
-        active.repair_attempts = 0;
+        active.reset_request_timer();
+        active.reset_repair_state();
         self.active_plain_request = Some(active);
 
         Ok(())
@@ -1989,6 +2322,7 @@ impl TuiApp {
             &active.schema_message,
             &active.user_message,
             &observation_message,
+            &active.executed_tool_records,
             &active.executed_tool_signatures,
             &next_turn_id,
         );
@@ -2006,7 +2340,8 @@ impl TuiApp {
         active.turn_id = next_turn_id;
         active.receiver =
             runtime_request::spawn_chat_request(&self.runtime_config, request_messages);
-        active.repair_attempts = 0;
+        active.reset_request_timer();
+        active.reset_repair_state();
         self.active_plain_request = Some(active);
 
         Ok(())
@@ -2058,6 +2393,7 @@ impl TuiApp {
             &active.schema_message,
             &active.user_message,
             &observation_message,
+            &active.executed_tool_records,
             &active.executed_tool_signatures,
             &next_turn_id,
         );
@@ -2075,7 +2411,8 @@ impl TuiApp {
         active.turn_id = next_turn_id;
         active.receiver =
             runtime_request::spawn_chat_request(&self.runtime_config, request_messages);
-        active.repair_attempts = 0;
+        active.reset_request_timer();
+        active.reset_repair_state();
         self.active_plain_request = Some(active);
 
         Ok(())
@@ -2219,6 +2556,7 @@ impl TuiApp {
                 Some((&active.run_id, &active.turn_id)),
                 active.persona_context_start,
                 persona_task_state_summary(&active, "tool_loop_limited", diagnosis.as_str()),
+                Some(runtime_request::conversation_task_context_summary(&active)),
             )?;
             return Ok(());
         }
@@ -2229,42 +2567,67 @@ impl TuiApp {
             } else {
                 1
             };
-        if same_tool_repeat_count > self.runtime_config.limits.max_same_tool_repeats {
-            let diagnosis = runtime_request::diagnose_tool_loop_limit(
-                "max_same_tool_repeats",
-                active.last_tool_observation.as_ref(),
-            );
-            self.log_tool_loop_limit_reached(
-                &active,
-                "max_same_tool_repeats",
-                same_tool_repeat_count,
-                self.runtime_config.limits.max_same_tool_repeats,
-                &signature,
-                diagnosis.as_str(),
-            )?;
-            self.state
-                .record_persona_runtime_event(PersonaRuntimeEvent::ToolLoopLimitReached);
-            let events = runtime_workspace::record_tool_loop_limit(
-                &mut self.state,
-                "max_same_tool_repeats",
-                diagnosis.as_str(),
-            );
-            self.finish_plain_request_with_events(
-                events,
-                "반복 도구 루프 제한을 보고합니다.",
-                Some((&active.run_id, &active.turn_id)),
-                active.persona_context_start,
-                persona_task_state_summary(&active, "tool_loop_limited", diagnosis.as_str()),
-            )?;
-            return Ok(());
-        }
-
         if let Some((redirect, execution_record)) = active
             .repeat_redirect_for_tool_candidate(&signature, tool_name, arguments)
             .map(|(redirect, record)| (redirect, record.clone()))
         {
+            let duplicate_redirect_count =
+                active.duplicate_redirect_count_for_signature(&signature);
+            if redirect == runtime_request::ToolLoopRepeatRedirect::SettledDuplicate
+                && duplicate_redirect_count > 0
+            {
+                let decision =
+                    runtime_request::settled_duplicate_final_decision(&active, &execution_record);
+                active.record_final_decision(&decision);
+                let events = runtime_workspace::record_runtime_decision(&mut self.state, &decision);
+                self.finish_plain_request_with_events(
+                    events,
+                    "기존 observation으로 반복 도구 후보를 종료합니다.",
+                    Some((&active.run_id, &active.turn_id)),
+                    active.persona_context_start,
+                    persona_task_state_summary(
+                        &active,
+                        "completed",
+                        "settled duplicate tool candidate finalized from existing observation",
+                    ),
+                    Some(runtime_request::conversation_task_context_summary(&active)),
+                )?;
+                return Ok(());
+            }
+
+            if duplicate_redirect_count >= self.runtime_config.limits.max_same_tool_repeats {
+                let diagnosis = runtime_request::diagnose_tool_loop_limit(
+                    "max_same_tool_repeats",
+                    active.last_tool_observation.as_ref(),
+                );
+                self.log_tool_loop_limit_reached(
+                    &active,
+                    "max_same_tool_repeats",
+                    duplicate_redirect_count.saturating_add(1),
+                    self.runtime_config.limits.max_same_tool_repeats,
+                    &signature,
+                    diagnosis.as_str(),
+                )?;
+                self.state
+                    .record_persona_runtime_event(PersonaRuntimeEvent::ToolLoopLimitReached);
+                let events = runtime_workspace::record_tool_loop_limit(
+                    &mut self.state,
+                    "max_same_tool_repeats",
+                    diagnosis.as_str(),
+                );
+                self.finish_plain_request_with_events(
+                    events,
+                    "반복 도구 루프 제한을 보고합니다.",
+                    Some((&active.run_id, &active.turn_id)),
+                    active.persona_context_start,
+                    persona_task_state_summary(&active, "tool_loop_limited", diagnosis.as_str()),
+                    Some(runtime_request::conversation_task_context_summary(&active)),
+                )?;
+                return Ok(());
+            }
             active.last_tool_signature = Some(signature.clone());
             active.same_tool_repeat_count = same_tool_repeat_count;
+            active.duplicate_redirect_count = duplicate_redirect_count.saturating_add(1);
 
             let next_turn_id = active.history.next_turn_id();
             self.log_turn_id_assigned(&active.history, &next_turn_id)?;
@@ -2274,6 +2637,7 @@ impl TuiApp {
                         &active.schema_message,
                         &active.user_message,
                         &execution_record,
+                        &active.executed_tool_records,
                         &active.executed_tool_signatures,
                         &next_turn_id,
                     )
@@ -2283,6 +2647,7 @@ impl TuiApp {
                         &active.schema_message,
                         &active.user_message,
                         &execution_record,
+                        &active.executed_tool_records,
                         &active.executed_tool_signatures,
                         &next_turn_id,
                     )
@@ -2292,6 +2657,7 @@ impl TuiApp {
                         &active.schema_message,
                         &active.user_message,
                         &execution_record,
+                        &active.executed_tool_records,
                         &active.executed_tool_signatures,
                         &next_turn_id,
                     )
@@ -2318,8 +2684,40 @@ impl TuiApp {
             active.turn_id = next_turn_id;
             active.receiver =
                 runtime_request::spawn_chat_request(&self.runtime_config, request_messages);
-            active.repair_attempts = 0;
+            active.reset_request_timer();
+            active.reset_repair_state();
             self.active_plain_request = Some(active);
+            return Ok(());
+        }
+
+        if same_tool_repeat_count > self.runtime_config.limits.max_same_tool_repeats {
+            let diagnosis = runtime_request::diagnose_tool_loop_limit(
+                "max_same_tool_repeats",
+                active.last_tool_observation.as_ref(),
+            );
+            self.log_tool_loop_limit_reached(
+                &active,
+                "max_same_tool_repeats",
+                same_tool_repeat_count,
+                self.runtime_config.limits.max_same_tool_repeats,
+                &signature,
+                diagnosis.as_str(),
+            )?;
+            self.state
+                .record_persona_runtime_event(PersonaRuntimeEvent::ToolLoopLimitReached);
+            let events = runtime_workspace::record_tool_loop_limit(
+                &mut self.state,
+                "max_same_tool_repeats",
+                diagnosis.as_str(),
+            );
+            self.finish_plain_request_with_events(
+                events,
+                "반복 도구 루프 제한을 보고합니다.",
+                Some((&active.run_id, &active.turn_id)),
+                active.persona_context_start,
+                persona_task_state_summary(&active, "tool_loop_limited", diagnosis.as_str()),
+                Some(runtime_request::conversation_task_context_summary(&active)),
+            )?;
             return Ok(());
         }
 
@@ -2377,6 +2775,7 @@ impl TuiApp {
             &active.schema_message,
             &active.user_message,
             &observation_message,
+            &active.executed_tool_records,
             &active.executed_tool_signatures,
             &next_turn_id,
         );
@@ -2394,7 +2793,8 @@ impl TuiApp {
         active.turn_id = next_turn_id;
         active.receiver =
             runtime_request::spawn_chat_request(&self.runtime_config, request_messages);
-        active.repair_attempts = 0;
+        active.reset_request_timer();
+        active.reset_repair_state();
         self.active_plain_request = Some(active);
 
         Ok(())
@@ -2425,7 +2825,9 @@ impl TuiApp {
         let receiver = runtime_request::spawn_chat_request(&self.runtime_config, request_messages);
 
         active.receiver = receiver;
+        active.reset_request_timer();
         active.repair_attempts = repair_request.attempt;
+        active.repair_source = Some(repair_request.source);
         self.active_plain_request = Some(active);
         Ok(())
     }
@@ -2452,6 +2854,7 @@ impl TuiApp {
         runtime_ids: Option<(&str, &str)>,
         persona_context_start: usize,
         persona_task_state_summary: String,
+        runtime_context_summary: Option<String>,
     ) -> io::Result<()> {
         self.set_runtime_working_phase(WorkingPhase::Answer, answer_detail)?;
         let complete_outcome = self.state.complete_working_process();
@@ -2463,6 +2866,8 @@ impl TuiApp {
         if let Some(prompt) = self.state.pending_prompt.as_ref() {
             self.previous_task_frame = Some(ConversationTaskFrame {
                 user_prompt: prompt.clone(),
+                runtime_context_summary: runtime_context_summary
+                    .unwrap_or_else(|| persona_task_state_summary.clone()),
                 task_state_summary: persona_task_state_summary,
             });
         }
@@ -2699,6 +3104,7 @@ impl TuiApp {
                 "turn_id": &active.turn_id,
                 "attempt": repair_request.attempt,
                 "max_attempts": repair_request.max_attempts,
+                "source": repair_request.source,
                 "failure_signature": &repair_request.failure_signature,
                 "prompt_chars": repair_request.prompt.chars().count(),
             }),
@@ -3823,6 +4229,48 @@ fn argument_keys(arguments: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn approval_signature(decision: &RuntimeDecision) -> String {
+    match decision {
+        RuntimeDecision::ApprovalNeeded {
+            tool_name,
+            arguments,
+            change_preview: Some(preview),
+            ..
+        } if tool_name == "apply_patch" => change_approval_signature(tool_name, arguments, preview),
+        RuntimeDecision::ApprovalNeeded {
+            tool_name,
+            arguments,
+            ..
+        } => tool_signature(tool_name, arguments),
+        _ => "non-approval".to_owned(),
+    }
+}
+
+fn change_approval_signature(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    preview: &ChangePreview,
+) -> String {
+    if tool_name != "apply_patch" {
+        return tool_signature(tool_name, arguments);
+    }
+    format!(
+        "apply_patch:target={}:operation={}:payload_hash={:016x}",
+        preview.target_path,
+        preview.operation.as_str(),
+        stable_signature_hash(&preview.payload_body)
+    )
+}
+
+fn stable_signature_hash(text: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn tool_signature(tool_name: &str, arguments: &serde_json::Value) -> String {
     format!("{tool_name}:{}", arguments)
 }
@@ -3988,9 +4436,10 @@ fn persona_turn_prompt_messages(prompt: PersonaTurnPrompt) -> Vec<LlmMessage> {
 
 fn conversation_context_message(frame: &ConversationTaskFrame) -> String {
     format!(
-        "<AHREUM_CONVERSATION_CONTEXT>\nprevious_task_user_request:\n{previous_prompt}\n\nprevious_task_state_summary:\n{previous_summary}\n\ninstruction: The current user message may be a follow-up, retry, correction, complaint, or an unrelated new task. Decide from the current message semantics. Use previous_task only when the current message depends on it; otherwise ignore it. Do not invent file contents, extracted values, package names, versions, or successful execution facts from this context.\n</AHREUM_CONVERSATION_CONTEXT>",
+        "<AHREUM_CONVERSATION_CONTEXT>\nprevious_task_user_request:\n{previous_prompt}\n\nprevious_task_state_summary:\n{previous_summary}\n\nprevious_runtime_context:\n{runtime_context}\n\ninstruction: The current user message may be a follow-up, retry, correction, complaint, or an unrelated new task. Decide from the current message semantics. Use previous_task only when the current message depends on it; otherwise ignore it. A previous task state that was limited, failed, canceled, or blocked is not completed evidence. Do not invent file contents, extracted values, package names, versions, path candidates, or successful execution facts from this context.\n</AHREUM_CONVERSATION_CONTEXT>",
         previous_prompt = frame.user_prompt,
         previous_summary = frame.task_state_summary,
+        runtime_context = frame.runtime_context_summary,
     )
 }
 
@@ -3999,7 +4448,7 @@ fn persona_follow_up_task_state_summary(
     current_prompt: &str,
 ) -> String {
     format!(
-        "follow_up_policy: current user message may be a follow-up, retry, correction, complaint, or unrelated new task; relate it to the previous task only when the message depends on it.\nprevious_user_request: {previous_prompt}\nprevious_task_state_summary:\n{previous_summary}\ncurrent_user_message: {current_prompt}\nfact_boundary: persona must not state literal extracted values, file contents, package names, versions, or configuration values; those belong only in the main answer.",
+        "follow_up_policy: current user message may be a follow-up, retry, correction, complaint, or unrelated new task; relate it to the previous task only when the message depends on it.\nprevious_user_request: {previous_prompt}\nprevious_task_state_summary:\n{previous_summary}\ncurrent_user_message: {current_prompt}\nfact_boundary: persona must not state literal paths, filenames, config keys, extracted values, file contents, package names, provider names, versions, or configuration values; those belong only in the main answer.",
         previous_prompt = frame.user_prompt,
         previous_summary = frame.task_state_summary,
         current_prompt = current_prompt,
@@ -4025,16 +4474,31 @@ fn persona_task_state_summary(
             observation.target_raw.as_deref().unwrap_or("-"),
             observation.error_kind.unwrap_or("-"),
         ));
-        lines.push("fact_boundary: persona must not state literal extracted values, file contents, package names, versions, or configuration values; those belong only in the main answer.".to_owned());
+        lines.push("fact_boundary: persona must not state literal paths, filenames, config keys, extracted values, file contents, package names, provider names, versions, or configuration values; those belong only in the main answer.".to_owned());
         if observation.status != "succeeded" || observation.error_kind.is_some() {
             lines.push("fact_boundary: last observation is not successful evidence; persona must not claim file contents or completed analysis from it.".to_owned());
         }
     } else {
         lines.push("last_observation: none".to_owned());
-        lines.push("fact_boundary: no observation is available to persona; do not state literal extracted values, file contents, package names, versions, or configuration values.".to_owned());
+        lines.push("fact_boundary: no observation is available to persona; do not state literal paths, filenames, config keys, extracted values, file contents, package names, provider names, versions, or configuration values.".to_owned());
     }
 
     lines.join("\n")
+}
+
+fn should_finalize_duplicate_approval_redirect(
+    redirect: runtime_request::ToolLoopRepeatRedirect,
+    duplicate_redirect_count: u16,
+    max_same_tool_repeats: u16,
+) -> bool {
+    let was_already_redirected = duplicate_redirect_count > 0;
+    match redirect {
+        runtime_request::ToolLoopRepeatRedirect::SettledDuplicate => was_already_redirected,
+        runtime_request::ToolLoopRepeatRedirect::FailedDuplicate => was_already_redirected,
+        runtime_request::ToolLoopRepeatRedirect::TruncatedContinuation => {
+            duplicate_redirect_count >= max_same_tool_repeats
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4064,8 +4528,23 @@ mod tests {
 
         let summary = super::persona_task_state_summary(&active, "completed", "done");
 
-        assert!(summary.contains("literal extracted values"));
+        assert!(summary.contains("literal paths"));
+        assert!(summary.contains("filenames"));
         assert!(summary.contains("last_observation: none"));
+    }
+
+    #[test]
+    fn failed_duplicate_approval_finalizes_after_one_redirect() {
+        assert!(!super::should_finalize_duplicate_approval_redirect(
+            crate::tui::runtime_request::ToolLoopRepeatRedirect::FailedDuplicate,
+            0,
+            8,
+        ));
+        assert!(super::should_finalize_duplicate_approval_redirect(
+            crate::tui::runtime_request::ToolLoopRepeatRedirect::FailedDuplicate,
+            1,
+            8,
+        ));
     }
 
     #[test]
@@ -4073,6 +4552,7 @@ mod tests {
         let frame = super::ConversationTaskFrame {
             user_prompt: "이전 HTML 작업".to_owned(),
             task_state_summary: "main_runtime_status: tool_loop_limited".to_owned(),
+            runtime_context_summary: "previous_final_response: none".to_owned(),
         };
 
         let message = super::conversation_context_message(&frame);
@@ -4082,6 +4562,7 @@ mod tests {
         assert!(message.contains("이전 HTML 작업"));
         assert!(message.contains("Use previous_task only when the current message depends on it"));
         assert!(message.contains("otherwise ignore it"));
+        assert!(message.contains("previous_runtime_context"));
         assert!(!message.contains("중간에 끊겼는데"));
     }
 
@@ -4091,6 +4572,7 @@ mod tests {
         let frame = super::ConversationTaskFrame {
             user_prompt: "이전 설정 분석".to_owned(),
             task_state_summary: "main_runtime_status: completed\nlast_observation: none".to_owned(),
+            runtime_context_summary: "previous_final_response: config path noted".to_owned(),
         };
 
         let summary =
@@ -4102,6 +4584,26 @@ mod tests {
             summary.contains("relate it to the previous task only when the message depends on it")
         );
         assert!(summary.contains("fact_boundary"));
+    }
+}
+
+fn plain_request_timeout_report(
+    config: &RuntimeConfig,
+    active: &ActivePlainRequest,
+) -> LlmChatReport {
+    LlmChatReport {
+        provider: config.provider.active.clone(),
+        base_url: config.provider.base_url.clone(),
+        model: config.provider.model.clone(),
+        chat_url: format!(
+            "{}/chat/completions",
+            config.provider.base_url.trim_end_matches('/')
+        ),
+        latency_ms: active.request_started_at.elapsed().as_millis(),
+        status: LlmChatStatus::Failed(LlmChatFailure::new(
+            ChatFailureKind::Timeout,
+            "local LLM request exceeded the UI request timeout boundary",
+        )),
     }
 }
 

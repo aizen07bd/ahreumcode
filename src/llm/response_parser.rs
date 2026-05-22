@@ -111,7 +111,11 @@ pub(crate) fn parse_runtime_response_envelope_diagnostic(
     raw: &str,
 ) -> Option<RuntimeResponseEnvelopeDiagnostic> {
     let unwrapped = unwrap_whole_markdown_fence(raw.trim());
-    let (json_raw, _) = split_action_and_payloads(unwrapped).ok()?;
+    let contract_raw = isolate_contract_segment(unwrapped).ok()?;
+    let json_raw = split_action_and_payloads(contract_raw)
+        .map(|(json_raw, _)| json_raw)
+        .or_else(|_| leading_unframed_json_before_payload(contract_raw))
+        .ok()?;
     let value = serde_json::from_str::<Value>(json_raw.trim()).ok()?;
     let envelope = value.as_object()?;
 
@@ -129,6 +133,21 @@ pub(crate) fn parse_runtime_response_envelope_diagnostic(
             .and_then(Value::as_str)
             .map(str::to_owned),
     })
+}
+
+fn leading_unframed_json_before_payload(raw: &str) -> Result<&str, RuntimeResponseParseError> {
+    let Some(payload_start) = raw.find(PAYLOAD_OPEN_PREFIX) else {
+        return Err(RuntimeResponseParseError::schema(
+            "no unframed payload block to diagnose",
+        ));
+    };
+    let json_candidate = raw[..payload_start].trim();
+    if json_candidate.is_empty() {
+        return Err(RuntimeResponseParseError::schema(
+            "missing JSON envelope before payload block",
+        ));
+    }
+    Ok(json_candidate)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -311,7 +330,9 @@ pub fn parse_runtime_response(
     raw: &str,
 ) -> Result<ParsedRuntimeResponse, RuntimeResponseParseError> {
     let unwrapped = unwrap_whole_markdown_fence(raw.trim());
-    let (json_raw, payload_raw) = split_action_and_payloads(unwrapped)?;
+    let contract_raw = isolate_contract_segment(unwrapped)?;
+    let (json_raw, payload_raw) = split_action_and_payloads(contract_raw)?;
+    let json_raw = isolate_json_envelope(json_raw)?;
     let value = serde_json::from_str::<Value>(json_raw.trim())
         .map_err(|source| RuntimeResponseParseError::json(source.to_string()))?;
     let envelope = value.as_object().ok_or_else(|| {
@@ -324,7 +345,7 @@ pub fn parse_runtime_response(
     Ok(ParsedRuntimeResponse { response, payloads })
 }
 
-fn unwrap_whole_markdown_fence(raw: &str) -> &str {
+pub(crate) fn unwrap_whole_markdown_fence(raw: &str) -> &str {
     let Some(body) = raw.strip_prefix("```") else {
         return raw;
     };
@@ -339,6 +360,29 @@ fn unwrap_whole_markdown_fence(raw: &str) -> &str {
         return raw;
     };
     raw[first_line_end + 1..raw.len() - 3].trim()
+}
+
+fn isolate_contract_segment(raw: &str) -> Result<&str, RuntimeResponseParseError> {
+    let trimmed = raw.trim();
+    let Some(start) = trimmed.find(ACTION_OPEN) else {
+        return Ok(trimmed);
+    };
+    if trimmed[start + ACTION_OPEN.len()..].contains(ACTION_OPEN) {
+        return Err(RuntimeResponseParseError::schema(
+            "response must contain exactly one AHREUM_ACTION block",
+        ));
+    }
+
+    let action_close_end = trimmed
+        .find(ACTION_CLOSE)
+        .map(|index| index + ACTION_CLOSE.len())
+        .ok_or_else(|| RuntimeResponseParseError::partial("missing AHREUM_ACTION close tag"))?;
+    let end = trimmed
+        .rfind(PAYLOAD_CLOSE)
+        .map(|index| index + PAYLOAD_CLOSE.len())
+        .unwrap_or(action_close_end);
+
+    Ok(trimmed[start..end].trim())
 }
 
 fn split_action_and_payloads(raw: &str) -> Result<(&str, &str), RuntimeResponseParseError> {
@@ -360,6 +404,61 @@ fn split_action_and_payloads(raw: &str) -> Result<(&str, &str), RuntimeResponseP
     Ok((trimmed, ""))
 }
 
+fn isolate_json_envelope(raw: &str) -> Result<&str, RuntimeResponseParseError> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with(ACTION_OPEN) {
+        return Ok(trimmed);
+    }
+    let Some(start) = trimmed.find('{') else {
+        return Ok(trimmed);
+    };
+    if start > 0 {
+        return Err(RuntimeResponseParseError::schema(
+            "plain JSON response must start with a JSON object",
+        ));
+    }
+
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in trimmed.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = index + ch.len_utf8();
+                    let trailing = trimmed[end..].trim();
+                    if trailing.is_empty() {
+                        return Ok(&trimmed[..end]);
+                    }
+                    if trailing.starts_with(PAYLOAD_OPEN_PREFIX) {
+                        return Err(RuntimeResponseParseError::schema(
+                            "payload blocks require AHREUM_ACTION framing",
+                        ));
+                    }
+                    return Ok(&trimmed[..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(trimmed)
+}
+
 fn split_leading_action(raw: &str) -> Result<(&str, &str), RuntimeResponseParseError> {
     let close_index = raw
         .find(ACTION_CLOSE)
@@ -375,11 +474,10 @@ fn parse_runtime_payloads(raw: &str) -> Result<Vec<RuntimePayload>, RuntimeRespo
     let mut ids = HashSet::new();
 
     while !rest.is_empty() {
-        if !rest.starts_with(PAYLOAD_OPEN_PREFIX) {
-            return Err(RuntimeResponseParseError::payload(
-                "unexpected text outside AHREUM_PAYLOAD block",
-            ));
-        }
+        let Some(payload_start) = rest.find(PAYLOAD_OPEN_PREFIX) else {
+            break;
+        };
+        rest = &rest[payload_start..];
 
         let header_end = rest.find('>').ok_or_else(|| {
             RuntimeResponseParseError::partial("missing AHREUM_PAYLOAD header end")
@@ -866,7 +964,7 @@ console.log(greeting);
     }
 
     #[test]
-    fn rejects_action_block_after_leading_text() {
+    fn parses_action_block_with_leading_model_text() {
         let raw = format!(
             r#"Here is the contract:
 <AHREUM_ACTION>
@@ -875,16 +973,12 @@ console.log(greeting);
             manifest_fields()
         );
 
-        let error = parse_runtime_response(&raw).expect_err("leading text should fail");
+        let parsed = parse_runtime_response(&raw).expect("tagged contract should parse");
 
-        assert_eq!(
-            error.kind,
-            RuntimeResponseParseErrorKind::SchemaValidationFailed
-        );
-        assert_eq!(
-            error.message,
-            "framed response must start with AHREUM_ACTION"
-        );
+        let RuntimeResponse::Answer(answer) = parsed.response else {
+            panic!("expected answer");
+        };
+        assert_eq!(answer.message, "ready");
     }
 
     #[test]
@@ -931,7 +1025,7 @@ body
     }
 
     #[test]
-    fn rejects_text_between_action_and_payload_blocks() {
+    fn parses_payload_block_with_interstitial_model_text() {
         let raw = format!(
             r#"<AHREUM_ACTION>
 {{"response_type":"answer","activity":"None","message":"summary","answer_payload_id":"answer_001",{} }}
@@ -943,16 +1037,10 @@ body
             manifest_fields()
         );
 
-        let error = parse_runtime_response(&raw).expect_err("text between blocks should fail");
+        let parsed = parse_runtime_response(&raw).expect("tagged payload should parse");
 
-        assert_eq!(
-            error.kind,
-            RuntimeResponseParseErrorKind::PayloadValidationFailed
-        );
-        assert_eq!(
-            error.message,
-            "unexpected text outside AHREUM_PAYLOAD block"
-        );
+        assert_eq!(parsed.payloads.len(), 1);
+        assert_eq!(parsed.payloads[0].body, "body");
     }
 
     #[test]
@@ -1080,6 +1168,31 @@ unused
         assert_eq!(
             error.kind,
             RuntimeResponseParseErrorKind::PayloadValidationFailed
+        );
+    }
+
+    #[test]
+    fn extracts_envelope_diagnostic_from_unframed_payload_response() {
+        let raw = format!(
+            r#"{{"response_type":"tool","activity":"Change","message":"patch","tool_name":"apply_patch","arguments":{{"payload_id":"patch_001"}},"reason":"change",{} }}
+<AHREUM_PAYLOAD id="patch_001" format="apply_patch">
+*** Begin Patch
+*** Update File: src/main.rs
+*** End Patch
+</AHREUM_PAYLOAD>"#,
+            manifest_fields()
+        );
+
+        let diagnostic = parse_runtime_response_envelope_diagnostic(&raw)
+            .expect("unframed payload diagnostic should parse");
+
+        assert_eq!(diagnostic.response_type.as_deref(), Some("tool"));
+        assert_eq!(diagnostic.activity.as_deref(), Some("Change"));
+        assert_eq!(diagnostic.tool_name.as_deref(), Some("apply_patch"));
+        let error = parse_runtime_response(&raw).expect_err("framing should still fail");
+        assert_eq!(
+            error.message,
+            "framed response must start with AHREUM_ACTION"
         );
     }
 

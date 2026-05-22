@@ -124,14 +124,16 @@ impl<'a> CommandCandidate<'a> {
             .and_then(|object| object.get("argv"))
             .and_then(Value::as_array)?;
         let program = argv.first().and_then(Value::as_str)?;
-        if program.trim().is_empty() {
+        if !is_plain_command_part(program) {
             return None;
         }
+        let args = argv
+            .iter()
+            .skip(1)
+            .map(|value| value.as_str().filter(|part| is_plain_command_part(part)))
+            .collect::<Option<Vec<_>>>()?;
 
-        Some(Self {
-            program,
-            args: argv.iter().skip(1).filter_map(Value::as_str).collect(),
-        })
+        Some(Self { program, args })
     }
 
     fn argv(&self) -> Vec<String> {
@@ -353,6 +355,10 @@ fn is_hidden_or_control(character: char) -> bool {
         )
 }
 
+fn is_plain_command_part(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && !value.chars().any(is_hidden_or_control)
+}
+
 fn persistent_approval_allowed(candidate: &CommandCandidate<'_>) -> bool {
     !matches!(
         candidate.program,
@@ -374,136 +380,88 @@ mod tests {
     use super::{CommandCapability, CommandPolicy, CommandPolicyDecision};
 
     #[test]
-    fn classifies_safe_verification_as_approval_required() {
-        assert_eq!(
-            CommandPolicy::evaluate(&json!({"argv":["cargo","test"],"cwd":".","timeout_ms":30000})),
-            CommandPolicyDecision::ApprovalRequired {
-                capability: CommandCapability::BuildTest
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_recursive_delete_as_manual_only() {
-        assert_eq!(
-            CommandPolicy::evaluate(
-                &json!({"argv":["rm","-rf","target"],"cwd":".","timeout_ms":30000})
+    fn classifies_command_policy_matrix() {
+        let cases = [
+            (
+                json!({"argv":["cargo","test"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ApprovalRequired {
+                    capability: CommandCapability::BuildTest,
+                },
             ),
-            CommandPolicyDecision::ManualOnly {
-                capability: CommandCapability::DestructiveFilesystem,
-                reason: "destructive filesystem command"
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_system_command_as_manual_only() {
-        assert_eq!(
-            CommandPolicy::evaluate(
-                &json!({"argv":["sudo","cargo","test"],"cwd":".","timeout_ms":30000})
+            (
+                json!({"argv":["git","status","--short"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ApprovalRequired {
+                    capability: CommandCapability::ReadOnly,
+                },
             ),
-            CommandPolicyDecision::ManualOnly {
-                capability: CommandCapability::SystemLevel,
-                reason: "system-level command"
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_external_service_command_as_manual_only() {
-        assert_eq!(
-            CommandPolicy::evaluate(
-                &json!({"argv":["curl","https://example.com"],"cwd":".","timeout_ms":30000})
+            (
+                json!({"argv":["rm","-rf","target"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ManualOnly {
+                    capability: CommandCapability::DestructiveFilesystem,
+                    reason: "destructive filesystem command",
+                },
             ),
-            CommandPolicyDecision::ManualOnly {
-                capability: CommandCapability::ExternalService,
-                reason: "external-service command"
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_unknown_command_as_manual_only() {
-        assert_eq!(
-            CommandPolicy::evaluate(&json!({"argv":["custom-tool"],"cwd":".","timeout_ms":30000})),
-            CommandPolicyDecision::ManualOnly {
-                capability: CommandCapability::Unknown,
-                reason: "command is outside the approved execution contract"
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_mutation_without_dry_run_contract_as_manual_only() {
-        assert_eq!(
-            CommandPolicy::evaluate(
-                &json!({"argv":["touch","index.html"],"cwd":".","timeout_ms":30000})
+            (
+                json!({"argv":["sudo","cargo","test"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ManualOnly {
+                    capability: CommandCapability::SystemLevel,
+                    reason: "system-level command",
+                },
             ),
-            CommandPolicyDecision::ManualOnly {
-                capability: CommandCapability::Mutation,
-                reason: "mutation command requires a dry-run contract"
-            }
-        );
-    }
+            (
+                json!({"argv":["curl","https://example.com"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ManualOnly {
+                    capability: CommandCapability::ExternalService,
+                    reason: "external-service command",
+                },
+            ),
+            (
+                json!({"argv":["touch","index.html"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ManualOnly {
+                    capability: CommandCapability::Mutation,
+                    reason: "mutation command requires a dry-run contract",
+                },
+            ),
+            (
+                json!({"argv":["git","reset","--hard"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ManualOnly {
+                    capability: CommandCapability::Mutation,
+                    reason: "mutation command requires a dry-run contract",
+                },
+            ),
+            (
+                json!({"argv":["sed","-i","s/a/b/","file.txt"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ManualOnly {
+                    capability: CommandCapability::Mutation,
+                    reason: "mutation command requires a dry-run contract",
+                },
+            ),
+            (
+                json!({"argv":["custom-tool"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ManualOnly {
+                    capability: CommandCapability::Unknown,
+                    reason: "command is outside the approved execution contract",
+                },
+            ),
+            (
+                json!({"argv":["python3","script.py"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ManualOnly {
+                    capability: CommandCapability::Unknown,
+                    reason: "command is outside the approved execution contract",
+                },
+            ),
+            (
+                json!({"argv":["git","show","HEAD"],"cwd":".","timeout_ms":30000}),
+                CommandPolicyDecision::ManualOnly {
+                    capability: CommandCapability::Unknown,
+                    reason: "command is outside the approved execution contract",
+                },
+            ),
+        ];
 
-    #[test]
-    fn classifies_git_mutation_as_manual_only() {
-        assert_eq!(
-            CommandPolicy::evaluate(
-                &json!({"argv":["git","reset","--hard"],"cwd":".","timeout_ms":30000})
-            ),
-            CommandPolicyDecision::ManualOnly {
-                capability: CommandCapability::Mutation,
-                reason: "mutation command requires a dry-run contract"
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_sed_in_place_as_manual_only() {
-        assert_eq!(
-            CommandPolicy::evaluate(
-                &json!({"argv":["sed","-i","s/a/b/","file.txt"],"cwd":".","timeout_ms":30000})
-            ),
-            CommandPolicyDecision::ManualOnly {
-                capability: CommandCapability::Mutation,
-                reason: "mutation command requires a dry-run contract"
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_arbitrary_interpreter_as_manual_only() {
-        assert_eq!(
-            CommandPolicy::evaluate(
-                &json!({"argv":["python3","script.py"],"cwd":".","timeout_ms":30000})
-            ),
-            CommandPolicyDecision::ManualOnly {
-                capability: CommandCapability::Unknown,
-                reason: "command is outside the approved execution contract"
-            }
-        );
-    }
-
-    #[test]
-    fn allows_only_closed_git_read_contracts() {
-        assert_eq!(
-            CommandPolicy::evaluate(
-                &json!({"argv":["git","status","--short"],"cwd":".","timeout_ms":30000})
-            ),
-            CommandPolicyDecision::ApprovalRequired {
-                capability: CommandCapability::ReadOnly
-            }
-        );
-        assert_eq!(
-            CommandPolicy::evaluate(
-                &json!({"argv":["git","show","HEAD"],"cwd":".","timeout_ms":30000})
-            ),
-            CommandPolicyDecision::ManualOnly {
-                capability: CommandCapability::Unknown,
-                reason: "command is outside the approved execution contract"
-            }
-        );
+        for (arguments, expected) in cases {
+            assert_eq!(CommandPolicy::evaluate(&arguments), expected);
+        }
     }
 
     #[test]
@@ -518,5 +476,21 @@ mod tests {
         assert!(rendered.contains("parsed_argv: \"git\" \"status\""));
         assert!(rendered.contains("persistent_approval_allowed: false"));
         assert!(rendered.contains("broad_persistent_prefix_denied"));
+    }
+
+    #[test]
+    fn rejects_unclassifiable_argv_shapes_without_dropping_parts() {
+        for arguments in [
+            json!({"argv":["cargo","test",true],"cwd":".","timeout_ms":30000}),
+            json!({"argv":["cargo","test\n"],"cwd":".","timeout_ms":30000}),
+        ] {
+            assert_eq!(
+                CommandPolicy::evaluate(&arguments),
+                CommandPolicyDecision::ManualOnly {
+                    capability: CommandCapability::Unknown,
+                    reason: "command arguments could not be classified"
+                }
+            );
+        }
     }
 }
