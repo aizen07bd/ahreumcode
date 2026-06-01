@@ -82,6 +82,9 @@ pub(super) fn record_runtime_decision(
             events.extend(state.record_system_notice(message.clone()));
             events
         }
+        RuntimeDecision::PlanCandidate { message, items, .. } => state.record_system_notice(
+            format!("task plan accepted: {} ({} items)", message, items.len()),
+        ),
         RuntimeDecision::ToolCandidatePending {
             activity,
             tool_name,

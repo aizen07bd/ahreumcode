@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -6,9 +7,10 @@ use crate::config::RuntimeConfig;
 use crate::llm::{
     payload_ordering_contract_lines, response_boundary_contract_lines,
     tool_path_selection_contract_lines, Activity, LlmChatReport, LlmChatRequest, LlmMessage,
-    LlmMessageRole, LlmProviderFactory, MessageHistory, PatchOperation, RuntimeDecision,
+    LlmMessageRole, LlmMessageVisibility, LlmProviderFactory, MessageHistory, PatchOperation,
+    PlanOperation, RuntimeDecision, RuntimePlanItem,
 };
-use crate::tool::ToolObservation;
+use crate::tool::{resolve_existing_workspace_path, ToolObservation};
 
 const MIN_LOCAL_CHAT_TIMEOUT_MS: u64 = 180_000;
 const RECENT_TOOL_OBSERVATION_LIMIT: usize = 4;
@@ -17,6 +19,7 @@ pub(super) struct ActivePlainRequest {
     pub(super) run_id: String,
     pub(super) turn_id: String,
     pub(super) prompt: String,
+    pub(super) workspace_root: PathBuf,
     pub(super) schema_message: LlmMessage,
     pub(super) user_message: LlmMessage,
     pub(super) history: MessageHistory,
@@ -26,6 +29,7 @@ pub(super) struct ActivePlainRequest {
     pub(super) cancelled: bool,
     pub(super) repair_attempts: u16,
     pub(super) repair_source: Option<&'static str>,
+    pub(super) plan_candidate_count: u16,
     pub(super) tool_call_count: u16,
     pub(super) last_tool_signature: Option<String>,
     pub(super) executed_tool_signatures: Vec<String>,
@@ -34,7 +38,9 @@ pub(super) struct ActivePlainRequest {
     pub(super) duplicate_redirect_count: u16,
     pub(super) last_tool_observation: Option<ToolLoopObservation>,
     pub(super) last_successful_tool_observation: Option<ToolLoopObservation>,
-    pub(super) pending_change_after_read_target: Option<String>,
+    pub(super) planned_read_targets: Vec<String>,
+    pub(super) pending_change_targets: Vec<String>,
+    pub(super) pending_change_after_read_targets: Vec<String>,
     pub(super) final_response_text: Option<String>,
 }
 
@@ -43,6 +49,7 @@ impl ActivePlainRequest {
         run_id: String,
         turn_id: String,
         prompt: String,
+        workspace_root: PathBuf,
         schema_message: LlmMessage,
         user_message: LlmMessage,
         history: MessageHistory,
@@ -53,6 +60,7 @@ impl ActivePlainRequest {
             run_id,
             turn_id,
             prompt,
+            workspace_root,
             schema_message,
             user_message,
             history,
@@ -62,6 +70,7 @@ impl ActivePlainRequest {
             cancelled: false,
             repair_attempts: 0,
             repair_source: None,
+            plan_candidate_count: 0,
             tool_call_count: 0,
             last_tool_signature: None,
             executed_tool_signatures: Vec::new(),
@@ -70,7 +79,9 @@ impl ActivePlainRequest {
             duplicate_redirect_count: 0,
             last_tool_observation: None,
             last_successful_tool_observation: None,
-            pending_change_after_read_target: None,
+            planned_read_targets: Vec::new(),
+            pending_change_targets: Vec::new(),
+            pending_change_after_read_targets: Vec::new(),
             final_response_text: None,
         }
     }
@@ -109,6 +120,7 @@ impl ActivePlainRequest {
             observation: loop_observation.clone(),
             observation_message,
         });
+        self.plan_candidate_count = 0;
         self.duplicate_redirect_count = 0;
         if loop_observation.status == "succeeded"
             && loop_observation.error_kind.is_none()
@@ -121,9 +133,60 @@ impl ActivePlainRequest {
             && loop_observation.status == "succeeded"
             && loop_observation.error_kind.is_none()
         {
-            self.pending_change_after_read_target = None;
+            let mut changed_targets = changed_targets_from_observation(&loop_observation);
+            if let Some(target) = loop_observation.target_raw.as_deref() {
+                push_unique(&mut changed_targets, target.to_owned());
+            }
+            self.pending_change_targets
+                .retain(|target| !changed_targets.iter().any(|changed| changed == target));
+            self.pending_change_after_read_targets
+                .retain(|target| !changed_targets.iter().any(|changed| changed == target));
         }
         self.last_tool_observation = Some(loop_observation);
+    }
+
+    pub(super) fn add_pending_change_targets(&mut self, targets: Vec<String>) {
+        for target in targets {
+            push_unique(&mut self.pending_change_targets, target);
+        }
+    }
+
+    pub(super) fn add_pending_change_after_read_targets(&mut self, targets: Vec<String>) {
+        for target in targets {
+            push_unique(&mut self.pending_change_after_read_targets, target);
+        }
+    }
+
+    pub(super) fn apply_plan_items(&mut self, items: &[RuntimePlanItem]) {
+        for item in items {
+            let Some(target) = item.target.as_deref() else {
+                continue;
+            };
+            match item.operation {
+                PlanOperation::Read => {
+                    push_unique(&mut self.planned_read_targets, target.to_owned())
+                }
+                PlanOperation::Create | PlanOperation::Update | PlanOperation::Delete => {
+                    push_unique(&mut self.pending_change_targets, target.to_owned());
+                }
+                PlanOperation::Execute | PlanOperation::Verify | PlanOperation::Answer => {}
+            }
+        }
+    }
+
+    pub(super) fn planned_read_target_count(&self) -> usize {
+        self.planned_read_targets.len()
+    }
+
+    pub(super) fn pending_planned_read_target_count(&self) -> usize {
+        self.planned_read_targets
+            .iter()
+            .filter(|target| !has_successful_read_for_target_after(self, target, None))
+            .count()
+    }
+
+    pub(super) fn pending_change_target_count(&self) -> usize {
+        self.pending_change_targets.len()
     }
 
     pub(super) fn record_final_decision(&mut self, decision: &RuntimeDecision) {
@@ -143,6 +206,7 @@ impl ActivePlainRequest {
             RuntimeDecision::Clarify { message, .. } | RuntimeDecision::Blocked { message, .. } => {
                 self.final_response_text = Some(message.clone());
             }
+            RuntimeDecision::PlanCandidate { .. } => {}
             RuntimeDecision::ToolCandidatePending { .. }
             | RuntimeDecision::ApprovalNeeded { .. } => {}
         }
@@ -360,6 +424,9 @@ pub(super) fn settled_duplicate_final_decision(
     if read_recovery_needs_file_content(active) && observation.tool_name != "read_file" {
         return read_recovery_requires_content_decision(observation);
     }
+    if let Some(next_read_decision) = sequential_read_progress_next_decision(active) {
+        return next_read_decision;
+    }
     if observation.preview.is_empty() {
         return RuntimeDecision::Blocked {
             message: format!(
@@ -385,9 +452,13 @@ pub(super) fn apply_final_answer_evidence_boundary(
         return recovery_decision;
     }
 
-    if !matches!(decision, RuntimeDecision::Answer { .. })
-        || active.executed_tool_records.is_empty()
-    {
+    let is_terminal_decision = matches!(
+        decision,
+        RuntimeDecision::Answer { .. }
+            | RuntimeDecision::Clarify { .. }
+            | RuntimeDecision::Blocked { .. }
+    );
+    if !is_terminal_decision || active.executed_tool_records.is_empty() {
         return decision;
     }
 
@@ -406,6 +477,18 @@ pub(super) fn apply_final_answer_evidence_boundary(
         };
     }
 
+    if let Some(next_read_decision) = planned_read_next_decision(active) {
+        return next_read_decision;
+    }
+
+    if let Some(next_read_decision) = sequential_read_progress_next_decision(active) {
+        return next_read_decision;
+    }
+
+    if !matches!(decision, RuntimeDecision::Answer { .. }) {
+        return decision;
+    }
+
     if let Some(observation) = unresolved_failed_change_observation(active) {
         return RuntimeDecision::Blocked {
             message: format!(
@@ -417,10 +500,21 @@ pub(super) fn apply_final_answer_evidence_boundary(
         };
     }
 
-    if let Some(target) = active.pending_change_after_read_target.as_deref() {
+    if !active.pending_change_targets.is_empty() {
+        let targets = active.pending_change_targets.join(", ");
         return RuntimeDecision::Blocked {
             message: format!(
-                "변경 전 읽기는 성공했지만 아직 파일 변경 관측이 없어 완료 답변을 할 수 없습니다. next_required_tool: apply_patch, target: {target}"
+                "아직 완료 관측이 없는 파일 변경 대상이 있어 완료 답변을 할 수 없습니다. next_required_tool: apply_patch, pending_targets: {targets}"
+            ),
+            reason: "answer_with_pending_change_targets".to_owned(),
+        };
+    }
+
+    if !active.pending_change_after_read_targets.is_empty() {
+        let targets = active.pending_change_after_read_targets.join(", ");
+        return RuntimeDecision::Blocked {
+            message: format!(
+                "변경 전 읽기는 성공했지만 아직 파일 변경 관측이 없어 완료 답변을 할 수 없습니다. next_required_tool: apply_patch, targets: {targets}"
             ),
             reason: "answer_after_prerequisite_read_without_change".to_owned(),
         };
@@ -449,6 +543,89 @@ pub(super) fn apply_final_answer_evidence_boundary(
     }
 }
 
+fn planned_read_next_decision(active: &ActivePlainRequest) -> Option<RuntimeDecision> {
+    let target = active
+        .planned_read_targets
+        .iter()
+        .find(|target| !has_successful_read_for_target_after(active, target, None))?;
+    Some(RuntimeDecision::ToolCandidatePending {
+        activity: Activity::Explore,
+        tool_name: "read_file".to_owned(),
+        arguments: serde_json::json!({
+            "path": target,
+            "start_line": 1,
+            "max_lines": 120
+        }),
+        summary: "Read the next planned target before completing the task.".to_owned(),
+    })
+}
+
+pub(super) fn apply_read_path_resolution_boundary(
+    active: &ActivePlainRequest,
+    decision: RuntimeDecision,
+) -> RuntimeDecision {
+    let RuntimeDecision::ToolCandidatePending {
+        activity,
+        tool_name,
+        mut arguments,
+        summary,
+    } = decision
+    else {
+        return decision;
+    };
+
+    if tool_name != "read_file" {
+        return RuntimeDecision::ToolCandidatePending {
+            activity,
+            tool_name,
+            arguments,
+            summary,
+        };
+    }
+
+    let Some(requested_path) = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return RuntimeDecision::ToolCandidatePending {
+            activity,
+            tool_name,
+            arguments,
+            summary,
+        };
+    };
+
+    let Some(resolved_path) = unique_discovered_read_candidate(active, &requested_path) else {
+        return RuntimeDecision::ToolCandidatePending {
+            activity,
+            tool_name,
+            arguments,
+            summary,
+        };
+    };
+
+    if resolved_path == requested_path {
+        return RuntimeDecision::ToolCandidatePending {
+            activity,
+            tool_name,
+            arguments,
+            summary,
+        };
+    }
+
+    if let Some(arguments_object) = arguments.as_object_mut() {
+        arguments_object.insert("path".to_owned(), serde_json::Value::String(resolved_path));
+    }
+
+    RuntimeDecision::ToolCandidatePending {
+        activity,
+        tool_name,
+        arguments,
+        summary,
+    }
+}
+
 pub(super) fn apply_change_evidence_boundary(
     active: &ActivePlainRequest,
     decision: RuntimeDecision,
@@ -473,35 +650,82 @@ pub(super) fn change_target_requiring_read(
     active: &ActivePlainRequest,
     decision: &RuntimeDecision,
 ) -> Option<String> {
+    change_targets_requiring_read(active, decision)
+        .into_iter()
+        .next()
+}
+
+pub(super) fn change_targets_requiring_read(
+    active: &ActivePlainRequest,
+    decision: &RuntimeDecision,
+) -> Vec<String> {
     let RuntimeDecision::ApprovalNeeded {
         tool_name,
         change_preview: Some(change_preview),
         ..
     } = decision
     else {
-        return None;
+        return Vec::new();
     };
 
-    if tool_name != "apply_patch"
-        || !matches!(
-            change_preview.operation,
+    if tool_name != "apply_patch" {
+        return Vec::new();
+    }
+
+    let targets = change_preview.target_summaries().unwrap_or_else(|_| {
+        vec![crate::llm::ChangeTargetPreview {
+            target_path: change_preview.target_path.clone(),
+            operation: change_preview.operation,
+            additions: change_preview.additions,
+            deletions: change_preview.deletions,
+        }]
+    });
+
+    let mut required = Vec::new();
+    for target in targets {
+        if !matches!(
+            target.operation,
             PatchOperation::Update | PatchOperation::Delete
-        )
-    {
-        return None;
+        ) {
+            continue;
+        }
+        let failed_change_index =
+            latest_failed_change_index_for_target(active, &target.target_path);
+        if !has_successful_read_for_target_after(active, &target.target_path, failed_change_index) {
+            required.push(target.target_path);
+        }
     }
 
-    let failed_change_index =
-        latest_failed_change_index_for_target(active, &change_preview.target_path);
-    if !has_successful_read_for_target_after(
-        active,
-        &change_preview.target_path,
-        failed_change_index,
-    ) {
-        return Some(change_preview.target_path.clone());
+    required
+}
+
+pub(super) fn change_targets_from_decision(decision: &RuntimeDecision) -> Vec<String> {
+    let RuntimeDecision::ApprovalNeeded {
+        tool_name,
+        change_preview: Some(change_preview),
+        ..
+    } = decision
+    else {
+        return Vec::new();
+    };
+
+    if tool_name != "apply_patch" {
+        return Vec::new();
     }
 
-    None
+    change_preview
+        .target_summaries()
+        .unwrap_or_else(|_| {
+            vec![crate::llm::ChangeTargetPreview {
+                target_path: change_preview.target_path.clone(),
+                operation: change_preview.operation,
+                additions: change_preview.additions,
+                deletions: change_preview.deletions,
+            }]
+        })
+        .into_iter()
+        .map(|target| target.target_path)
+        .collect()
 }
 
 fn latest_failed_change_index_for_target(
@@ -714,6 +938,37 @@ fn read_file_candidates_from_observation(
     matches
 }
 
+fn unique_discovered_read_candidate(
+    active: &ActivePlainRequest,
+    requested_path: &str,
+) -> Option<String> {
+    let mut matches = Vec::new();
+
+    for record in &active.executed_tool_records {
+        let observation = &record.observation;
+        if observation.status != "succeeded" || observation.error_kind.is_some() {
+            continue;
+        }
+        if !matches!(
+            observation.tool_name.as_str(),
+            "list_files" | "search_text" | "read_file"
+        ) {
+            continue;
+        }
+
+        for candidate in candidate_paths_from_observation(observation) {
+            if candidate_matches_failed_read_target(&candidate, requested_path) {
+                push_unique(&mut matches, candidate);
+            }
+        }
+    }
+
+    match matches.as_slice() {
+        [candidate] => Some(candidate.clone()),
+        _ => None,
+    }
+}
+
 fn candidate_matches_failed_read_target(candidate: &str, failed_target: &str) -> bool {
     if candidate == failed_target {
         return true;
@@ -801,20 +1056,58 @@ pub(super) fn repeated_completed_add_change_final_decision(
     else {
         return None;
     };
-    if tool_name != "apply_patch" || change_preview.operation != PatchOperation::Add {
+    if tool_name != "apply_patch" {
         return None;
     }
 
+    let target_previews = change_preview.target_summaries().unwrap_or_else(|_| {
+        vec![crate::llm::ChangeTargetPreview {
+            target_path: change_preview.target_path.clone(),
+            operation: change_preview.operation,
+            additions: change_preview.additions,
+            deletions: change_preview.deletions,
+        }]
+    });
+    if target_previews
+        .iter()
+        .any(|target| target.operation != PatchOperation::Add)
+    {
+        return None;
+    }
+    let target_paths = target_previews
+        .iter()
+        .map(|target| target.target_path.clone())
+        .collect::<Vec<_>>();
+
     let record = active.executed_tool_records.iter().rev().find(|record| {
-        record.observation.tool_name == "apply_patch"
-            && record.observation.target_raw.as_deref() == Some(change_preview.target_path.as_str())
-            && record.observation.status == "succeeded"
-            && record.observation.error_kind.is_none()
-            && !record.observation.preview.is_empty()
+        if record.observation.tool_name != "apply_patch"
+            || record.observation.status != "succeeded"
+            || record.observation.error_kind.is_some()
+            || record.observation.preview.is_empty()
+        {
+            return false;
+        }
+        let changed_targets = changed_targets_from_observation(&record.observation);
+        if changed_targets.is_empty() && target_paths.len() == 1 {
+            return record.observation.target_raw.as_deref() == Some(target_paths[0].as_str());
+        }
+        target_paths
+            .iter()
+            .all(|target| changed_targets.iter().any(|changed| changed == target))
     })?;
 
+    let summary = if target_paths.len() == 1 {
+        format!("파일 생성이 완료되었습니다: {}", target_paths[0])
+    } else {
+        format!(
+            "파일 생성이 완료되었습니다: {}개 대상 ({})",
+            target_paths.len(),
+            target_paths.join(", ")
+        )
+    };
+
     Some(RuntimeDecision::Answer {
-        summary: format!("파일 생성이 완료되었습니다: {}", change_preview.target_path),
+        summary,
         payload_body: Some(observation_payload(&record.observation)),
     })
 }
@@ -837,11 +1130,18 @@ fn unresolved_failed_change_observation(
             continue;
         }
         if observation.status == "succeeded" && observation.error_kind.is_none() {
+            let mut resolved_targets = changed_targets_from_observation(observation);
             if let Some(target) = observation.target_raw.as_deref() {
-                unresolved.retain(|failed: &&ToolLoopObservation| {
-                    failed.target_raw.as_deref() != Some(target)
-                });
+                push_unique(&mut resolved_targets, target.to_owned());
             }
+            unresolved.retain(|failed: &&ToolLoopObservation| {
+                let Some(failed_target) = failed.target_raw.as_deref() else {
+                    return true;
+                };
+                !resolved_targets
+                    .iter()
+                    .any(|resolved| resolved == failed_target)
+            });
         } else if observation.is_failed() {
             unresolved.push(observation);
         }
@@ -927,6 +1227,250 @@ fn read_recovery_requires_content_decision(observation: &ToolLoopObservation) ->
     }
 }
 
+fn sequential_read_progress_next_decision(active: &ActivePlainRequest) -> Option<RuntimeDecision> {
+    if latest_failed_read_recovery_state(active).is_some() {
+        return None;
+    }
+
+    let plan = read_plan(active);
+    if plan.started_reads.is_empty() {
+        return None;
+    }
+
+    if let Some(continuation) = plan.pending_continuations.first() {
+        return Some(RuntimeDecision::ToolCandidatePending {
+            activity: Activity::Explore,
+            tool_name: "read_file".to_owned(),
+            arguments: serde_json::json!({
+                "path": continuation.path,
+                "start_line": continuation.start_line,
+                "max_lines": continuation.max_lines
+            }),
+            summary: "Continue the current file read range before moving to another read target."
+                .to_owned(),
+        });
+    }
+
+    let next_path = plan.unread_candidates.first()?;
+    Some(RuntimeDecision::ToolCandidatePending {
+        activity: Activity::Explore,
+        tool_name: "read_file".to_owned(),
+        arguments: serde_json::json!({
+            "path": next_path,
+            "start_line": 1,
+            "max_lines": 120
+        }),
+        summary: "Continue the multi-file read plan with the next unread target.".to_owned(),
+    })
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ReadPlan {
+    candidates: Vec<String>,
+    started_reads: Vec<String>,
+    completed_reads: Vec<String>,
+    pending_continuations: Vec<ReadContinuation>,
+    unread_candidates: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReadContinuation {
+    path: String,
+    start_line: usize,
+    max_lines: usize,
+}
+
+fn read_plan(active: &ActivePlainRequest) -> ReadPlan {
+    read_plan_from_records(
+        &active.workspace_root,
+        &active.prompt,
+        &active.executed_tool_records,
+    )
+}
+
+fn read_plan_from_records(
+    workspace_root: &Path,
+    prompt: &str,
+    records: &[ToolLoopExecutionRecord],
+) -> ReadPlan {
+    let mut plan = ReadPlan::default();
+
+    for target in explicit_read_targets_from_prompt(workspace_root, prompt) {
+        push_unique(&mut plan.candidates, target);
+    }
+
+    for record in records {
+        let observation = &record.observation;
+        if observation.status != "succeeded" || observation.error_kind.is_some() {
+            continue;
+        }
+
+        match observation.tool_name.as_str() {
+            "list_files" => {
+                for candidate in candidate_paths_from_observation(observation) {
+                    push_read_candidate(&mut plan.candidates, workspace_root, &candidate);
+                }
+            }
+            "read_file" => {
+                if let Some(target) = observation.target_raw.as_deref() {
+                    let target = normalized_existing_file_path(workspace_root, target)
+                        .unwrap_or_else(|| target.to_owned());
+                    push_unique(&mut plan.started_reads, target.clone());
+                    remove_value(&mut plan.completed_reads, &target);
+                    remove_continuation(&mut plan.pending_continuations, &target);
+                    if observation.is_truncated_continuation() {
+                        if let Some(mut continuation) = read_continuation_from_observation_message(
+                            workspace_root,
+                            &record.observation_message.content,
+                        ) {
+                            continuation.path =
+                                normalized_existing_file_path(workspace_root, &continuation.path)
+                                    .unwrap_or(continuation.path);
+                            if continuation.path == target {
+                                plan.pending_continuations.push(continuation);
+                            }
+                        }
+                    } else {
+                        push_unique(&mut plan.completed_reads, target);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    plan.unread_candidates = plan
+        .candidates
+        .iter()
+        .filter(|candidate| !plan.completed_reads.iter().any(|read| read == *candidate))
+        .cloned()
+        .collect();
+
+    plan
+}
+
+fn remove_value(values: &mut Vec<String>, value: &str) {
+    values.retain(|existing| existing != value);
+}
+
+fn remove_continuation(continuations: &mut Vec<ReadContinuation>, target: &str) {
+    continuations.retain(|continuation| continuation.path != target);
+}
+
+fn read_continuation_from_observation_message(
+    workspace_root: &Path,
+    observation_message: &str,
+) -> Option<ReadContinuation> {
+    let hint = observation_field(observation_message, "next_range_hint")?;
+    let continuation = read_continuation_from_hint(hint)?;
+    if normalized_existing_file_path(workspace_root, &continuation.path).is_some() {
+        Some(continuation)
+    } else {
+        None
+    }
+}
+
+fn read_continuation_from_hint(hint: &str) -> Option<ReadContinuation> {
+    let hint = hint.trim();
+    if hint == "-" {
+        return None;
+    }
+    let rest = hint.strip_prefix("read_file ")?;
+    let rest = rest.strip_prefix("path=")?;
+    let (path, rest) = rest.split_once(" start_line=")?;
+    let (start_line, max_lines) = rest.split_once(" max_lines=")?;
+    Some(ReadContinuation {
+        path: path.to_owned(),
+        start_line: start_line.parse().ok()?,
+        max_lines: max_lines.parse().ok()?,
+    })
+}
+
+fn explicit_read_targets_from_prompt(workspace_root: &Path, prompt: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for token in prompt.split(path_token_delimiter) {
+        let Some(target) = workspace_file_target_from_token(workspace_root, token) else {
+            continue;
+        };
+        push_unique(&mut targets, target);
+    }
+    targets
+}
+
+fn path_token_delimiter(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '"' | '\''
+                | '`'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | ','
+                | ';'
+                | ':'
+                | '|'
+        )
+}
+
+fn workspace_file_target_from_token(workspace_root: &Path, token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+
+    let mut matched = None;
+    for end in token
+        .char_indices()
+        .map(|(index, _)| index)
+        .skip(1)
+        .chain(std::iter::once(token.len()))
+    {
+        let candidate = trim_path_edge_punctuation(&token[..end]);
+        if candidate.is_empty() || !looks_like_workspace_path(candidate) {
+            continue;
+        }
+        if let Some(target) = normalized_existing_file_path(workspace_root, candidate) {
+            matched = Some(target);
+        }
+    }
+
+    matched
+}
+
+fn trim_path_edge_punctuation(value: &str) -> &str {
+    value.trim_matches(|edge| {
+        matches!(
+            edge,
+            '.' | '!' | '?' | ']' | ')' | '}' | '>' | '"' | '\'' | '`'
+        )
+    })
+}
+
+fn looks_like_workspace_path(value: &str) -> bool {
+    !value.is_empty() && !value.contains("://") && value.chars().any(|ch| ch == '.' || ch == '/')
+}
+
+fn normalized_existing_file_path(workspace_root: &Path, raw_path: &str) -> Option<String> {
+    let target = resolve_existing_workspace_path(workspace_root, raw_path).ok()?;
+    if target.resolved.is_file() {
+        Some(target.display)
+    } else {
+        None
+    }
+}
+
+fn push_read_candidate(values: &mut Vec<String>, workspace_root: &Path, raw_path: &str) {
+    let value = normalized_existing_file_path(workspace_root, raw_path)
+        .unwrap_or_else(|| raw_path.to_owned());
+    push_unique(values, value);
+}
+
 fn observation_payload(observation: &ToolLoopObservation) -> String {
     let target = observation.target_raw.as_deref().unwrap_or("-");
     let mut payload_lines = vec![
@@ -949,7 +1493,9 @@ pub(super) fn completed_tool_fallback_final_decision(
     if active.executed_tool_records.is_empty()
         || read_recovery_needs_file_content(active)
         || unresolved_failed_change_observation(active).is_some()
-        || active.pending_change_after_read_target.is_some()
+        || planned_read_next_decision(active).is_some()
+        || !active.pending_change_targets.is_empty()
+        || !active.pending_change_after_read_targets.is_empty()
         || fallback_reason == "payload_validation_failed"
     {
         return None;
@@ -1043,12 +1589,66 @@ pub(super) fn repair_request_messages(history: &MessageHistory) -> Vec<LlmMessag
         .collect()
 }
 
+pub(super) fn plan_follow_up_request_messages(
+    workspace_root: &Path,
+    schema_message: &LlmMessage,
+    user_message: &LlmMessage,
+    executed_tool_records: &[ToolLoopExecutionRecord],
+    executed_tool_signatures: &[String],
+    planned_read_targets: &[String],
+    pending_change_targets: &[String],
+    next_turn_id: &str,
+) -> Vec<LlmMessage> {
+    let mut instruction_lines = vec![
+        "Continue from the accepted AHREUM task plan ledger.".to_owned(),
+        "The plan is not a tool execution and does not satisfy the user goal by itself.".to_owned(),
+        "Return exactly one next tool candidate for the first pending planned target, or answer only if every planned target has a successful observation.".to_owned(),
+        "Do not return another plan unless new workspace evidence changes the target list.".to_owned(),
+    ];
+    instruction_lines.extend(
+        response_boundary_contract_lines()
+            .iter()
+            .map(|line| line.to_string()),
+    );
+    instruction_lines.extend(
+        payload_ordering_contract_lines()
+            .iter()
+            .map(|line| line.to_string()),
+    );
+    instruction_lines.extend(
+        tool_path_selection_contract_lines()
+            .iter()
+            .map(|line| line.to_string()),
+    );
+    instruction_lines.extend(tool_loop_state_lines(executed_tool_signatures));
+    instruction_lines.extend(tool_target_progress_lines(
+        workspace_root,
+        &user_message.content,
+        executed_tool_records,
+        planned_read_targets,
+        pending_change_targets,
+    ));
+
+    let mut messages = vec![schema_message.clone(), user_message.clone()];
+    messages.extend(recent_tool_observation_messages_tail(executed_tool_records));
+    messages.push(LlmMessage {
+        turn_id: next_turn_id.to_owned(),
+        role: LlmMessageRole::System,
+        visibility: LlmMessageVisibility::Internal,
+        content: instruction_lines.join("\n"),
+    });
+    messages
+}
+
 pub(super) fn tool_loop_request_messages(
+    workspace_root: &Path,
     schema_message: &LlmMessage,
     user_message: &LlmMessage,
     observation_message: &LlmMessage,
     executed_tool_records: &[ToolLoopExecutionRecord],
     executed_tool_signatures: &[String],
+    planned_read_targets: &[String],
+    pending_change_targets: &[String],
     next_turn_id: &str,
 ) -> Vec<LlmMessage> {
     let mut instruction_lines =
@@ -1072,6 +1672,8 @@ pub(super) fn tool_loop_request_messages(
         [
             "If the observation is enough evidence for the user goal, return exactly one answer response with activity None.",
             "If the latest observation is a succeeded Change or Execute tool and the user did not ask for another distinct action, return exactly one answer response with activity None.",
+            "For multi-target read, create, update, or delete goals, continue sequentially from AHREUM_TARGET_PROGRESS until every required target is read or changed; do not stop after the first successful target unless the user goal is satisfied.",
+            "For large multi-target goals, request exactly one next tool candidate or one small coherent apply_patch batch at a time, then continue from the next observation.",
             "After a succeeded apply_patch Add File observation, do not request another Add File for the same target; summarize the completed change.",
             "After a succeeded run_command observation, do not request the same command again unless the observation is truncated or the user asked for a separate command.",
             "After a succeeded read_file observation, do not request the same read_file again. If the user goal still requires a file change or command execution, use the read evidence to request the next Change or Execute tool candidate.",
@@ -1096,6 +1698,13 @@ pub(super) fn tool_loop_request_messages(
     );
     append_read_candidate_guidance(&mut instruction_lines, &observation_message.content);
     instruction_lines.extend(tool_loop_state_lines(executed_tool_signatures));
+    instruction_lines.extend(tool_target_progress_lines(
+        workspace_root,
+        &user_message.content,
+        executed_tool_records,
+        planned_read_targets,
+        pending_change_targets,
+    ));
 
     let mut messages = vec![schema_message.clone(), user_message.clone()];
     messages.extend(recent_tool_observation_messages_with_latest(
@@ -1112,11 +1721,14 @@ pub(super) fn tool_loop_request_messages(
 }
 
 pub(super) fn tool_repeat_answer_request_messages(
+    workspace_root: &Path,
     schema_message: &LlmMessage,
     user_message: &LlmMessage,
     execution_record: &ToolLoopExecutionRecord,
     executed_tool_records: &[ToolLoopExecutionRecord],
     executed_tool_signatures: &[String],
+    planned_read_targets: &[String],
+    pending_change_targets: &[String],
     next_turn_id: &str,
 ) -> Vec<LlmMessage> {
     let mut instruction_lines = vec![
@@ -1138,6 +1750,7 @@ pub(super) fn tool_repeat_answer_request_messages(
         [
             "Do not call the duplicate tool candidate again.",
             "Return exactly one answer response with activity None from the existing observation when it is enough evidence for the user goal.",
+            "For multi-target read, create, update, or delete goals, continue sequentially from AHREUM_TARGET_PROGRESS until every required target is read or changed; do not stop after the first successful target unless the user goal is satisfied.",
             "If the duplicate successful observation is read_file and the user goal still requires a file change or command execution, request the next non-duplicate Change or Execute tool candidate instead of answering or re-reading.",
             "When file contents or values are still required and the duplicate successful observation is list_files or search_text, do not answer from discovery alone; request read_file for a candidate path from that observation.",
             "If the existing successful observation is only path discovery after a failed read_file, request read_file for the discovered candidate before answering file-backed details.",
@@ -1151,6 +1764,13 @@ pub(super) fn tool_repeat_answer_request_messages(
         &execution_record.observation_message.content,
     );
     instruction_lines.extend(tool_loop_state_lines(executed_tool_signatures));
+    instruction_lines.extend(tool_target_progress_lines(
+        workspace_root,
+        &user_message.content,
+        executed_tool_records,
+        planned_read_targets,
+        pending_change_targets,
+    ));
 
     let mut messages = vec![schema_message.clone(), user_message.clone()];
     messages.extend(recent_tool_observation_messages(
@@ -1167,11 +1787,14 @@ pub(super) fn tool_repeat_answer_request_messages(
 }
 
 pub(super) fn tool_repeat_continuation_request_messages(
+    workspace_root: &Path,
     schema_message: &LlmMessage,
     user_message: &LlmMessage,
     execution_record: &ToolLoopExecutionRecord,
     executed_tool_records: &[ToolLoopExecutionRecord],
     executed_tool_signatures: &[String],
+    planned_read_targets: &[String],
+    pending_change_targets: &[String],
     next_turn_id: &str,
 ) -> Vec<LlmMessage> {
     let mut instruction_lines = vec![
@@ -1198,6 +1821,7 @@ pub(super) fn tool_repeat_continuation_request_messages(
         [
             "Do not call the duplicate tool candidate again.",
             "If the existing observation is enough evidence for the user goal, return exactly one answer response with activity None.",
+            "For multi-target read, create, update, or delete goals, continue sequentially from AHREUM_TARGET_PROGRESS until every required target is read or changed; do not stop after the first successful target unless the user goal is satisfied.",
             "If more content from the same file is required and the observation includes next_range_hint, request read_file with that next range instead of repeating the same range.",
             "If a directory listing is truncated and there is no next_range_hint, request a narrower path or search_text for the missing evidence instead of repeating the same directory.",
             "If different evidence is required, request exactly one different tool candidate.",
@@ -1206,6 +1830,13 @@ pub(super) fn tool_repeat_continuation_request_messages(
         .map(str::to_owned),
     );
     instruction_lines.extend(tool_loop_state_lines(executed_tool_signatures));
+    instruction_lines.extend(tool_target_progress_lines(
+        workspace_root,
+        &user_message.content,
+        executed_tool_records,
+        planned_read_targets,
+        pending_change_targets,
+    ));
 
     let mut messages = vec![schema_message.clone(), user_message.clone()];
     messages.extend(recent_tool_observation_messages(
@@ -1222,11 +1853,14 @@ pub(super) fn tool_repeat_continuation_request_messages(
 }
 
 pub(super) fn tool_repeat_failure_request_messages(
+    workspace_root: &Path,
     schema_message: &LlmMessage,
     user_message: &LlmMessage,
     execution_record: &ToolLoopExecutionRecord,
     executed_tool_records: &[ToolLoopExecutionRecord],
     executed_tool_signatures: &[String],
+    planned_read_targets: &[String],
+    pending_change_targets: &[String],
     next_turn_id: &str,
 ) -> Vec<LlmMessage> {
     let mut instruction_lines = vec![
@@ -1258,12 +1892,20 @@ pub(super) fn tool_repeat_failure_request_messages(
             "Do not call the duplicate failed tool candidate again.",
             "Return exactly one blocked response if the failure prevents the user goal.",
             "Return exactly one answer response if the failure itself is enough to answer the user goal.",
+            "For multi-target read, create, update, or delete goals, continue sequentially from AHREUM_TARGET_PROGRESS; skip only failed targets that cannot be recovered with a different bounded tool candidate.",
             "Request a tool only if a different tool candidate is required for missing evidence.",
         ]
         .into_iter()
         .map(str::to_owned),
     );
     instruction_lines.extend(tool_loop_state_lines(executed_tool_signatures));
+    instruction_lines.extend(tool_target_progress_lines(
+        workspace_root,
+        &user_message.content,
+        executed_tool_records,
+        planned_read_targets,
+        pending_change_targets,
+    ));
 
     let mut messages = vec![schema_message.clone(), user_message.clone()];
     messages.extend(recent_tool_observation_messages(
@@ -1287,6 +1929,21 @@ fn recent_tool_observation_messages(
         executed_tool_records,
         &execution_record.observation_message,
     )
+}
+
+fn recent_tool_observation_messages_tail(
+    executed_tool_records: &[ToolLoopExecutionRecord],
+) -> Vec<LlmMessage> {
+    let mut messages = executed_tool_records
+        .iter()
+        .rev()
+        .take(RECENT_TOOL_OBSERVATION_LIMIT)
+        .collect::<Vec<_>>();
+    messages.reverse();
+    messages
+        .into_iter()
+        .map(|record| record.observation_message.clone())
+        .collect()
 }
 
 fn recent_tool_observation_messages_with_latest(
@@ -1334,6 +1991,158 @@ fn tool_loop_state_lines(executed_tool_signatures: &[String]) -> Vec<String> {
             .to_owned(),
     );
     lines
+}
+
+fn tool_target_progress_lines(
+    workspace_root: &Path,
+    user_prompt: &str,
+    executed_tool_records: &[ToolLoopExecutionRecord],
+    planned_read_targets: &[String],
+    pending_change_targets: &[String],
+) -> Vec<String> {
+    let explicit_read_targets = explicit_read_targets_from_prompt(workspace_root, user_prompt);
+    let read_plan = read_plan_from_records(workspace_root, user_prompt, executed_tool_records);
+    let mut discovery_candidates = Vec::new();
+    let mut successful_changes = Vec::new();
+    let mut failed_targets = Vec::new();
+
+    for record in executed_tool_records {
+        let observation = &record.observation;
+        if observation.status == "succeeded" && observation.error_kind.is_none() {
+            match observation.tool_name.as_str() {
+                "list_files" | "search_text" => {
+                    for candidate in candidate_paths_from_observation(observation) {
+                        push_read_candidate(&mut discovery_candidates, workspace_root, &candidate);
+                    }
+                }
+                "apply_patch" => {
+                    for target in changed_targets_from_observation(observation) {
+                        push_unique(&mut successful_changes, target);
+                    }
+                }
+                _ => {}
+            }
+        } else if observation.is_failed() {
+            let target = observation.target_raw.as_deref().unwrap_or("-");
+            push_unique(
+                &mut failed_targets,
+                format!(
+                    "{} target={} error_kind={}",
+                    observation.tool_name,
+                    target,
+                    observation.error_kind.unwrap_or("-")
+                ),
+            );
+        }
+    }
+
+    let pending_continuations = read_plan
+        .pending_continuations
+        .iter()
+        .map(|continuation| {
+            format!(
+                "{} start_line={} max_lines={}",
+                continuation.path, continuation.start_line, continuation.max_lines
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut lines = vec!["<AHREUM_TARGET_PROGRESS>".to_owned()];
+    push_progress_section(
+        &mut lines,
+        "explicit_read_targets_from_user_request",
+        &explicit_read_targets,
+    );
+    push_progress_section(&mut lines, "planned_read_targets", planned_read_targets);
+    push_progress_section(
+        &mut lines,
+        "candidate_paths_from_discovery",
+        &discovery_candidates,
+    );
+    push_progress_section(&mut lines, "started_read_targets", &read_plan.started_reads);
+    push_progress_section(
+        &mut lines,
+        "completed_read_targets",
+        &read_plan.completed_reads,
+    );
+    push_progress_section(
+        &mut lines,
+        "pending_read_continuations",
+        &pending_continuations,
+    );
+    push_progress_section(
+        &mut lines,
+        "unread_read_targets",
+        &read_plan.unread_candidates,
+    );
+    push_progress_section(&mut lines, "successful_change_targets", &successful_changes);
+    push_progress_section(&mut lines, "pending_change_targets", pending_change_targets);
+    push_progress_section(&mut lines, "failed_targets", &failed_targets);
+    lines.push("</AHREUM_TARGET_PROGRESS>".to_owned());
+    lines.push(
+        "Use AHREUM_TARGET_PROGRESS as a compact plan ledger. Pick the next required target that is not already completed; never repeat a completed target just to make progress."
+            .to_owned(),
+    );
+    lines
+}
+
+fn push_progress_section(lines: &mut Vec<String>, label: &str, values: &[String]) {
+    lines.push(format!("{label}:"));
+    if values.is_empty() {
+        lines.push("- none".to_owned());
+        return;
+    }
+    for value in values.iter().take(40) {
+        lines.push(format!("- {value}"));
+    }
+    if values.len() > 40 {
+        lines.push(format!("- ... {} more", values.len() - 40));
+    }
+}
+
+fn candidate_paths_from_observation(observation: &ToolLoopObservation) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for line in &observation.preview {
+        let candidate = match observation.tool_name.as_str() {
+            "list_files" => list_files_candidate_path(line),
+            "search_text" => search_text_candidate_path(line),
+            "read_file" => read_file_failure_candidate_path(line),
+            _ => None,
+        };
+        if let Some(candidate) = candidate {
+            push_unique(&mut candidates, candidate);
+        }
+    }
+    candidates
+}
+
+fn changed_targets_from_observation(observation: &ToolLoopObservation) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in &observation.preview {
+        if let Some(target) = changed_target_from_preview_line(line) {
+            push_unique(&mut targets, target);
+        }
+    }
+    targets
+}
+
+fn changed_target_from_preview_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let target = trimmed
+        .strip_prefix("added ")
+        .or_else(|| trimmed.strip_prefix("updated "))
+        .and_then(|rest| rest.split_once(" (+").map(|(target, _)| target))
+        .or_else(|| trimmed.strip_prefix("deleted "));
+    target
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(str::to_owned)
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 fn append_read_candidate_guidance(instruction_lines: &mut Vec<String>, observation_message: &str) {
@@ -1434,6 +2243,9 @@ pub(super) fn runtime_execute_detail(decision: &RuntimeDecision) -> &'static str
         RuntimeDecision::Answer { .. }
         | RuntimeDecision::Clarify { .. }
         | RuntimeDecision::Blocked { .. } => "실행할 도구가 없어 실행 단계를 통과합니다.",
+        RuntimeDecision::PlanCandidate { .. } => {
+            "계획 장부를 반영하고 다음 후보 요청을 준비합니다."
+        }
         RuntimeDecision::ToolCandidatePending { .. } => "Explore 도구 후보를 실행합니다.",
         RuntimeDecision::ApprovalNeeded { .. } => {
             "승인이 필요한 후보이므로 직접 실행하지 않습니다."
@@ -1445,22 +2257,27 @@ pub(super) fn runtime_execute_detail(decision: &RuntimeDecision) -> &'static str
 mod tests {
     use super::{
         apply_change_evidence_boundary, apply_final_answer_evidence_boundary,
-        completed_tool_fallback_final_decision, diagnose_tool_loop_limit,
-        duplicate_approval_final_decision, duplicate_approval_repeat_redirect,
-        read_file_candidate_paths_from_observation_message,
+        apply_read_path_resolution_boundary, change_targets_from_decision,
+        change_targets_requiring_read, completed_tool_fallback_final_decision,
+        diagnose_tool_loop_limit, duplicate_approval_final_decision,
+        duplicate_approval_repeat_redirect, read_file_candidate_paths_from_observation_message,
         repeated_completed_add_change_final_decision, settled_duplicate_final_decision,
         tool_loop_request_messages, tool_repeat_answer_request_messages,
         tool_repeat_continuation_request_messages, tool_repeat_failure_request_messages,
-        ActivePlainRequest, ToolLoopExecutionRecord, ToolLoopLimitDiagnosis, ToolLoopObservation,
-        ToolLoopRepeatRedirect,
+        tool_target_progress_lines, ActivePlainRequest, ToolLoopExecutionRecord,
+        ToolLoopLimitDiagnosis, ToolLoopObservation, ToolLoopRepeatRedirect,
     };
     use crate::llm::{
         payload_ordering_contract_lines, response_boundary_contract_lines,
         tool_path_selection_contract_lines, Activity, ChangePreview, LlmMessage, LlmMessageRole,
-        LlmMessageVisibility, MessageHistory, PatchOperation, RuntimeDecision,
+        LlmMessageVisibility, MessageHistory, PatchOperation, PlanOperation, RuntimeDecision,
+        RuntimePlanItem,
     };
     use crate::tool::ToolObservation;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::mpsc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn message(
         role: LlmMessageRole,
@@ -1473,6 +2290,164 @@ mod tests {
             visibility,
             content: content.to_owned(),
         }
+    }
+
+    fn workspace_root() -> PathBuf {
+        std::env::current_dir().expect("current dir")
+    }
+
+    fn temporary_workspace(files: &[(&str, &str)]) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ahreumcode-runtime-request-test-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create temp workspace");
+        for (path, contents) in files {
+            let full_path = root.join(path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).expect("create parent dir");
+            }
+            fs::write(full_path, contents).expect("write temp file");
+        }
+        root
+    }
+
+    fn generated_read_targets(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("generated/read-target-{index}.md"))
+            .collect()
+    }
+
+    fn succeeded_list_files_record(path: &str, candidates: &[&str]) -> ToolLoopExecutionRecord {
+        ToolLoopExecutionRecord {
+            signature: format!(r#"list_files:{{"path":"{path}"}}"#),
+            observation: ToolLoopObservation {
+                tool_name: "list_files".to_owned(),
+                target_raw: Some(path.to_owned()),
+                status: "succeeded",
+                error_kind: None,
+                truncated: false,
+                source_truncated: false,
+                preview_truncated: false,
+                has_next_range_hint: false,
+                preview: candidates
+                    .iter()
+                    .map(|candidate| candidate.to_string())
+                    .collect(),
+            },
+            observation_message: message(
+                LlmMessageRole::System,
+                LlmMessageVisibility::Internal,
+                "listed discovered candidates",
+            ),
+        }
+    }
+
+    fn succeeded_read_file_record(path: &str) -> ToolLoopExecutionRecord {
+        ToolLoopExecutionRecord {
+            signature: format!(r#"read_file:{{"path":"{path}"}}"#),
+            observation: ToolLoopObservation {
+                tool_name: "read_file".to_owned(),
+                target_raw: Some(path.to_owned()),
+                status: "succeeded",
+                error_kind: None,
+                truncated: false,
+                source_truncated: false,
+                preview_truncated: false,
+                has_next_range_hint: false,
+                preview: vec!["file content".to_owned()],
+            },
+            observation_message: message(
+                LlmMessageRole::System,
+                LlmMessageVisibility::Internal,
+                "read discovered candidate",
+            ),
+        }
+    }
+
+    fn truncated_read_file_record(
+        path: &str,
+        start_line: usize,
+        max_lines: usize,
+        next_start_line: usize,
+    ) -> ToolLoopExecutionRecord {
+        ToolLoopExecutionRecord {
+            signature: format!(
+                r#"read_file:{{"max_lines":{max_lines},"path":"{path}","start_line":{start_line}}}"#
+            ),
+            observation: ToolLoopObservation {
+                tool_name: "read_file".to_owned(),
+                target_raw: Some(path.to_owned()),
+                status: "succeeded",
+                error_kind: None,
+                truncated: true,
+                source_truncated: true,
+                preview_truncated: false,
+                has_next_range_hint: true,
+                preview: vec!["partial file content".to_owned()],
+            },
+            observation_message: message(
+                LlmMessageRole::System,
+                LlmMessageVisibility::Internal,
+                &format!(
+                    "<AHREUM_TOOL_OBSERVATION>\ntool_name: read_file\nstatus: succeeded\ntarget_raw: {path}\nnext_range_hint: read_file path={path} start_line={next_start_line} max_lines={max_lines}\npreview:\npartial file content\n</AHREUM_TOOL_OBSERVATION>"
+                ),
+            ),
+        }
+    }
+
+    fn active_with_discovered_read_progress(
+        discovery_root: &str,
+        candidates: &[&str],
+        read_count: usize,
+    ) -> ActivePlainRequest {
+        let mut active = active_request();
+        active
+            .executed_tool_records
+            .push(succeeded_list_files_record(discovery_root, candidates));
+        for candidate in candidates.iter().take(read_count) {
+            active
+                .executed_tool_records
+                .push(succeeded_read_file_record(candidate));
+        }
+        active
+    }
+
+    fn assert_next_read_file(decision: RuntimeDecision, expected_path: &str) {
+        let RuntimeDecision::ToolCandidatePending {
+            tool_name,
+            arguments,
+            ..
+        } = decision
+        else {
+            panic!("expected next unread candidate to be requested with read_file");
+        };
+        assert_eq!(tool_name, "read_file");
+        assert_eq!(arguments["path"], expected_path);
+    }
+
+    fn assert_next_read_file_range(
+        decision: RuntimeDecision,
+        expected_path: &str,
+        expected_start_line: usize,
+        expected_max_lines: usize,
+    ) {
+        let RuntimeDecision::ToolCandidatePending {
+            tool_name,
+            arguments,
+            ..
+        } = decision
+        else {
+            panic!("expected next read range to be requested with read_file");
+        };
+        assert_eq!(tool_name, "read_file");
+        assert_eq!(arguments["path"], expected_path);
+        assert_eq!(arguments["start_line"], expected_start_line);
+        assert_eq!(arguments["max_lines"], expected_max_lines);
     }
 
     #[test]
@@ -1497,8 +2472,17 @@ mod tests {
             r#"read_file:{"max_lines":120,"path":"Cargo.toml","start_line":1}"#.to_owned(),
             r#"search_text:{"max_results":20,"path":"src","query":"RuntimeDecision"}"#.to_owned(),
         ];
-        let messages =
-            tool_loop_request_messages(&schema, &user, &observation, &[], &executed, "turn-2");
+        let messages = tool_loop_request_messages(
+            &workspace_root(),
+            &schema,
+            &user,
+            &observation,
+            &[],
+            &executed,
+            &[],
+            &[],
+            "turn-2",
+        );
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].content, "schema");
@@ -1547,6 +2531,11 @@ mod tests {
             .content
             .contains("request read_file for target_raw"));
         assert!(messages[3].content.contains("<AHREUM_TOOL_LOOP_STATE>"));
+        assert!(messages[3].content.contains("<AHREUM_TARGET_PROGRESS>"));
+        assert!(messages[3].content.contains("AHREUM_TARGET_PROGRESS"));
+        assert!(messages[3]
+            .content
+            .contains("continue sequentially from AHREUM_TARGET_PROGRESS"));
         assert!(messages[3]
             .content
             .contains("executed_tool_candidate_count: 2"));
@@ -1588,7 +2577,17 @@ mod tests {
             ),
         );
 
-        let messages = tool_loop_request_messages(&schema, &user, &observation, &[], &[], "turn-2");
+        let messages = tool_loop_request_messages(
+            &workspace_root(),
+            &schema,
+            &user,
+            &observation,
+            &[],
+            &[],
+            &[],
+            &[],
+            "turn-2",
+        );
 
         assert!(messages[3]
             .content
@@ -1629,11 +2628,14 @@ mod tests {
         );
 
         let messages = tool_loop_request_messages(
+            &workspace_root(),
             &schema,
             &user,
             &failed_patch,
             &[read_record],
             &["apply_patch:target=file.md:operation=update".to_owned()],
+            &[],
+            &[],
             "turn-2",
         );
 
@@ -1686,6 +2688,191 @@ mod tests {
         let candidates = read_file_candidate_paths_from_observation_message(observation);
 
         assert_eq!(candidates, vec!["nested/settings.local".to_owned()]);
+    }
+
+    #[test]
+    fn target_progress_tracks_discovered_read_and_changed_targets() {
+        let discovery_root = "collection";
+        let read_target = "collection/item-a.txt";
+        let unread_target = "collection/item-b.txt";
+        let directory_candidate = "collection/nested/";
+        let added_target = "output/created.txt";
+        let updated_target = "output/changed.txt";
+        let records = vec![
+            ToolLoopExecutionRecord {
+                signature: format!(r#"list_files:{{"path":"{discovery_root}"}}"#),
+                observation: ToolLoopObservation {
+                    tool_name: "list_files".to_owned(),
+                    target_raw: Some(discovery_root.to_owned()),
+                    status: "succeeded",
+                    error_kind: None,
+                    truncated: false,
+                    source_truncated: false,
+                    preview_truncated: false,
+                    has_next_range_hint: false,
+                    preview: vec![
+                        read_target.to_owned(),
+                        unread_target.to_owned(),
+                        directory_candidate.to_owned(),
+                    ],
+                },
+                observation_message: message(
+                    LlmMessageRole::System,
+                    LlmMessageVisibility::Internal,
+                    "listed candidates",
+                ),
+            },
+            ToolLoopExecutionRecord {
+                signature: format!(r#"read_file:{{"path":"{read_target}"}}"#),
+                observation: ToolLoopObservation {
+                    tool_name: "read_file".to_owned(),
+                    target_raw: Some(read_target.to_owned()),
+                    status: "succeeded",
+                    error_kind: None,
+                    truncated: false,
+                    source_truncated: false,
+                    preview_truncated: false,
+                    has_next_range_hint: false,
+                    preview: vec!["intro".to_owned()],
+                },
+                observation_message: message(
+                    LlmMessageRole::System,
+                    LlmMessageVisibility::Internal,
+                    "read candidate",
+                ),
+            },
+            ToolLoopExecutionRecord {
+                signature: "apply_patch:multi".to_owned(),
+                observation: ToolLoopObservation {
+                    tool_name: "apply_patch".to_owned(),
+                    target_raw: Some(format!("2 targets: {added_target}, {updated_target}")),
+                    status: "succeeded",
+                    error_kind: None,
+                    truncated: false,
+                    source_truncated: false,
+                    preview_truncated: false,
+                    has_next_range_hint: false,
+                    preview: vec![
+                        format!("added {added_target} (+10 -0)"),
+                        format!("updated {updated_target} (+2 -1)"),
+                    ],
+                },
+                observation_message: message(
+                    LlmMessageRole::System,
+                    LlmMessageVisibility::Internal,
+                    "changed files",
+                ),
+            },
+        ];
+
+        let pending_changes = vec!["generated/change-pending.rs".to_owned()];
+        let lines = tool_target_progress_lines(
+            &workspace_root(),
+            "user goal",
+            &records,
+            &[],
+            &pending_changes,
+        )
+        .join("\n");
+
+        assert!(lines.contains("candidate_paths_from_discovery:"));
+        assert!(lines.contains(&format!("- {read_target}")));
+        assert!(lines.contains(&format!("- {unread_target}")));
+        assert!(!lines.contains(directory_candidate));
+        assert!(lines.contains(&format!("completed_read_targets:\n- {read_target}")));
+        assert!(lines.contains(&format!("unread_read_targets:\n- {unread_target}")));
+        assert!(lines.contains("successful_change_targets:"));
+        assert!(lines.contains(&format!("- {added_target}")));
+        assert!(lines.contains(&format!("- {updated_target}")));
+        assert!(lines.contains("pending_change_targets:"));
+        assert!(lines.contains("- generated/change-pending.rs"));
+    }
+
+    #[test]
+    fn target_progress_tracks_existing_files_named_in_user_request() {
+        let targets = generated_read_targets(3);
+        let root = temporary_workspace(&[
+            (targets[0].as_str(), "read target 0"),
+            (targets[1].as_str(), "read target 1"),
+            (targets[2].as_str(), "not requested"),
+        ]);
+        let records = vec![succeeded_read_file_record(&targets[0])];
+        let prompt = format!("{}와 {}를 읽고 비교해줘", targets[0], targets[1]);
+
+        let lines = tool_target_progress_lines(&root, &prompt, &records, &[], &[]).join("\n");
+
+        assert!(lines.contains("explicit_read_targets_from_user_request:"));
+        assert!(lines.contains(&format!("- {}", targets[0])));
+        assert!(lines.contains(&format!("- {}", targets[1])));
+        assert!(lines.contains(&format!("completed_read_targets:\n- {}", targets[0])));
+        assert!(lines.contains(&format!("unread_read_targets:\n- {}", targets[1])));
+        assert!(!lines.contains(&targets[2]));
+
+        fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[test]
+    fn target_progress_tracks_pending_read_continuation_before_completion() {
+        let targets = generated_read_targets(2);
+        let root = temporary_workspace(&[
+            (targets[0].as_str(), "read target 0"),
+            (targets[1].as_str(), "read target 1"),
+        ]);
+        let records = vec![truncated_read_file_record(&targets[0], 1, 40, 41)];
+        let prompt = format!("{}와 {}를 읽고 비교해줘", targets[0], targets[1]);
+
+        let lines = tool_target_progress_lines(&root, &prompt, &records, &[], &[]).join("\n");
+
+        assert!(lines.contains(&format!("started_read_targets:\n- {}", targets[0])));
+        assert!(lines.contains("completed_read_targets:\n- none"));
+        assert!(lines.contains(&format!(
+            "pending_read_continuations:\n- {} start_line=41 max_lines=40",
+            targets[0]
+        )));
+        assert!(lines.contains(&format!("- {}", targets[1])));
+
+        fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[test]
+    fn active_request_applies_plan_items_to_read_and_change_ledgers() {
+        let mut active = active_request();
+        active.apply_plan_items(&[
+            RuntimePlanItem {
+                operation: PlanOperation::Read,
+                target: Some("docs/guide.md".to_owned()),
+            },
+            RuntimePlanItem {
+                operation: PlanOperation::Create,
+                target: Some("web/index.html".to_owned()),
+            },
+            RuntimePlanItem {
+                operation: PlanOperation::Verify,
+                target: None,
+            },
+        ]);
+
+        assert_eq!(active.planned_read_targets, vec!["docs/guide.md"]);
+        assert_eq!(active.pending_change_targets, vec!["web/index.html"]);
+    }
+
+    #[test]
+    fn final_answer_boundary_reads_pending_planned_read_target() {
+        let mut active = active_request();
+        active.planned_read_targets.push("docs/guide.md".to_owned());
+        active
+            .executed_tool_records
+            .push(succeeded_list_files_record("docs", &["docs/guide.md"]));
+
+        let decision = apply_final_answer_evidence_boundary(
+            &active,
+            RuntimeDecision::Answer {
+                summary: "done".to_owned(),
+                payload_body: None,
+            },
+        );
+
+        assert_next_read_file(decision, "docs/guide.md");
     }
 
     #[test]
@@ -2143,6 +3330,231 @@ mod tests {
     }
 
     #[test]
+    fn final_answer_evidence_boundary_continues_discovered_multi_file_read() {
+        let candidates = generated_read_targets(3);
+        let candidate_refs = candidates.iter().map(String::as_str).collect::<Vec<_>>();
+        let active =
+            active_with_discovered_read_progress("generated", candidate_refs.as_slice(), 1);
+
+        let decision = apply_final_answer_evidence_boundary(
+            &active,
+            RuntimeDecision::Answer {
+                summary: "read one file".to_owned(),
+                payload_body: None,
+            },
+        );
+
+        assert_next_read_file(decision, &candidates[1]);
+    }
+
+    #[test]
+    fn final_answer_evidence_boundary_continues_explicit_multi_file_read() {
+        let targets = generated_read_targets(2);
+        let root = temporary_workspace(&[
+            (targets[0].as_str(), "read target 0"),
+            (targets[1].as_str(), "read target 1"),
+        ]);
+        let mut active = active_request();
+        active.workspace_root = root.clone();
+        active.prompt = format!("Read {} and {}, then compare them.", targets[0], targets[1]);
+        active
+            .executed_tool_records
+            .push(succeeded_read_file_record(&targets[0]));
+
+        let decision = apply_final_answer_evidence_boundary(
+            &active,
+            RuntimeDecision::Answer {
+                summary: "read one file".to_owned(),
+                payload_body: None,
+            },
+        );
+
+        assert_next_read_file(decision, &targets[1]);
+
+        fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[test]
+    fn final_answer_evidence_boundary_continues_current_file_range_before_next_target() {
+        let targets = generated_read_targets(2);
+        let root = temporary_workspace(&[
+            (targets[0].as_str(), "read target 0"),
+            (targets[1].as_str(), "read target 1"),
+        ]);
+        let mut active = active_request();
+        active.workspace_root = root.clone();
+        active.prompt = format!("Read {} and {}, then compare them.", targets[0], targets[1]);
+        active
+            .executed_tool_records
+            .push(truncated_read_file_record(&targets[0], 1, 40, 41));
+
+        let decision = apply_final_answer_evidence_boundary(
+            &active,
+            RuntimeDecision::Answer {
+                summary: "read one range".to_owned(),
+                payload_body: None,
+            },
+        );
+
+        assert_next_read_file_range(decision, &targets[0], 41, 40);
+
+        fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[test]
+    fn final_answer_evidence_boundary_moves_to_next_target_after_range_completion() {
+        let targets = generated_read_targets(2);
+        let root = temporary_workspace(&[
+            (targets[0].as_str(), "read target 0"),
+            (targets[1].as_str(), "read target 1"),
+        ]);
+        let mut active = active_request();
+        active.workspace_root = root.clone();
+        active.prompt = format!("Read {} and {}, then compare them.", targets[0], targets[1]);
+        active
+            .executed_tool_records
+            .push(truncated_read_file_record(&targets[0], 1, 40, 41));
+        active
+            .executed_tool_records
+            .push(succeeded_read_file_record(&targets[0]));
+
+        let decision = apply_final_answer_evidence_boundary(
+            &active,
+            RuntimeDecision::Answer {
+                summary: "read first target".to_owned(),
+                payload_body: None,
+            },
+        );
+
+        assert_next_read_file(decision, &targets[1]);
+
+        fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[test]
+    fn terminal_clarify_boundary_continues_discovered_multi_file_read() {
+        let candidates = generated_read_targets(2);
+        let candidate_refs = candidates.iter().map(String::as_str).collect::<Vec<_>>();
+        let active =
+            active_with_discovered_read_progress("generated", candidate_refs.as_slice(), 1);
+
+        let decision = apply_final_answer_evidence_boundary(
+            &active,
+            RuntimeDecision::Clarify {
+                message: "which file?".to_owned(),
+                reason: "premature_clarify".to_owned(),
+            },
+        );
+
+        assert_next_read_file(decision, &candidates[1]);
+    }
+
+    #[test]
+    fn settled_duplicate_list_files_continues_discovered_multi_file_read() {
+        let candidates = generated_read_targets(2);
+        let candidate_refs = candidates.iter().map(String::as_str).collect::<Vec<_>>();
+        let active =
+            active_with_discovered_read_progress("generated", candidate_refs.as_slice(), 1);
+        let duplicate = succeeded_list_files_record("generated", candidate_refs.as_slice());
+
+        let decision = settled_duplicate_final_decision(&active, &duplicate);
+
+        assert_next_read_file(decision, &candidates[1]);
+    }
+
+    #[test]
+    fn settled_duplicate_continues_explicit_multi_file_read() {
+        let targets = generated_read_targets(2);
+        let root = temporary_workspace(&[
+            (targets[0].as_str(), "read target 0"),
+            (targets[1].as_str(), "read target 1"),
+        ]);
+        let mut active = active_request();
+        active.workspace_root = root.clone();
+        active.prompt = format!("Read {} and {}.", targets[0], targets[1]);
+        let read_record = succeeded_read_file_record(&targets[0]);
+        active.executed_tool_records.push(read_record.clone());
+
+        let decision = settled_duplicate_final_decision(&active, &read_record);
+
+        assert_next_read_file(decision, &targets[1]);
+
+        fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[test]
+    fn read_path_resolution_uses_unique_discovered_candidate_path() {
+        let candidates = ["workspace/alpha.md", "workspace/beta.md"];
+        let mut active = active_request();
+        active
+            .executed_tool_records
+            .push(succeeded_list_files_record("workspace", &candidates));
+        let basename = candidates[1].rsplit('/').next().unwrap();
+
+        let decision = apply_read_path_resolution_boundary(
+            &active,
+            RuntimeDecision::ToolCandidatePending {
+                activity: Activity::Explore,
+                tool_name: "read_file".to_owned(),
+                arguments: serde_json::json!({
+                    "path": basename,
+                    "start_line": 1,
+                    "max_lines": 120
+                }),
+                summary: "read a discovered file".to_owned(),
+            },
+        );
+
+        let RuntimeDecision::ToolCandidatePending { arguments, .. } = decision else {
+            panic!("read_file candidate should remain executable");
+        };
+        assert_eq!(arguments["path"], candidates[1]);
+    }
+
+    #[test]
+    fn read_path_resolution_does_not_guess_ambiguous_candidate_path() {
+        let mut active = active_request();
+        active.executed_tool_records.push(ToolLoopExecutionRecord {
+            signature: r#"list_files:{"path":"."}"#.to_owned(),
+            observation: ToolLoopObservation {
+                tool_name: "list_files".to_owned(),
+                target_raw: Some(".".to_owned()),
+                status: "succeeded",
+                error_kind: None,
+                truncated: false,
+                source_truncated: false,
+                preview_truncated: false,
+                has_next_range_hint: false,
+                preview: vec!["docs/a/config.md".to_owned(), "docs/b/config.md".to_owned()],
+            },
+            observation_message: message(
+                LlmMessageRole::System,
+                LlmMessageVisibility::Internal,
+                "listed workspace",
+            ),
+        });
+
+        let decision = apply_read_path_resolution_boundary(
+            &active,
+            RuntimeDecision::ToolCandidatePending {
+                activity: Activity::Explore,
+                tool_name: "read_file".to_owned(),
+                arguments: serde_json::json!({
+                    "path": "config.md",
+                    "start_line": 1,
+                    "max_lines": 120
+                }),
+                summary: "read a discovered file".to_owned(),
+            },
+        );
+
+        let RuntimeDecision::ToolCandidatePending { arguments, .. } = decision else {
+            panic!("ambiguous read_file candidate should remain executable");
+        };
+        assert_eq!(arguments["path"], "config.md");
+    }
+
+    #[test]
     fn final_answer_evidence_boundary_blocks_answer_after_failed_change() {
         let mut active = active_request();
         active.executed_tool_records.push(ToolLoopExecutionRecord {
@@ -2203,7 +3615,9 @@ mod tests {
     #[test]
     fn final_answer_evidence_boundary_blocks_answer_after_prerequisite_read_without_change() {
         let mut active = active_request();
-        active.pending_change_after_read_target = Some("fixture-target.txt".to_owned());
+        active
+            .pending_change_after_read_targets
+            .push("fixture-target.txt".to_owned());
         active.executed_tool_records.push(ToolLoopExecutionRecord {
             signature: r#"read_file:{"path":"fixture-target.txt"}"#.to_owned(),
             observation: ToolLoopObservation {
@@ -2237,13 +3651,15 @@ mod tests {
         };
         assert_eq!(reason, "answer_after_prerequisite_read_without_change");
         assert!(message.contains("next_required_tool: apply_patch"));
-        assert!(message.contains("target: fixture-target.txt"));
+        assert!(message.contains("targets: fixture-target.txt"));
     }
 
     #[test]
     fn completed_tool_fallback_does_not_finish_prerequisite_read_without_change() {
         let mut active = active_request();
-        active.pending_change_after_read_target = Some("fixture-target.txt".to_owned());
+        active
+            .pending_change_after_read_targets
+            .push("fixture-target.txt".to_owned());
         active.last_successful_tool_observation = Some(ToolLoopObservation {
             tool_name: "read_file".to_owned(),
             target_raw: Some("fixture-target.txt".to_owned()),
@@ -2417,6 +3833,177 @@ mod tests {
         };
         assert_eq!(reason, "answer_after_failed_change_without_success");
         assert!(message.contains("target: fixture-a.txt"));
+    }
+
+    #[test]
+    fn change_targets_requiring_read_returns_all_unread_multi_update_targets() {
+        let targets = generated_read_targets(3);
+        let mut active = active_request();
+        active
+            .executed_tool_records
+            .push(succeeded_read_file_record(&targets[0]));
+        let decision = RuntimeDecision::ApprovalNeeded {
+            activity: Activity::Change,
+            tool_name: "apply_patch".to_owned(),
+            arguments: serde_json::json!({"payload_id":"patch_multi"}),
+            change_preview: Some(ChangePreview {
+                payload_id: "patch_multi".to_owned(),
+                target_path: targets[0].clone(),
+                operation: PatchOperation::Update,
+                additions: 2,
+                deletions: 2,
+                payload_body: format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** Update File: {}\n@@\n-old\n+new\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch",
+                    targets[0], targets[1], targets[2]
+                ),
+            }),
+            reason: "multi update".to_owned(),
+        };
+
+        let required = change_targets_requiring_read(&active, &decision);
+
+        assert_eq!(required, vec![targets[1].clone(), targets[2].clone()]);
+    }
+
+    #[test]
+    fn change_targets_from_decision_returns_all_multi_change_targets() {
+        let targets = generated_read_targets(3);
+        let decision = RuntimeDecision::ApprovalNeeded {
+            activity: Activity::Change,
+            tool_name: "apply_patch".to_owned(),
+            arguments: serde_json::json!({"payload_id":"patch_multi"}),
+            change_preview: Some(ChangePreview {
+                payload_id: "patch_multi".to_owned(),
+                target_path: targets[0].clone(),
+                operation: PatchOperation::Add,
+                additions: 3,
+                deletions: 0,
+                payload_body: format!(
+                    "*** Begin Patch\n*** Add File: {}\n+one\n*** Add File: {}\n+two\n*** Add File: {}\n+three\n*** End Patch",
+                    targets[0], targets[1], targets[2]
+                ),
+            }),
+            reason: "multi add".to_owned(),
+        };
+
+        assert_eq!(change_targets_from_decision(&decision), targets);
+    }
+
+    #[test]
+    fn final_answer_boundary_keeps_pending_multi_change_targets_after_partial_change() {
+        let targets = generated_read_targets(2);
+        let mut active = active_request();
+        active.add_pending_change_after_read_targets(targets.clone());
+        let observation = ToolObservation::succeeded(
+            "apply_patch",
+            Some(targets[0].clone()),
+            Some(format!("/workspace/{}", targets[0])),
+            vec![format!("updated {} (+1 -1)", targets[0])],
+            false,
+            None,
+            "approved patch applied",
+        );
+
+        active.record_tool_execution(
+            "apply_patch:partial".to_owned(),
+            &observation,
+            message(
+                LlmMessageRole::System,
+                LlmMessageVisibility::Internal,
+                "partial change",
+            ),
+        );
+
+        let decision = apply_final_answer_evidence_boundary(
+            &active,
+            RuntimeDecision::Answer {
+                summary: "done".to_owned(),
+                payload_body: None,
+            },
+        );
+
+        let RuntimeDecision::Blocked { message, reason } = decision else {
+            panic!("partial multi-target change must not allow completion");
+        };
+        assert_eq!(reason, "answer_after_prerequisite_read_without_change");
+        assert!(!message.contains(&format!("targets: {}", targets[0])));
+        assert!(message.contains(&targets[1]));
+    }
+
+    #[test]
+    fn final_answer_boundary_blocks_known_change_targets_after_partial_observation() {
+        let targets = generated_read_targets(2);
+        let mut active = active_request();
+        active.add_pending_change_targets(targets.clone());
+        let observation = ToolObservation::succeeded(
+            "apply_patch",
+            Some(targets[0].clone()),
+            Some(format!("/workspace/{}", targets[0])),
+            vec![format!("added {} (+1 -0)", targets[0])],
+            false,
+            None,
+            "approved patch applied",
+        );
+
+        active.record_tool_execution(
+            "apply_patch:partial".to_owned(),
+            &observation,
+            message(
+                LlmMessageRole::System,
+                LlmMessageVisibility::Internal,
+                "partial change",
+            ),
+        );
+
+        let decision = apply_final_answer_evidence_boundary(
+            &active,
+            RuntimeDecision::Answer {
+                summary: "done".to_owned(),
+                payload_body: None,
+            },
+        );
+
+        let RuntimeDecision::Blocked { message, reason } = decision else {
+            panic!("partial known-target change must not allow completion");
+        };
+        assert_eq!(reason, "answer_with_pending_change_targets");
+        assert!(!message.contains(&format!("pending_targets: {}", targets[0])));
+        assert!(message.contains(&targets[1]));
+    }
+
+    #[test]
+    fn completed_tool_fallback_does_not_finish_pending_known_change_targets() {
+        let targets = generated_read_targets(2);
+        let mut active = active_request();
+        active.add_pending_change_targets(vec![targets[1].clone()]);
+        active.last_successful_tool_observation = Some(ToolLoopObservation {
+            tool_name: "apply_patch".to_owned(),
+            target_raw: Some(targets[0].clone()),
+            status: "succeeded",
+            error_kind: None,
+            truncated: false,
+            source_truncated: false,
+            preview_truncated: false,
+            has_next_range_hint: false,
+            preview: vec![format!("added {} (+1 -0)", targets[0])],
+        });
+        active.executed_tool_records.push(ToolLoopExecutionRecord {
+            signature: "apply_patch:partial".to_owned(),
+            observation: active
+                .last_successful_tool_observation
+                .as_ref()
+                .expect("successful observation")
+                .clone(),
+            observation_message: message(
+                LlmMessageRole::System,
+                LlmMessageVisibility::Internal,
+                "partial change",
+            ),
+        });
+
+        assert!(
+            completed_tool_fallback_final_decision(&active, "schema_validation_failed").is_none()
+        );
     }
 
     #[test]
@@ -2826,6 +4413,86 @@ mod tests {
     }
 
     #[test]
+    fn repeated_completed_add_change_final_decision_requires_every_multi_add_target() {
+        let targets = generated_read_targets(2);
+        let decision = RuntimeDecision::ApprovalNeeded {
+            activity: Activity::Change,
+            tool_name: "apply_patch".to_owned(),
+            arguments: serde_json::json!({"payload_id":"patch_repeat"}),
+            change_preview: Some(ChangePreview {
+                payload_id: "patch_repeat".to_owned(),
+                target_path: targets[0].clone(),
+                operation: PatchOperation::Add,
+                additions: 2,
+                deletions: 0,
+                payload_body: format!(
+                    "*** Begin Patch\n*** Add File: {}\n+one\n*** Add File: {}\n+two\n*** End Patch",
+                    targets[0], targets[1]
+                ),
+            }),
+            reason: "repeat multi add".to_owned(),
+        };
+        let mut partial = active_request();
+        partial.executed_tool_records.push(ToolLoopExecutionRecord {
+            signature: r#"apply_patch:{"payload_id":"patch_done"}"#.to_owned(),
+            observation: ToolLoopObservation {
+                tool_name: "apply_patch".to_owned(),
+                target_raw: Some(targets[0].clone()),
+                status: "succeeded",
+                error_kind: None,
+                truncated: false,
+                source_truncated: false,
+                preview_truncated: false,
+                has_next_range_hint: false,
+                preview: vec![format!("added {} (+1 -0)", targets[0])],
+            },
+            observation_message: message(
+                LlmMessageRole::System,
+                LlmMessageVisibility::Internal,
+                "partial multi add",
+            ),
+        });
+
+        assert!(repeated_completed_add_change_final_decision(&partial, &decision).is_none());
+
+        let mut complete = active_request();
+        complete
+            .executed_tool_records
+            .push(ToolLoopExecutionRecord {
+                signature: r#"apply_patch:{"payload_id":"patch_done"}"#.to_owned(),
+                observation: ToolLoopObservation {
+                    tool_name: "apply_patch".to_owned(),
+                    target_raw: Some(targets[0].clone()),
+                    status: "succeeded",
+                    error_kind: None,
+                    truncated: false,
+                    source_truncated: false,
+                    preview_truncated: false,
+                    has_next_range_hint: false,
+                    preview: vec![
+                        format!("added {} (+1 -0)", targets[0]),
+                        format!("added {} (+1 -0)", targets[1]),
+                    ],
+                },
+                observation_message: message(
+                    LlmMessageRole::System,
+                    LlmMessageVisibility::Internal,
+                    "complete multi add",
+                ),
+            });
+
+        let final_decision = repeated_completed_add_change_final_decision(&complete, &decision)
+            .expect("all multi-add targets should finalize from existing observation");
+
+        let RuntimeDecision::Answer { summary, .. } = final_decision else {
+            panic!("completed multi-add should become answer");
+        };
+        assert!(summary.contains("2개 대상"));
+        assert!(summary.contains(&targets[0]));
+        assert!(summary.contains(&targets[1]));
+    }
+
+    #[test]
     fn repeated_completed_add_change_final_decision_allows_update_on_same_target() {
         let mut active = active_request();
         active.executed_tool_records.push(ToolLoopExecutionRecord {
@@ -3005,11 +4672,14 @@ mod tests {
         let executed_records = vec![record.clone()];
 
         let messages = tool_repeat_answer_request_messages(
+            &workspace_root(),
             &schema,
             &user,
             &record,
             &executed_records,
             &executed,
+            &[],
+            &[],
             "turn-2",
         );
 
@@ -3073,11 +4743,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         let messages = tool_repeat_answer_request_messages(
+            &workspace_root(),
             &schema,
             &user,
             &read_record,
             &executed_records,
             &executed,
+            &[],
+            &[],
             "turn-2",
         );
 
@@ -3116,11 +4789,14 @@ mod tests {
         let executed_records = vec![record.clone()];
 
         let messages = tool_repeat_continuation_request_messages(
+            &workspace_root(),
             &schema,
             &user,
             &record,
             &executed_records,
             &executed,
+            &[],
+            &[],
             "turn-2",
         );
 
@@ -3168,11 +4844,14 @@ mod tests {
         let executed_records = vec![record.clone()];
 
         let messages = tool_repeat_failure_request_messages(
+            &workspace_root(),
             &schema,
             &user,
             &record,
             &executed_records,
             &executed,
+            &[],
+            &[],
             "turn-2",
         );
 
@@ -3252,6 +4931,7 @@ mod tests {
             "run-0001".to_owned(),
             "turn-1".to_owned(),
             "prompt".to_owned(),
+            std::env::current_dir().expect("current dir"),
             message(
                 LlmMessageRole::System,
                 LlmMessageVisibility::Internal,

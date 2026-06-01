@@ -20,11 +20,9 @@ use llm::{
     SchemaPromptBuilder,
 };
 use tool::{
-    apply_approved_change, capture_change_precondition, ApprovedChange, ObservationStatus,
-    PermissionDecision, PermissionGate, ToolCall, ToolObservation, ToolRuntime,
+    apply_approved_change, capture_change_preconditions, ApprovedChange, ObservationStatus,
+    PermissionDecision, PermissionGate, ToolCall, ToolErrorKind, ToolObservation, ToolRuntime,
 };
-
-const MAX_BENCH_STEPS: usize = 4;
 
 #[derive(Default)]
 struct BenchOptions {
@@ -449,7 +447,8 @@ fn run_scenario(
     let mut total_repairs = 0;
     let mut last_failure = None;
 
-    for step in 1..=MAX_BENCH_STEPS {
+    let max_steps = usize::from(config.limits.max_tool_calls.max(1));
+    for step in 1..=max_steps {
         let turn_id = format!("bench-turn-{number:04}-{step:02}");
         let raw = match send_chat(messages.clone()) {
             Ok(raw) => raw,
@@ -467,14 +466,7 @@ fn run_scenario(
 
         let (decision, repair_attempts) = match raw_decision {
             Ok(decision) => (decision, 0),
-            Err(error) => match repair_parse_error(
-                send_chat,
-                &turn_id,
-                schema_content,
-                &scenario.prompt,
-                &raw,
-                &error,
-            ) {
+            Err(error) => match repair_parse_error(send_chat, &turn_id, &messages, &raw, &error) {
                 Ok((decision, attempts)) => (decision, attempts),
                 Err(error) => {
                     return BenchResult {
@@ -557,7 +549,7 @@ fn run_scenario(
         first_tool,
         final_tool,
         repair_attempts: total_repairs,
-        steps: MAX_BENCH_STEPS,
+        steps: max_steps,
         failure: last_failure,
     }
 }
@@ -594,8 +586,7 @@ fn parse_and_classify(raw: &str) -> Result<RuntimeDecision, String> {
 fn repair_parse_error(
     send_chat: &impl Fn(Vec<LlmMessage>) -> Result<String, String>,
     turn_id: &str,
-    schema_content: &str,
-    user_prompt: &str,
+    base_messages: &[LlmMessage],
     raw: &str,
     parse_error: &str,
 ) -> Result<(RuntimeDecision, u16), String> {
@@ -611,11 +602,8 @@ fn repair_parse_error(
         let repair = repair_loop
             .next_request_with_raw(attempts, &synthetic, Some(&last_raw))
             .map_err(|limit| format!("repair limit: {}", limit.reason.as_str()))?;
-        let messages = vec![
-            message(turn_id, LlmMessageRole::System, schema_content),
-            message(turn_id, LlmMessageRole::User, user_prompt),
-            message(turn_id, LlmMessageRole::System, &repair.prompt),
-        ];
+        let mut messages = base_messages.to_vec();
+        messages.push(message(turn_id, LlmMessageRole::System, &repair.prompt));
         let repaired_raw = send_chat(messages)?;
         attempts = repair.attempt;
         match parse_and_classify(&repaired_raw) {
@@ -674,13 +662,21 @@ fn execute_and_check(
             let preview = change_preview
                 .clone()
                 .ok_or_else(|| "apply_patch candidate has no change preview".to_owned())?;
-            let precondition = capture_change_precondition(project_root, &preview)
-                .map_err(|observation| observation.summary())?;
+            let preconditions = match capture_change_preconditions(project_root, &preview) {
+                Ok(preconditions) => preconditions,
+                Err(observation) => {
+                    let completed = check_observation(&observation, check, project_root);
+                    return Ok(ExecutionCheck {
+                        observation,
+                        completed,
+                    });
+                }
+            };
             apply_approved_change(
                 project_root,
                 ApprovedChange {
                     preview,
-                    precondition,
+                    preconditions,
                 },
             )
         }
@@ -696,7 +692,22 @@ fn execute_and_check(
                 config.limits.command_timeout_ms,
             ),
             PermissionDecision::Deny(denial) => {
-                return Err(format!("permission denied: {}", denial.reason));
+                if matches!(
+                    denial.reason.as_str(),
+                    "external_path_manual_only" | "sensitive_external_path"
+                ) {
+                    ToolObservation::failed(
+                        tool_name.clone(),
+                        arguments
+                            .get("cwd")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                        ToolErrorKind::PathOutsideWorkspace,
+                        denial.message,
+                    )
+                } else {
+                    return Err(format!("permission denied: {}", denial.reason));
+                }
             }
             PermissionDecision::Allow => {
                 return Err("run_command unexpectedly allowed without approval".to_owned());

@@ -163,6 +163,11 @@ impl RepairDiagnostic {
                 Some(response.activity.as_str().to_owned()),
                 None,
             ),
+            RuntimeResponse::Plan(response) => (
+                Some("plan".to_owned()),
+                Some(response.activity.as_str().to_owned()),
+                None,
+            ),
             RuntimeResponse::Tool(candidate) => (
                 Some("tool".to_owned()),
                 Some(candidate.activity.as_str().to_owned()),
@@ -212,13 +217,14 @@ const APPLY_PATCH_REPAIR_CONTRACT_LINES: &[&str] = &[
     "- The JSON arguments object for apply_patch must contain payload_id only.",
     "- Do not put target path, patch operation, patch text, or file body text in JSON arguments.",
     "- Keep the existing payload_id when one was present; otherwise choose one payload id and use it in both arguments and AHREUM_PAYLOAD.",
+    "- If the previous response contains <AHREUM_PAYLOAD id=\"X\" format=\"apply_patch\"> and arguments.payload_id is missing or different, set arguments to exactly {\"payload_id\":\"X\"}.",
     "- Do not remove arguments.payload_id or switch away from apply_patch to avoid repairing the patch payload.",
     "- The same payload_id must appear in arguments.payload_id and exactly one AHREUM_PAYLOAD id.",
     "- The AHREUM_PAYLOAD format must be \"apply_patch\".",
     "- The repaired response must start with <AHREUM_ACTION>, then the JSON envelope, then </AHREUM_ACTION>, then the matching AHREUM_PAYLOAD block.",
     "- The payload body must be one complete patch document beginning with *** Begin Patch and ending with *** End Patch.",
-    "- The payload body must contain exactly one target header: Add File, Update File, or Delete File.",
-    "- Encode the target path and operation only in that patch target header.",
+    "- The payload body may contain one or more target headers: Add File, Update File, or Delete File.",
+    "- Encode each target path and operation only in its patch target header.",
     "- The payload body is the patch wrapper, not the final file body by itself.",
     "- Required payload skeleton, with placeholders replaced by the actual target and lines:",
     "<AHREUM_PAYLOAD id=\"patch_001\" format=\"apply_patch\">",
@@ -236,6 +242,17 @@ const APPLY_PATCH_REPAIR_CONTRACT_LINES: &[&str] = &[
     "- The space, -, and + markers are the first character of the patch line, not separators. Do not add an extra space after - or + unless the file line itself starts with a space.",
     "- Do not wrap the patch body in markdown fences.",
     "- Preserve the intended patch operation unless the parser failure proves that operation invalid for the observed file state.",
+];
+
+const PLAN_REPAIR_CONTRACT_LINES: &[&str] = &[
+    "Plan repair focus:",
+    "- Use response_type=plan only for a multi-target execution ledger that the runtime should complete over later turns.",
+    "- If the failed response is only a normal advisory or explanatory reply, convert it to response_type=answer with activity=None instead of forcing an unnecessary plan.",
+    "- When preserving response_type=plan, plan_items must be a JSON array, never an object, string, map, or prose paragraph.",
+    "- Every plan item must be a JSON object with operation and optional target only.",
+    "- operation must be one of read, create, update, delete, execute, verify, answer.",
+    "- read, create, update, and delete plan items require a concrete workspace-relative target when the target is known.",
+    "- Plan responses must not contain tool_name, arguments, payload_id, patch text, file body text, command argv, or AHREUM_PAYLOAD blocks.",
 ];
 
 #[cfg(test)]
@@ -277,7 +294,7 @@ fn build_repair_prompt_from_diagnostic(
         "- Do not go backward to an earlier evidence-gathering tool when the failed response attempted a later Change, Execute, or Configure candidate.",
         "- For tool argument errors, keep the same tool_name and repair only arguments, message, or reason as needed.",
         "- For apply_patch repairs, do not return plain JSON alone; return one AHREUM_ACTION block plus exactly one matching AHREUM_PAYLOAD id with format=\"apply_patch\".",
-        "- For apply_patch target-count errors, the payload body must contain exactly one Add File, Update File, or Delete File target header inside the patch document.",
+        "- For apply_patch target-count errors, the payload body must contain one complete patch document with one or more Add File, Update File, or Delete File target headers.",
         "- For apply_patch target-count errors, do not preserve a bare file body; convert it into a patch document with the target header and patch line prefixes.",
         "- If a workspace fact can be checked by a safe Explore tool, do not use clarify.",
         "",
@@ -362,6 +379,17 @@ fn build_repair_prompt_from_diagnostic(
         );
     }
 
+    if diagnostic.response_type.as_deref() == Some("plan")
+        || diagnostic.failure_message.contains("plan_items")
+        || diagnostic.failure_message.contains("plan operation")
+    {
+        lines.extend(
+            PLAN_REPAIR_CONTRACT_LINES
+                .iter()
+                .map(|line| line.to_string()),
+        );
+    }
+
     if matches!(
         diagnostic.failure_kind.as_str(),
         "payload_validation_failed" | "partial_response"
@@ -373,6 +401,10 @@ fn build_repair_prompt_from_diagnostic(
         );
         lines.push(
             "- If an AHREUM_PAYLOAD block remains, the JSON envelope must reference it with answer_payload_id or arguments.payload_id."
+                .to_owned(),
+        );
+        lines.push(
+            "- For apply_patch with one AHREUM_PAYLOAD id=\"X\", keep response_type=tool, activity=Change, tool_name=apply_patch, and set arguments to exactly {\"payload_id\":\"X\"}."
                 .to_owned(),
         );
         lines.push(
@@ -519,6 +551,29 @@ mod tests {
     }
 
     #[test]
+    fn plan_shape_repair_includes_array_contract_and_answer_escape() {
+        let error = RuntimeResponseParseError {
+            kind: RuntimeResponseParseErrorKind::SchemaValidationFailed,
+            message: "plan_items must be an array".to_owned(),
+        };
+        let raw = r#"{"response_type":"plan","activity":"None","message":"정리합니다.","tool_manifest_id":"ahreumcode.local-llm.tool-manifest.v1","tool_manifest_version":"1","plan_items":{"operation":"answer"}}"#;
+        let loop_state = RepairLoop::default_local();
+
+        let request = loop_state
+            .next_request_with_raw(0, &error, Some(raw))
+            .expect("plan repair should be allowed");
+
+        assert!(request.prompt.contains("Plan repair focus:"));
+        assert!(request.prompt.contains("plan_items must be a JSON array"));
+        assert!(request
+            .prompt
+            .contains("convert it to response_type=answer"));
+        assert!(request
+            .prompt
+            .contains("must not contain tool_name, arguments, payload_id"));
+    }
+
+    #[test]
     fn payload_parse_repair_reconstructs_apply_patch_payload_contract() {
         let error = RuntimeResponseParseError {
             kind: RuntimeResponseParseErrorKind::PayloadValidationFailed,
@@ -539,6 +594,9 @@ mod tests {
         assert!(request
             .prompt
             .contains("The same payload_id must appear in arguments.payload_id"));
+        assert!(request
+            .prompt
+            .contains("set arguments to exactly {\"payload_id\":\"X\"}"));
         assert!(request.prompt.contains("format=\"apply_patch\""));
         assert!(request.prompt.contains("*** Begin Patch"));
         assert!(request.prompt.contains("*** End Patch"));
@@ -630,10 +688,10 @@ mod tests {
             .contains("target path, patch operation, patch text, or file body text"));
         assert!(request
             .prompt
-            .contains("Encode the target path and operation only in that patch target header"));
+            .contains("Encode each target path and operation only in its patch target header"));
         assert!(request
             .prompt
-            .contains("exactly one target header: Add File, Update File, or Delete File"));
+            .contains("one or more target headers: Add File, Update File, or Delete File"));
         assert!(request.prompt.contains("do not preserve a bare file body"));
         assert!(request
             .prompt

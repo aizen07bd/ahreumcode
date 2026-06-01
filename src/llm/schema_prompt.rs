@@ -13,6 +13,7 @@ const REQUIRED_SCHEMA_RULES: &[&str] = &[
     "response_type",
     "answer",
     "tool",
+    "plan",
     "clarify",
     "blocked",
     "activity",
@@ -26,6 +27,8 @@ const REQUIRED_SCHEMA_RULES: &[&str] = &[
     "tool_manifest_version",
     "Unknown fields are rejected.",
     "Tool argument schemas:",
+    "Plan response contract:",
+    "plan_items",
     "Integer fields must be JSON numbers, not strings.",
     "Omitted optional Explore bounds use runtime defaults",
     "workspace-relative path",
@@ -130,6 +133,7 @@ impl SchemaPromptBuilder {
                 "Allowed response_type values:",
                 "- answer",
                 "- tool",
+                "- plan",
                 "- clarify",
                 "- blocked",
                 "",
@@ -158,9 +162,11 @@ impl SchemaPromptBuilder {
             "- Unknown fields are rejected.",
             "- answer uses response_type, activity, message, tool_manifest_id, tool_manifest_version, and optional answer_payload_id.",
             "- tool uses response_type, activity, message, tool_manifest_id, tool_manifest_version, tool_name, arguments, and optional reason.",
+            "- plan uses response_type, activity None, message, tool_manifest_id, tool_manifest_version, plan_items, and optional reason.",
             "- clarify uses response_type, activity, message, tool_manifest_id, tool_manifest_version, and optional reason.",
             "- blocked uses response_type, activity, message, tool_manifest_id, tool_manifest_version, and optional reason.",
             "- One response cannot contain multiple tool candidates.",
+            "- A plan response is not a tool call and must not contain tool_name, arguments, payload_id, or executable command text.",
             "- Do not invent tool names or argument fields.",
             "- Tool arguments must match the provided typed argument schema.",
             "- Integer fields must be JSON numbers, not strings.",
@@ -187,7 +193,12 @@ impl SchemaPromptBuilder {
             "- If the user asks to create new self-contained content and does not ask to inspect existing workspace state, do not Explore first. Return exactly one Change tool candidate with an apply_patch payload for the requested file.",
             "- If the user asks to modify, update, replace, or delete content in a named existing workspace file and no successful read_file observation for that target is available in this request, request read_file first; do not build an apply_patch payload from assumed file contents.",
             "- read_file observations include read_file_patch_content for exact file lines. Use that block for Update File hunks; preview line number prefixes are display-only.",
+            "- For multi-target read, create, update, or delete goals, maintain a compact target plan from observations and continue one target or one small coherent batch at a time until the user goal is complete.",
+            "- If a multi-target goal is not yet represented by AHREUM_TARGET_PROGRESS, return one plan response first with plan_items for the concrete targets you can name from the user request; then continue with one tool candidate in the next turn.",
+            "- When AHREUM_TARGET_PROGRESS is present, treat it as the current plan ledger: do not repeat completed targets, and choose the next required unread or unchanged target before answering.",
             "- Use answer with activity None only when no workspace evidence is needed, project context is sufficient, or the latest observation is enough evidence.",
+            "- When answering an advisory or planning request that does not ask to choose a technology stack, do not introduce concrete framework, library, runtime, database, hosting, repository, CI, editor, or product names unless the user named them or successful workspace evidence fixed them; use category terms instead.",
+            "- For category-only advisory answers, do not add parenthetical examples containing concrete product, framework, service, repository, editor, or communication-tool names. Keep examples generic, such as user group, interaction pattern, validation criterion, collaboration role, or deployment constraint.",
             "",
             "Explore tool selection rules:",
             "- Use read_file when the user names an exact workspace file path or when a previous observation identifies the file to read.",
@@ -197,6 +208,17 @@ impl SchemaPromptBuilder {
             "- After search_text returns candidate files or lines, use read_file if file content is needed before answering.",
             "- Do not use clarify when safe bounded read/search can reduce uncertainty.",
             "- Do not use list_files or search_text before a self-contained new-file Change unless existing workspace evidence is required to choose the target or content.",
+            "",
+            "Plan response contract:",
+            "- Plan responses use response_type=plan and activity=None.",
+            "- Use plan only for workspace execution goals that require tracking multiple concrete targets or ordered tool steps.",
+            "- Do not use plan for advisory, summarization, explanation, brainstorming, or team-perspective requests; answer those directly when no workspace evidence is needed.",
+            "- plan_items is a JSON array of objects with operation and optional target.",
+            "- operation must be one of read, create, update, delete, execute, verify, answer.",
+            "- read, create, update, and delete plan items must include a concrete workspace-relative target when the target is known.",
+            "- Do not put tool_name, arguments, payload_id, patch text, file body, or command argv inside a plan response.",
+            "- The runtime uses plan_items only as a completion ledger; it will ask for the actual next tool candidate in a later turn.",
+            "- Do not invent conventional filenames. If the user did not name targets and no observation identifies targets, use clarify or a bounded Explore tool instead of a plan.",
             "",
             "Execute tool selection rules:",
             "- If the user asks to run, execute, check with a shell command, print the current working directory, or invoke a named command, use run_command with activity=Execute.",
@@ -252,6 +274,7 @@ impl SchemaPromptBuilder {
             "- Do not put target path, patch operation, patch text, or file body text in apply_patch JSON arguments.",
             "- arguments.payload_id must match the AHREUM_PAYLOAD id, and the payload format must be \"apply_patch\".",
             "- The payload body must be one complete patch document beginning with *** Begin Patch and ending with *** End Patch.",
+            "- One apply_patch payload may contain one or more Add File, Update File, or Delete File target sections; use one atomic payload for related multi-file changes.",
             "- The payload body is the patch wrapper, not the final file body by itself.",
             "- For a new file, use *** Add File: <requested workspace path> and prefix every created content line with +.",
             "- Do not use Add File for a path whose current contents are being modified; read the file first, then use Update File with exact context lines.",
@@ -378,6 +401,15 @@ mod tests {
         assert!(prompt
             .content
             .contains("no successful read_file observation for that target"));
+        assert!(prompt
+            .content
+            .contains("does not ask to choose a technology stack"));
+        assert!(prompt
+            .content
+            .contains("do not add parenthetical examples containing concrete product"));
+        assert!(prompt
+            .content
+            .contains("Do not use plan for advisory, summarization"));
         assert!(prompt
             .content
             .contains("Use search_text when the user asks where a symbol"));

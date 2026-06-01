@@ -25,7 +25,7 @@ use crate::llm::{
 };
 use crate::logging::{LogEvent, Logger};
 use crate::tool::{
-    apply_approved_change, capture_change_precondition, redacted_tool_arguments,
+    apply_approved_change, capture_change_preconditions, redacted_tool_arguments,
     validate_approved_change, ApprovedChange, ChangePrecondition, ObservationStatus,
     PermissionDecision, PermissionDenial, PermissionGate, PermissionRequest,
     PostEditDiagnosticRequest, ToolCall, ToolErrorKind, ToolName, ToolObservation, ToolRuntime,
@@ -37,8 +37,8 @@ use super::event_log::{self, TUI_01_SCOPE, TUI_02_SCOPE, TUI_03_SCOPE};
 use super::expanded_form::ExpandedFormEvent;
 use super::persona::{PersonaEvent, PersonaRendered, PersonaRuntimeEvent};
 use super::persona_runtime::{
-    parse_persona_turn_result_for_turn, PersonaRuntime, PersonaRuntimeMode, PersonaTurn,
-    PersonaTurnKind, PersonaTurnOutcome, PersonaTurnPrompt,
+    parse_persona_turn_result_for_turn, PersonaRuntime, PersonaRuntimeMode, PersonaRuntimeStage,
+    PersonaTurn, PersonaTurnKind, PersonaTurnOutcome, PersonaTurnPrompt,
 };
 use super::runtime_request::{self, ActivePlainRequest};
 use super::runtime_workspace;
@@ -374,7 +374,7 @@ struct PendingChangeApproval {
     arguments: Value,
     signature: String,
     preview: ChangePreview,
-    precondition: ChangePrecondition,
+    preconditions: Vec<ChangePrecondition>,
 }
 
 struct PendingCommandApproval {
@@ -396,7 +396,7 @@ enum PendingChangePreparation {
         arguments: Value,
         signature: String,
         preview: ChangePreview,
-        precondition: ChangePrecondition,
+        preconditions: Vec<ChangePrecondition>,
     },
     Failed {
         tool_name: String,
@@ -840,38 +840,33 @@ impl TuiApp {
             {
                 return true;
             }
+
+            self.persona_runtime
+                .complete_without_visible_turn(task_state_summary);
+            self.active_persona_request = None;
+            return true;
         }
 
-        if self
-            .persona_runtime
-            .enqueue_completion_for_mode(PersonaRuntimeMode::Full, task_state_summary)
-            .is_none()
-        {
-            return false;
-        }
-
-        if let Some(active) = self.active_persona_request.as_ref() {
-            if active.turn.kind != PersonaTurnKind::Completion {
-                self.active_persona_request = None;
-            } else {
-                return true;
-            }
-        }
-
-        let Some(prompt) = self
-            .persona_runtime
-            .current_task()
-            .map(|task| task.user_prompt.clone())
-        else {
-            return false;
-        };
-        let persona_context_start = self.state.persona.message_count();
-        self.start_next_persona_turn_request(prompt, false, persona_context_start)
+        self.persona_runtime
+            .complete_without_visible_turn(task_state_summary)
     }
 
     fn enqueue_persona_progress_request(&mut self, task_state_summary: String) -> bool {
         if !self.state.persona_panel.is_full() {
             return false;
+        }
+
+        let kickoff_in_progress = self
+            .active_persona_request
+            .as_ref()
+            .is_some_and(|active| active.turn.stage == PersonaRuntimeStage::Kickoff)
+            || self
+                .persona_runtime
+                .has_pending_stage(PersonaRuntimeStage::Kickoff);
+        if kickoff_in_progress {
+            return self
+                .persona_runtime
+                .update_task_state_summary(task_state_summary);
         }
 
         if self
@@ -975,17 +970,24 @@ impl TuiApp {
         self.persona_runtime
             .record_turn_result(&active.turn, outcome);
 
+        let plain_started = if active.start_plain_after && self.active_plain_request.is_none() {
+            self.start_plain_prompt_request(active.prompt.clone(), active.persona_context_start)?;
+            true
+        } else {
+            false
+        };
+
         if self.active_persona_request.is_none()
             && self.start_next_persona_turn_request(
                 active.prompt.clone(),
-                active.start_plain_after,
+                active.start_plain_after && !plain_started,
                 active.persona_context_start,
             )
         {
             return Ok(());
         }
 
-        if active.start_plain_after && self.active_plain_request.is_none() {
+        if active.start_plain_after && !plain_started && self.active_plain_request.is_none() {
             self.start_plain_prompt_request(active.prompt, active.persona_context_start)?;
         }
 
@@ -1051,6 +1053,7 @@ impl TuiApp {
             run_id,
             turn_id,
             prompt,
+            self.tool_runtime.workspace_root().to_path_buf(),
             schema_message,
             user_message,
             history,
@@ -1240,11 +1243,14 @@ impl TuiApp {
                                     runtime_request::apply_final_answer_evidence_boundary(
                                         &active, decision,
                                     );
-                                if let Some(target) = runtime_request::change_target_requiring_read(
-                                    &active, &decision,
-                                ) {
-                                    active.pending_change_after_read_target = Some(target);
-                                }
+                                let decision = runtime_request::apply_read_path_resolution_boundary(
+                                    &active, decision,
+                                );
+                                active.add_pending_change_after_read_targets(
+                                    runtime_request::change_targets_requiring_read(
+                                        &active, &decision,
+                                    ),
+                                );
                                 let decision = runtime_request::apply_change_evidence_boundary(
                                     &active, decision,
                                 );
@@ -1254,6 +1260,94 @@ impl TuiApp {
                                     decision.activity().map(|activity| activity.as_str()),
                                     decision.tool_name(),
                                 );
+                                if let RuntimeDecision::PlanCandidate { items, .. } = &decision {
+                                    if active.plan_candidate_count
+                                        >= self.runtime_config.limits.max_same_tool_repeats
+                                    {
+                                        let final_decision = RuntimeDecision::Blocked {
+                                            message: "계획 응답이 실제 도구 후보 없이 반복되어 작업을 진행할 수 없습니다."
+                                                .to_owned(),
+                                            reason: "plan_repeated_without_tool_candidate"
+                                                .to_owned(),
+                                        };
+                                        active.record_final_decision(&final_decision);
+                                        let events = runtime_workspace::record_runtime_decision(
+                                            &mut self.state,
+                                            &final_decision,
+                                        );
+                                        self.finish_plain_request_with_events(
+                                            events,
+                                            "반복 계획 응답을 차단했습니다.",
+                                            Some((&active.run_id, &active.turn_id)),
+                                            active.persona_context_start,
+                                            persona_task_state_summary(
+                                                &active,
+                                                "blocked",
+                                                "plan response repeated without a concrete tool candidate",
+                                            ),
+                                            Some(
+                                                runtime_request::conversation_task_context_summary(
+                                                    &active,
+                                                ),
+                                            ),
+                                        )?;
+                                        return Ok(());
+                                    }
+                                    active.plan_candidate_count =
+                                        active.plan_candidate_count.saturating_add(1);
+                                    active.apply_plan_items(items);
+                                    if self.state.persona_panel.is_full() {
+                                        self.persona_runtime.update_task_state_summary(
+                                            persona_task_state_summary(
+                                            &active,
+                                            "plan_ledger_registered",
+                                            "main runtime registered a non-executing task plan and is requesting the next concrete tool candidate",
+                                            ),
+                                        );
+                                    }
+                                    let events = runtime_workspace::record_runtime_decision(
+                                        &mut self.state,
+                                        &decision,
+                                    );
+                                    self.log_workspace_events(&events.events)?;
+                                    let next_turn_id = active.history.next_turn_id();
+                                    self.log_turn_id_assigned(&active.history, &next_turn_id)?;
+                                    let request_messages =
+                                        runtime_request::plan_follow_up_request_messages(
+                                            &active.workspace_root,
+                                            &active.schema_message,
+                                            &active.user_message,
+                                            &active.executed_tool_records,
+                                            &active.executed_tool_signatures,
+                                            &active.planned_read_targets,
+                                            &active.pending_change_targets,
+                                            &next_turn_id,
+                                        );
+                                    self.log_plain_request_started(
+                                        &active.run_id,
+                                        &next_turn_id,
+                                        &active.prompt,
+                                    )?;
+                                    self.state.record_persona_runtime_event(
+                                        PersonaRuntimeEvent::LlmRequestStarted,
+                                    );
+                                    self.llm_diagnostics
+                                        .record_request_started(&active.run_id, &next_turn_id);
+                                    self.set_runtime_working_phase(
+                                        WorkingPhase::Interpret,
+                                        "계획 장부를 반영한 뒤 다음 도구 후보를 요청합니다.",
+                                    )?;
+
+                                    active.turn_id = next_turn_id;
+                                    active.receiver = runtime_request::spawn_chat_request(
+                                        &self.runtime_config,
+                                        request_messages,
+                                    );
+                                    active.reset_request_timer();
+                                    active.reset_repair_state();
+                                    self.active_plain_request = Some(active);
+                                    return Ok(());
+                                }
                                 if let RuntimeDecision::ApprovalNeeded {
                                     tool_name: _,
                                     arguments: _,
@@ -1340,31 +1434,40 @@ impl TuiApp {
                                         let request_messages = match redirect {
                                             runtime_request::ToolLoopRepeatRedirect::SettledDuplicate => {
                                                 runtime_request::tool_repeat_answer_request_messages(
+                                                    &active.workspace_root,
                                                     &active.schema_message,
                                                     &active.user_message,
                                                     &execution_record,
                                                     &active.executed_tool_records,
                                                     &active.executed_tool_signatures,
+                                                    &active.planned_read_targets,
+                                                    &active.pending_change_targets,
                                                     &next_turn_id,
                                                 )
                                             }
                                             runtime_request::ToolLoopRepeatRedirect::TruncatedContinuation => {
                                                 runtime_request::tool_repeat_continuation_request_messages(
+                                                    &active.workspace_root,
                                                     &active.schema_message,
                                                     &active.user_message,
                                                     &execution_record,
                                                     &active.executed_tool_records,
                                                     &active.executed_tool_signatures,
+                                                    &active.planned_read_targets,
+                                                    &active.pending_change_targets,
                                                     &next_turn_id,
                                                 )
                                             }
                                             runtime_request::ToolLoopRepeatRedirect::FailedDuplicate => {
                                                 runtime_request::tool_repeat_failure_request_messages(
+                                                    &active.workspace_root,
                                                     &active.schema_message,
                                                     &active.user_message,
                                                     &execution_record,
                                                     &active.executed_tool_records,
                                                     &active.executed_tool_signatures,
+                                                    &active.planned_read_targets,
+                                                    &active.pending_change_targets,
                                                     &next_turn_id,
                                                 )
                                             }
@@ -1520,9 +1623,14 @@ impl TuiApp {
                                             arguments,
                                             signature,
                                             preview,
-                                            precondition,
+                                            preconditions,
                                         } = pending_change
                                         {
+                                            active.add_pending_change_targets(
+                                                runtime_request::change_targets_from_decision(
+                                                    &decision,
+                                                ),
+                                            );
                                             self.pending_change_approval =
                                                 Some(PendingChangeApproval {
                                                     active,
@@ -1530,7 +1638,7 @@ impl TuiApp {
                                                     arguments,
                                                     signature,
                                                     preview,
-                                                    precondition,
+                                                    preconditions,
                                                 });
                                             self.log_workspace_events(&events.events)?;
                                             return Ok(());
@@ -1822,11 +1930,24 @@ impl TuiApp {
             .record_system_notice(format!("approval needed: {action}"));
         events.extend(self.state.record_system_notice(reason));
         if let Some(preview) = change_preview {
-            events.extend(self.state.workspace.push_diff_summary(
-                preview.target_path,
-                preview.additions,
-                preview.deletions,
-            ));
+            match preview.target_summaries() {
+                Ok(targets) => {
+                    for target in targets {
+                        events.extend(self.state.workspace.push_diff_summary(
+                            target.target_path,
+                            target.additions,
+                            target.deletions,
+                        ));
+                    }
+                }
+                Err(_) => {
+                    events.extend(self.state.workspace.push_diff_summary(
+                        preview.target_path,
+                        preview.additions,
+                        preview.deletions,
+                    ));
+                }
+            }
         }
         Ok(events)
     }
@@ -1867,11 +1988,11 @@ impl TuiApp {
         }
         let signature = change_approval_signature(tool_name, arguments, preview);
 
-        match capture_change_precondition(self.tool_runtime.workspace_root(), preview) {
-            Ok(precondition) => {
+        match capture_change_preconditions(self.tool_runtime.workspace_root(), preview) {
+            Ok(preconditions) => {
                 let approved = ApprovedChange {
                     preview: preview.clone(),
-                    precondition,
+                    preconditions,
                 };
                 if let Err(observation) = validate_approved_change(&approved) {
                     return Ok(PendingChangePreparation::Failed {
@@ -1886,7 +2007,7 @@ impl TuiApp {
                     arguments: arguments.clone(),
                     signature,
                     preview: approved.preview,
-                    precondition: approved.precondition,
+                    preconditions: approved.preconditions,
                 })
             }
             Err(observation) => Ok(PendingChangePreparation::Failed {
@@ -1932,22 +2053,26 @@ impl TuiApp {
             arguments,
             signature,
             preview,
-            precondition,
+            preconditions,
         } = pending;
         let observation = apply_approved_change(
             self.tool_runtime.workspace_root(),
             ApprovedChange {
                 preview: preview.clone(),
-                precondition,
+                preconditions,
             },
         );
+        let diagnostic_target = preview
+            .target_summaries()
+            .ok()
+            .and_then(|targets| (targets.len() == 1).then(|| targets[0].target_path.clone()));
         self.handle_change_observation_after_approval(
             active,
             tool_name,
             arguments,
             signature,
             observation,
-            Some(preview.target_path),
+            diagnostic_target,
             "approved_change_observation_recorded",
         )
     }
@@ -2182,11 +2307,14 @@ impl TuiApp {
         let next_turn_id = active.history.next_turn_id();
         self.log_turn_id_assigned(&active.history, &next_turn_id)?;
         let request_messages = runtime_request::tool_loop_request_messages(
+            &active.workspace_root,
             &active.schema_message,
             &active.user_message,
             &observation_message,
             &active.executed_tool_records,
             &active.executed_tool_signatures,
+            &active.planned_read_targets,
+            &active.pending_change_targets,
             &next_turn_id,
         );
         self.log_plain_request_started(&active.run_id, &next_turn_id, &active.prompt)?;
@@ -2253,11 +2381,14 @@ impl TuiApp {
         let next_turn_id = active.history.next_turn_id();
         self.log_turn_id_assigned(&active.history, &next_turn_id)?;
         let request_messages = runtime_request::tool_loop_request_messages(
+            &active.workspace_root,
             &active.schema_message,
             &active.user_message,
             &observation_message,
             &active.executed_tool_records,
             &active.executed_tool_signatures,
+            &active.planned_read_targets,
+            &active.pending_change_targets,
             &next_turn_id,
         );
         self.log_plain_request_started(&active.run_id, &next_turn_id, &active.prompt)?;
@@ -2319,11 +2450,14 @@ impl TuiApp {
         let next_turn_id = active.history.next_turn_id();
         self.log_turn_id_assigned(&active.history, &next_turn_id)?;
         let request_messages = runtime_request::tool_loop_request_messages(
+            &active.workspace_root,
             &active.schema_message,
             &active.user_message,
             &observation_message,
             &active.executed_tool_records,
             &active.executed_tool_signatures,
+            &active.planned_read_targets,
+            &active.pending_change_targets,
             &next_turn_id,
         );
         self.log_plain_request_started(&active.run_id, &next_turn_id, &active.prompt)?;
@@ -2390,11 +2524,14 @@ impl TuiApp {
         let next_turn_id = active.history.next_turn_id();
         self.log_turn_id_assigned(&active.history, &next_turn_id)?;
         let request_messages = runtime_request::tool_loop_request_messages(
+            &active.workspace_root,
             &active.schema_message,
             &active.user_message,
             &observation_message,
             &active.executed_tool_records,
             &active.executed_tool_signatures,
+            &active.planned_read_targets,
+            &active.pending_change_targets,
             &next_turn_id,
         );
         self.log_plain_request_started(&active.run_id, &next_turn_id, &active.prompt)?;
@@ -2634,31 +2771,40 @@ impl TuiApp {
             let request_messages = match redirect {
                 runtime_request::ToolLoopRepeatRedirect::SettledDuplicate => {
                     runtime_request::tool_repeat_answer_request_messages(
+                        &active.workspace_root,
                         &active.schema_message,
                         &active.user_message,
                         &execution_record,
                         &active.executed_tool_records,
                         &active.executed_tool_signatures,
+                        &active.planned_read_targets,
+                        &active.pending_change_targets,
                         &next_turn_id,
                     )
                 }
                 runtime_request::ToolLoopRepeatRedirect::TruncatedContinuation => {
                     runtime_request::tool_repeat_continuation_request_messages(
+                        &active.workspace_root,
                         &active.schema_message,
                         &active.user_message,
                         &execution_record,
                         &active.executed_tool_records,
                         &active.executed_tool_signatures,
+                        &active.planned_read_targets,
+                        &active.pending_change_targets,
                         &next_turn_id,
                     )
                 }
                 runtime_request::ToolLoopRepeatRedirect::FailedDuplicate => {
                     runtime_request::tool_repeat_failure_request_messages(
+                        &active.workspace_root,
                         &active.schema_message,
                         &active.user_message,
                         &execution_record,
                         &active.executed_tool_records,
                         &active.executed_tool_signatures,
+                        &active.planned_read_targets,
+                        &active.pending_change_targets,
                         &next_turn_id,
                     )
                 }
@@ -2772,11 +2918,14 @@ impl TuiApp {
         let next_turn_id = active.history.next_turn_id();
         self.log_turn_id_assigned(&active.history, &next_turn_id)?;
         let request_messages = runtime_request::tool_loop_request_messages(
+            &active.workspace_root,
             &active.schema_message,
             &active.user_message,
             &observation_message,
             &active.executed_tool_records,
             &active.executed_tool_signatures,
+            &active.planned_read_targets,
+            &active.pending_change_targets,
             &next_turn_id,
         );
         self.log_plain_request_started(&active.run_id, &next_turn_id, &active.prompt)?;
@@ -4468,10 +4617,10 @@ fn persona_task_state_summary(
 
     if let Some(observation) = active.last_tool_observation.as_ref() {
         lines.push(format!(
-            "last_observation: tool_name={} status={} target_raw={} error_kind={}",
+            "last_observation: tool_name={} status={} target_present={} error_kind={}",
             observation.tool_name,
             observation.status,
-            observation.target_raw.as_deref().unwrap_or("-"),
+            observation.target_raw.is_some(),
             observation.error_kind.unwrap_or("-"),
         ));
         lines.push("fact_boundary: persona must not state literal paths, filenames, config keys, extracted values, file contents, package names, provider names, versions, or configuration values; those belong only in the main answer.".to_owned());
@@ -4481,6 +4630,16 @@ fn persona_task_state_summary(
     } else {
         lines.push("last_observation: none".to_owned());
         lines.push("fact_boundary: no observation is available to persona; do not state literal paths, filenames, config keys, extracted values, file contents, package names, provider names, versions, or configuration values.".to_owned());
+    }
+
+    if active.planned_read_target_count() > 0 || active.pending_change_target_count() > 0 {
+        lines.push(format!(
+            "plan_ledger_status: planned_read_targets={} pending_planned_reads={} pending_change_targets={}",
+            active.planned_read_target_count(),
+            active.pending_planned_read_target_count(),
+            active.pending_change_target_count(),
+        ));
+        lines.push("fact_boundary: a plan ledger is not execution evidence; persona must not claim planned targets were read, written, changed, deleted, verified, or completed until runtime observations report success.".to_owned());
     }
 
     lines.join("\n")
@@ -4509,6 +4668,7 @@ mod tests {
             "run-0001".to_owned(),
             "turn-0001".to_owned(),
             "USER_REQUEST_MARKER".to_owned(),
+            std::env::current_dir().expect("current dir"),
             crate::llm::LlmMessage {
                 turn_id: "turn-0001".to_owned(),
                 role: crate::llm::LlmMessageRole::System,
@@ -4531,6 +4691,90 @@ mod tests {
         assert!(summary.contains("literal paths"));
         assert!(summary.contains("filenames"));
         assert!(summary.contains("last_observation: none"));
+    }
+
+    #[test]
+    fn persona_request_state_exposes_plan_ledger_as_counts_only() {
+        let mut active = crate::tui::runtime_request::ActivePlainRequest::new(
+            "run-0001".to_owned(),
+            "turn-0001".to_owned(),
+            "USER_REQUEST_MARKER".to_owned(),
+            std::env::current_dir().expect("current dir"),
+            crate::llm::LlmMessage {
+                turn_id: "turn-0001".to_owned(),
+                role: crate::llm::LlmMessageRole::System,
+                visibility: crate::llm::LlmMessageVisibility::Internal,
+                content: "schema".to_owned(),
+            },
+            crate::llm::LlmMessage {
+                turn_id: "turn-0001".to_owned(),
+                role: crate::llm::LlmMessageRole::User,
+                visibility: crate::llm::LlmMessageVisibility::UserVisible,
+                content: "USER_REQUEST_MARKER".to_owned(),
+            },
+            crate::llm::MessageHistory::new("run-0001"),
+            std::sync::mpsc::channel().1,
+            0,
+        );
+        active
+            .planned_read_targets
+            .push("src/hidden_plan.md".to_owned());
+        active
+            .pending_change_targets
+            .push("src/hidden_change.md".to_owned());
+
+        let summary =
+            super::persona_task_state_summary(&active, "plan_ledger_registered", "plan accepted");
+
+        assert!(summary.contains("plan_ledger_status"));
+        assert!(summary.contains("planned_read_targets=1"));
+        assert!(summary.contains("pending_planned_reads=1"));
+        assert!(summary.contains("pending_change_targets=1"));
+        assert!(summary.contains("plan ledger is not execution evidence"));
+        assert!(!summary.contains("src/hidden_plan.md"));
+        assert!(!summary.contains("src/hidden_change.md"));
+    }
+
+    #[test]
+    fn persona_request_state_does_not_expose_observation_target_literal() {
+        let mut active = crate::tui::runtime_request::ActivePlainRequest::new(
+            "run-0001".to_owned(),
+            "turn-0001".to_owned(),
+            "USER_REQUEST_MARKER".to_owned(),
+            std::env::current_dir().expect("current dir"),
+            crate::llm::LlmMessage {
+                turn_id: "turn-0001".to_owned(),
+                role: crate::llm::LlmMessageRole::System,
+                visibility: crate::llm::LlmMessageVisibility::Internal,
+                content: "schema".to_owned(),
+            },
+            crate::llm::LlmMessage {
+                turn_id: "turn-0001".to_owned(),
+                role: crate::llm::LlmMessageRole::User,
+                visibility: crate::llm::LlmMessageVisibility::UserVisible,
+                content: "USER_REQUEST_MARKER".to_owned(),
+            },
+            crate::llm::MessageHistory::new("run-0001"),
+            std::sync::mpsc::channel().1,
+            0,
+        );
+        active.last_tool_observation = Some(crate::tui::runtime_request::ToolLoopObservation {
+            tool_name: "read_file".to_owned(),
+            target_raw: Some("src/private_target.md".to_owned()),
+            status: "succeeded",
+            error_kind: None,
+            truncated: false,
+            source_truncated: false,
+            preview_truncated: false,
+            has_next_range_hint: false,
+            preview: vec!["content".to_owned()],
+        });
+
+        let summary = super::persona_task_state_summary(&active, "tool_succeeded", "done");
+
+        assert!(summary.contains("target_present=true"));
+        assert!(!summary.contains("src/private_target.md"));
+        assert!(!summary.contains("target_raw="));
     }
 
     #[test]

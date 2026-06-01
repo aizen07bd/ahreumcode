@@ -20,34 +20,77 @@ pub struct ChangePrecondition {
 
 pub struct ApprovedChange {
     pub preview: ChangePreview,
-    pub precondition: ChangePrecondition,
+    pub preconditions: Vec<ChangePrecondition>,
 }
 
 pub fn validate_approved_change(change: &ApprovedChange) -> Result<(), ToolObservation> {
-    verify_precondition(&change.preview, &change.precondition)?;
-    match change.preview.operation {
+    let target_previews = split_change_preview(&change.preview)?;
+    if target_previews.len() != change.preconditions.len() {
+        return Err(change_failure(
+            &change.preview,
+            ToolErrorKind::InvalidArguments,
+            "patch target precondition count does not match target count",
+        ));
+    }
+    for (preview, precondition) in target_previews.iter().zip(&change.preconditions) {
+        validate_single_approved_change(preview, precondition)?;
+    }
+    Ok(())
+}
+
+fn validate_single_approved_change(
+    preview: &ChangePreview,
+    precondition: &ChangePrecondition,
+) -> Result<(), ToolObservation> {
+    verify_precondition(preview, precondition)?;
+    match preview.operation {
         PatchOperation::Add => {
-            parse_add_content(&change.preview)?;
+            parse_add_content(preview)?;
         }
         PatchOperation::Update => {
-            let original =
-                fs::read_to_string(&change.precondition.target_resolved).map_err(|error| {
-                    change_failure(
-                        &change.preview,
-                        ToolErrorKind::IoError,
-                        format!("update target could not be read: {error}"),
-                    )
-                })?;
-            apply_update_hunks(&change.preview, &original)?;
+            let original = fs::read_to_string(&precondition.target_resolved).map_err(|error| {
+                change_failure(
+                    preview,
+                    ToolErrorKind::IoError,
+                    format!("update target could not be read: {error}"),
+                )
+            })?;
+            apply_update_hunks(preview, &original)?;
         }
         PatchOperation::Delete => {
-            validate_delete_patch_body(&change.preview)?;
+            validate_delete_patch_body(preview)?;
         }
     }
     Ok(())
 }
 
+pub fn capture_change_preconditions(
+    workspace_root: &Path,
+    preview: &ChangePreview,
+) -> Result<Vec<ChangePrecondition>, ToolObservation> {
+    split_change_preview(preview)?
+        .iter()
+        .map(|target_preview| capture_single_change_precondition(workspace_root, target_preview))
+        .collect()
+}
+
+#[cfg(test)]
 pub fn capture_change_precondition(
+    workspace_root: &Path,
+    preview: &ChangePreview,
+) -> Result<ChangePrecondition, ToolObservation> {
+    let mut preconditions = capture_change_preconditions(workspace_root, preview)?;
+    if preconditions.len() != 1 {
+        return Err(change_failure(
+            preview,
+            ToolErrorKind::InvalidArguments,
+            "single-target precondition requested for multi-target patch",
+        ));
+    }
+    Ok(preconditions.remove(0))
+}
+
+fn capture_single_change_precondition(
     workspace_root: &Path,
     preview: &ChangePreview,
 ) -> Result<ChangePrecondition, ToolObservation> {
@@ -122,36 +165,123 @@ pub fn apply_approved_change(workspace_root: &Path, change: ApprovedChange) -> T
     let preview = change.preview;
     if let Err(observation) = validate_approved_change(&ApprovedChange {
         preview: preview.clone(),
-        precondition: change.precondition.clone(),
+        preconditions: change.preconditions.clone(),
     }) {
         return observation;
     }
 
-    let result = match preview.operation {
-        PatchOperation::Add => apply_add(&preview, &change.precondition),
-        PatchOperation::Update => apply_update(&preview, &change.precondition),
-        PatchOperation::Delete => apply_delete(&preview, &change.precondition),
+    let target_previews = match split_change_preview(&preview) {
+        Ok(target_previews) => target_previews,
+        Err(observation) => return observation,
+    };
+    let snapshots = match capture_snapshots(&change.preconditions) {
+        Ok(snapshots) => snapshots,
+        Err(observation) => return observation,
     };
 
-    match result {
-        Ok(lines) => {
-            if let Err(observation) =
-                verify_postcondition(workspace_root, &preview, &change.precondition)
-            {
+    let mut output = Vec::new();
+    for (target_preview, precondition) in target_previews.iter().zip(&change.preconditions) {
+        let result = match target_preview.operation {
+            PatchOperation::Add => apply_add(target_preview, precondition),
+            PatchOperation::Update => apply_update(target_preview, precondition),
+            PatchOperation::Delete => apply_delete(target_preview, precondition),
+        };
+        match result {
+            Ok(lines) => output.extend(lines),
+            Err(observation) => {
+                if let Err(rollback) = restore_snapshots(&snapshots) {
+                    return change_failure_with_preview(
+                        &preview,
+                        ToolErrorKind::IoError,
+                        format!("patch failed and rollback failed: {rollback}"),
+                        observation.preview,
+                    );
+                }
                 return observation;
             }
-            ToolObservation::succeeded(
-                "apply_patch",
-                Some(preview.target_path),
-                Some(change.precondition.display),
-                lines,
-                false,
-                None,
-                "approved patch applied",
-            )
         }
-        Err(observation) => observation,
     }
+
+    for (target_preview, precondition) in target_previews.iter().zip(&change.preconditions) {
+        if let Err(observation) = verify_postcondition(workspace_root, target_preview, precondition)
+        {
+            let _ = restore_snapshots(&snapshots);
+            return observation;
+        }
+    }
+
+    let resolved = change
+        .preconditions
+        .iter()
+        .map(|precondition| precondition.display.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    ToolObservation::succeeded(
+        "apply_patch",
+        Some(preview.target_path),
+        Some(resolved),
+        output,
+        false,
+        None,
+        "approved patch applied",
+    )
+}
+
+#[derive(Clone)]
+struct ChangeSnapshot {
+    path: PathBuf,
+    existed: bool,
+    bytes: Option<Vec<u8>>,
+}
+
+fn capture_snapshots(
+    preconditions: &[ChangePrecondition],
+) -> Result<Vec<ChangeSnapshot>, ToolObservation> {
+    preconditions
+        .iter()
+        .map(|precondition| {
+            let bytes = if precondition.exists {
+                Some(fs::read(&precondition.target_resolved).map_err(|error| {
+                    ToolObservation::failed(
+                        "apply_patch",
+                        Some(precondition.target_raw.clone()),
+                        ToolErrorKind::IoError,
+                        format!("target snapshot could not be read: {error}"),
+                    )
+                })?)
+            } else {
+                None
+            };
+            Ok(ChangeSnapshot {
+                path: precondition.target_resolved.clone(),
+                existed: precondition.exists,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn restore_snapshots(snapshots: &[ChangeSnapshot]) -> io::Result<()> {
+    for snapshot in snapshots.iter().rev() {
+        if snapshot.existed {
+            if let Some(parent) = snapshot.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(
+                &snapshot.path,
+                snapshot.bytes.as_deref().unwrap_or_default(),
+            )?;
+        } else if snapshot.path.exists() {
+            fs::remove_file(&snapshot.path)?;
+        }
+    }
+    Ok(())
+}
+
+fn split_change_preview(preview: &ChangePreview) -> Result<Vec<ChangePreview>, ToolObservation> {
+    preview
+        .split_by_target()
+        .map_err(|message| change_failure(preview, ToolErrorKind::InvalidArguments, message))
 }
 
 fn apply_add(
@@ -773,8 +903,8 @@ mod tests {
     use crate::llm::{ChangePreview, PatchOperation};
 
     use super::{
-        apply_approved_change, capture_change_precondition, validate_approved_change,
-        ApprovedChange,
+        apply_approved_change, capture_change_precondition, capture_change_preconditions,
+        validate_approved_change, ApprovedChange,
     };
 
     fn root(name: &str) -> std::path::PathBuf {
@@ -825,7 +955,7 @@ mod tests {
                 &root,
                 ApprovedChange {
                     preview,
-                    precondition,
+                    preconditions: vec![precondition],
                 },
             );
 
@@ -851,7 +981,7 @@ mod tests {
             &root,
             ApprovedChange {
                 preview,
-                precondition,
+                preconditions: vec![precondition],
             },
         );
 
@@ -875,7 +1005,7 @@ mod tests {
             &root,
             ApprovedChange {
                 preview,
-                precondition,
+                preconditions: vec![precondition],
             },
         );
 
@@ -898,7 +1028,7 @@ mod tests {
 
         let observation = validate_approved_change(&ApprovedChange {
             preview,
-            precondition,
+            preconditions: vec![precondition],
         })
         .expect_err("mismatched update should fail before approval");
 
@@ -921,7 +1051,7 @@ mod tests {
             &root,
             ApprovedChange {
                 preview,
-                precondition,
+                preconditions: vec![precondition],
             },
         );
 
@@ -944,7 +1074,7 @@ mod tests {
             &root,
             ApprovedChange {
                 preview,
-                precondition,
+                preconditions: vec![precondition],
             },
         );
 
@@ -952,6 +1082,96 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("nested/pages/index.html")).unwrap(),
             "<main>Hello</main>\n"
+        );
+    }
+
+    #[test]
+    fn applies_multi_file_add_atomically() {
+        let root = root("multi-add");
+        let body = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: web/index.html\n",
+            "+<link rel=\"stylesheet\" href=\"styles.css\">\n",
+            "+<script src=\"game.js\"></script>\n",
+            "*** Add File: web/styles.css\n",
+            "+body { font-family: sans-serif; }\n",
+            "*** Add File: web/game.js\n",
+            "+console.log('ready');\n",
+            "*** End Patch"
+        );
+        let preview = preview(
+            body,
+            PatchOperation::Add,
+            "3 targets: web/index.html, web/styles.css, web/game.js",
+        );
+        let preconditions =
+            capture_change_preconditions(&root, &preview).expect("multi preconditions");
+
+        let observation = apply_approved_change(
+            &root,
+            ApprovedChange {
+                preview,
+                preconditions,
+            },
+        );
+
+        assert_eq!(observation.status.as_str(), "succeeded");
+        assert_eq!(
+            fs::read_to_string(root.join("web/index.html")).unwrap(),
+            "<link rel=\"stylesheet\" href=\"styles.css\">\n<script src=\"game.js\"></script>\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("web/styles.css")).unwrap(),
+            "body { font-family: sans-serif; }\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("web/game.js")).unwrap(),
+            "console.log('ready');\n"
+        );
+    }
+
+    #[test]
+    fn applies_multi_file_add_with_raw_add_body_lines() {
+        let root = root("multi-add-raw-body");
+        let body = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: web/index.html\n",
+            "<link rel=\"stylesheet\" href=\"styles.css\">\n",
+            "<script src=\"game.js\"></script>\n",
+            "*** Add File: web/styles.css\n",
+            "body { font-family: sans-serif; }\n",
+            "*** Add File: web/game.js\n",
+            "console.log('ready');\n",
+            "*** End Patch"
+        );
+        let preview = preview(
+            body,
+            PatchOperation::Add,
+            "3 targets: web/index.html, web/styles.css, web/game.js",
+        );
+        let preconditions =
+            capture_change_preconditions(&root, &preview).expect("multi preconditions");
+
+        let observation = apply_approved_change(
+            &root,
+            ApprovedChange {
+                preview,
+                preconditions,
+            },
+        );
+
+        assert_eq!(observation.status.as_str(), "succeeded");
+        assert_eq!(
+            fs::read_to_string(root.join("web/index.html")).unwrap(),
+            "<link rel=\"stylesheet\" href=\"styles.css\">\n<script src=\"game.js\"></script>\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("web/styles.css")).unwrap(),
+            "body { font-family: sans-serif; }\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("web/game.js")).unwrap(),
+            "console.log('ready');\n"
         );
     }
 
@@ -1002,7 +1222,7 @@ mod tests {
             &root,
             ApprovedChange {
                 preview,
-                precondition,
+                preconditions: vec![precondition],
             },
         );
 
@@ -1016,15 +1236,8 @@ mod tests {
         fs::write(root.join("old.txt"), "remove me\n").expect("write");
         let body = "*** Begin Patch\n*** Delete File: old.txt\n-remove me\n*** End Patch";
         let preview = preview(body, PatchOperation::Delete, "old.txt");
-        let precondition = capture_change_precondition(&root, &preview).expect("precondition");
-
-        let observation = apply_approved_change(
-            &root,
-            ApprovedChange {
-                preview,
-                precondition,
-            },
-        );
+        let observation =
+            capture_change_precondition(&root, &preview).expect_err("delete body should fail");
 
         assert_eq!(observation.status.as_str(), "failed");
         assert!(root.join("old.txt").exists());

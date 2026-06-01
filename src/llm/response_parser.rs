@@ -18,6 +18,7 @@ const COMMON_FIELDS: &[&str] = &[
 ];
 const ANSWER_FIELDS: &[&str] = &["answer_payload_id"];
 const TOOL_FIELDS: &[&str] = &["tool_name", "arguments", "reason"];
+const PLAN_FIELDS: &[&str] = &["plan_items", "reason"];
 const REASON_FIELD: &[&str] = &["reason"];
 const FORBIDDEN_RAW_ARGUMENT_FIELDS: &[&str] = &[
     "content",
@@ -43,6 +44,10 @@ pub const RESPONSE_ACTIVITY_PAIRS: &[ResponseActivityPair] = &[
             Activity::Execute,
             Activity::Configure,
         ],
+    },
+    ResponseActivityPair {
+        response_type: "plan",
+        activities: &[Activity::None],
     },
     ResponseActivityPair {
         response_type: "clarify",
@@ -154,6 +159,7 @@ fn leading_unframed_json_before_payload(raw: &str) -> Result<&str, RuntimeRespon
 pub enum RuntimeResponse {
     Answer(RuntimeAnswer),
     Tool(RuntimeToolCandidate),
+    Plan(RuntimePlan),
     Clarify(RuntimeClarification),
     Blocked(RuntimeBlocked),
 }
@@ -163,6 +169,7 @@ impl RuntimeResponse {
         match self {
             Self::Answer(_) => "answer",
             Self::Tool(_) => "tool",
+            Self::Plan(_) => "plan",
             Self::Clarify(_) => "clarify",
             Self::Blocked(_) => "blocked",
         }
@@ -172,6 +179,7 @@ impl RuntimeResponse {
         match self {
             Self::Answer(response) => response.activity,
             Self::Tool(response) => response.activity,
+            Self::Plan(response) => response.activity,
             Self::Clarify(response) => response.activity,
             Self::Blocked(response) => response.activity,
         }
@@ -181,6 +189,7 @@ impl RuntimeResponse {
         match self {
             Self::Answer(response) => &response.manifest,
             Self::Tool(response) => &response.manifest,
+            Self::Plan(response) => &response.manifest,
             Self::Clarify(response) => &response.manifest,
             Self::Blocked(response) => &response.manifest,
         }
@@ -203,6 +212,61 @@ pub struct RuntimeToolCandidate {
     pub arguments: Value,
     pub reason: String,
     pub manifest: RuntimeManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimePlan {
+    pub activity: Activity,
+    pub message: String,
+    pub plan_items: Vec<RuntimePlanItem>,
+    pub reason: String,
+    pub manifest: RuntimeManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimePlanItem {
+    pub operation: PlanOperation,
+    pub target: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanOperation {
+    Read,
+    Create,
+    Update,
+    Delete,
+    Execute,
+    Verify,
+    Answer,
+}
+
+impl PlanOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Execute => "execute",
+            Self::Verify => "verify",
+            Self::Answer => "answer",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, RuntimeResponseParseError> {
+        match raw {
+            "read" => Ok(Self::Read),
+            "create" => Ok(Self::Create),
+            "update" => Ok(Self::Update),
+            "delete" => Ok(Self::Delete),
+            "execute" => Ok(Self::Execute),
+            "verify" => Ok(Self::Verify),
+            "answer" => Ok(Self::Answer),
+            value => Err(RuntimeResponseParseError::schema(format!(
+                "unknown plan operation: {value}"
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -611,6 +675,18 @@ fn to_runtime_response(
                 manifest,
             }))
         }
+        "plan" => {
+            validate_allowed_fields(envelope, &[COMMON_FIELDS, PLAN_FIELDS].concat())?;
+            validate_activity_pair(response_type, activity)?;
+            reject_unreferenced_payloads(payloads)?;
+            Ok(RuntimeResponse::Plan(RuntimePlan {
+                activity,
+                message,
+                plan_items: parse_plan_items(envelope)?,
+                reason: optional_str(envelope, "reason")?.unwrap_or("").to_owned(),
+                manifest,
+            }))
+        }
         "clarify" => {
             validate_allowed_fields(envelope, &[COMMON_FIELDS, REASON_FIELD].concat())?;
             validate_activity_pair(response_type, activity)?;
@@ -637,6 +713,51 @@ fn to_runtime_response(
             "unknown response_type: {value}"
         ))),
     }
+}
+
+fn parse_plan_items(
+    envelope: &Map<String, Value>,
+) -> Result<Vec<RuntimePlanItem>, RuntimeResponseParseError> {
+    let items = envelope
+        .get("plan_items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RuntimeResponseParseError::schema("plan_items must be an array"))?;
+    if items.is_empty() {
+        return Err(RuntimeResponseParseError::schema(
+            "plan_items cannot be empty",
+        ));
+    }
+    if items.len() > 40 {
+        return Err(RuntimeResponseParseError::schema(
+            "plan_items cannot exceed 40 entries",
+        ));
+    }
+
+    items
+        .iter()
+        .map(|item| {
+            let item = item.as_object().ok_or_else(|| {
+                RuntimeResponseParseError::schema("plan item must be a JSON object")
+            })?;
+            validate_allowed_fields(item, &["operation", "target"])?;
+            let operation = PlanOperation::parse(required_str(item, "operation")?)?;
+            let target = optional_str(item, "target")?.map(str::to_owned);
+            if matches!(
+                operation,
+                PlanOperation::Read
+                    | PlanOperation::Create
+                    | PlanOperation::Update
+                    | PlanOperation::Delete
+            ) && target.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(RuntimeResponseParseError::schema(format!(
+                    "plan operation {} requires target",
+                    operation.as_str()
+                )));
+            }
+            Ok(RuntimePlanItem { operation, target })
+        })
+        .collect()
 }
 
 fn manifest_from_envelope(
@@ -723,7 +844,7 @@ fn validate_payload_reference(
                 .ok_or_else(|| RuntimeResponseParseError::payload("payload_id must be a string"))?;
             validate_single_payload_reference(payload_id, payloads, None)
         }
-        RuntimeResponse::Clarify(_) | RuntimeResponse::Blocked(_) => {
+        RuntimeResponse::Plan(_) | RuntimeResponse::Clarify(_) | RuntimeResponse::Blocked(_) => {
             reject_unreferenced_payloads(payloads)
         }
     }
@@ -848,7 +969,7 @@ fn required_object_value<'a>(
 mod tests {
     use super::{
         parse_runtime_response, parse_runtime_response_envelope_diagnostic, Activity,
-        RuntimeResponse, RuntimeResponseParseErrorKind,
+        PlanOperation, RuntimeResponse, RuntimeResponseParseErrorKind,
     };
 
     fn manifest_fields() -> &'static str {
@@ -888,6 +1009,42 @@ mod tests {
         assert_eq!(clarify.activity, Activity::Ask);
         assert_eq!(clarify.message, "Which file should I inspect?");
         assert_eq!(clarify.reason, "target is ambiguous");
+    }
+
+    #[test]
+    fn parses_plan_response_with_target_ledger_items() {
+        let raw = format!(
+            r#"{{"response_type":"plan","activity":"None","message":"계획을 세웠습니다.","plan_items":[{{"operation":"create","target":"web/index.html"}},{{"operation":"create","target":"web/app.js"}},{{"operation":"verify"}}],"reason":"multi-target request",{}}}"#,
+            manifest_fields()
+        );
+
+        let parsed = parse_runtime_response(&raw).expect("plan should parse");
+
+        let RuntimeResponse::Plan(plan) = parsed.response else {
+            panic!("expected plan");
+        };
+        assert_eq!(plan.activity, Activity::None);
+        assert_eq!(plan.plan_items.len(), 3);
+        assert_eq!(plan.plan_items[0].operation, PlanOperation::Create);
+        assert_eq!(plan.plan_items[0].target.as_deref(), Some("web/index.html"));
+        assert_eq!(plan.plan_items[2].operation, PlanOperation::Verify);
+        assert_eq!(plan.plan_items[2].target, None);
+    }
+
+    #[test]
+    fn rejects_plan_response_with_tool_arguments() {
+        let raw = format!(
+            r#"{{"response_type":"plan","activity":"None","message":"plan","plan_items":[{{"operation":"create","target":"web/index.html"}}],"tool_name":"apply_patch","arguments":{{"payload_id":"patch_001"}},{}}}"#,
+            manifest_fields()
+        );
+
+        let error = parse_runtime_response(&raw).expect_err("plan must not carry tool fields");
+
+        assert_eq!(
+            error.kind,
+            RuntimeResponseParseErrorKind::SchemaValidationFailed
+        );
+        assert!(error.message.contains("unknown field"));
     }
 
     #[test]

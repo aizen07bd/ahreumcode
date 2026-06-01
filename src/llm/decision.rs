@@ -1,8 +1,9 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use super::response_parser::{
-    unwrap_whole_markdown_fence, Activity, ParsedRuntimeResponse, RuntimeAnswer, RuntimeResponse,
-    RuntimeToolCandidate,
+    unwrap_whole_markdown_fence, Activity, ParsedRuntimeResponse, PlanOperation, RuntimeAnswer,
+    RuntimePlan, RuntimePlanItem, RuntimeResponse, RuntimeToolCandidate,
 };
 use crate::tool::{normalize_tool_arguments, tool_spec, ToolName};
 use serde_json::{Map, Value};
@@ -19,6 +20,11 @@ pub enum RuntimeDecision {
     },
     Blocked {
         message: String,
+        reason: String,
+    },
+    PlanCandidate {
+        message: String,
+        items: Vec<RuntimePlanItem>,
         reason: String,
     },
     ToolCandidatePending {
@@ -48,15 +54,63 @@ pub struct ChangePreview {
 
 impl ChangePreview {
     pub fn details(&self) -> String {
-        format!(
+        let mut details = format!(
             "patch target: {}\noperation: {}\nadditions: {}\ndeletions: {}\npayload_id: {}",
             self.target_path,
             self.operation.as_str(),
             self.additions,
             self.deletions,
             self.payload_id
-        )
+        );
+        if let Ok(targets) = self.target_summaries() {
+            if targets.len() > 1 {
+                details.push_str("\ntargets:");
+                for target in targets {
+                    details.push_str(&format!(
+                        "\n- {} {} (+{} -{})",
+                        target.operation.as_str(),
+                        target.target_path,
+                        target.additions,
+                        target.deletions
+                    ));
+                }
+            }
+        }
+        details
     }
+
+    pub fn target_summaries(&self) -> Result<Vec<ChangeTargetPreview>, String> {
+        parse_apply_patch_target_sections(&self.payload_body).map(|sections| {
+            sections
+                .into_iter()
+                .map(|section| section.preview)
+                .collect()
+        })
+    }
+
+    pub fn split_by_target(&self) -> Result<Vec<ChangePreview>, String> {
+        parse_apply_patch_target_sections(&self.payload_body).map(|sections| {
+            sections
+                .into_iter()
+                .map(|section| ChangePreview {
+                    payload_id: self.payload_id.clone(),
+                    target_path: section.preview.target_path,
+                    operation: section.preview.operation,
+                    additions: section.preview.additions,
+                    deletions: section.preview.deletions,
+                    payload_body: section.payload_body,
+                })
+                .collect()
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangeTargetPreview {
+    pub target_path: String,
+    pub operation: PatchOperation,
+    pub additions: u16,
+    pub deletions: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +136,7 @@ impl RuntimeDecision {
             Self::Answer { .. } => "answer",
             Self::Clarify { .. } => "clarify",
             Self::Blocked { .. } => "blocked",
+            Self::PlanCandidate { .. } => "plan_candidate",
             Self::ToolCandidatePending { .. } => "tool_candidate_pending",
             Self::ApprovalNeeded { .. } => "approval_needed",
         }
@@ -92,6 +147,7 @@ impl RuntimeDecision {
             Self::ToolCandidatePending { activity, .. } | Self::ApprovalNeeded { activity, .. } => {
                 Some(*activity)
             }
+            Self::PlanCandidate { .. } => Some(Activity::None),
             _ => None,
         }
     }
@@ -158,8 +214,37 @@ impl DecisionGate {
                 message: response.message.clone(),
                 reason: response.reason.clone(),
             }),
+            RuntimeResponse::Plan(response) => classify_plan(response),
             RuntimeResponse::Tool(candidate) => classify_tool_candidate(candidate, parsed),
         }
+    }
+}
+
+fn classify_plan(response: &RuntimePlan) -> Result<RuntimeDecision, RuntimeDecisionError> {
+    if !response.plan_items.iter().any(is_executable_plan_item) {
+        return Err(RuntimeDecisionError::invalid_arguments(
+            "plan requires at least one executable workspace item; advisory, summary, explanation, or team-perspective responses must use answer",
+        ));
+    }
+
+    Ok(RuntimeDecision::PlanCandidate {
+        message: response.message.clone(),
+        items: response.plan_items.clone(),
+        reason: response.reason.clone(),
+    })
+}
+
+fn is_executable_plan_item(item: &RuntimePlanItem) -> bool {
+    match item.operation {
+        PlanOperation::Read
+        | PlanOperation::Create
+        | PlanOperation::Update
+        | PlanOperation::Delete => item
+            .target
+            .as_deref()
+            .is_some_and(|target| !target.is_empty()),
+        PlanOperation::Execute => true,
+        PlanOperation::Verify | PlanOperation::Answer => false,
     }
 }
 
@@ -243,12 +328,6 @@ fn classify_change_candidate(
         }
 
         let patch_body = normalize_apply_patch_payload_body(&payload.body);
-        let target_count = count_apply_patch_targets(patch_body.as_ref());
-        if target_count != 1 {
-            return Err(RuntimeDecisionError::invalid_arguments(format!(
-                "apply_patch target count must be exactly one, got {target_count}"
-            )));
-        }
         change_preview = Some(parse_apply_patch_preview(payload_id, patch_body.as_ref())?);
     }
 
@@ -336,14 +415,14 @@ fn normalize_apply_patch_payload_body(body: &str) -> Cow<'_, str> {
         } else {
             trimmed[target_start..].trim()
         };
-        if count_apply_patch_targets(patch_body) == 1 {
+        if count_apply_patch_targets(patch_body) > 0 {
             return Cow::Owned(format!("*** Begin Patch\n{patch_body}\n*** End Patch"));
         }
         return Cow::Borrowed(trimmed);
     };
     let Some(end_start) = trimmed[start..].rfind("*** End Patch") else {
         let patch_body = trimmed[start..].trim();
-        if count_apply_patch_targets(patch_body) == 1 {
+        if count_apply_patch_targets(patch_body) > 0 {
             return Cow::Owned(format!("{patch_body}\n*** End Patch"));
         }
         return Cow::Borrowed(trimmed);
@@ -363,77 +442,165 @@ fn parse_apply_patch_preview(
     payload_id: &str,
     body: &str,
 ) -> Result<ChangePreview, RuntimeDecisionError> {
-    let lines = body.lines().collect::<Vec<_>>();
-    if lines.first() != Some(&"*** Begin Patch") || lines.last() != Some(&"*** End Patch") {
-        return Err(RuntimeDecisionError::invalid_arguments(
-            "apply_patch payload must begin with *** Begin Patch and end with *** End Patch",
-        ));
-    }
-
-    let mut target = None;
-    for (index, line) in lines.iter().enumerate() {
-        let candidate = line
-            .strip_prefix("*** Add File: ")
-            .map(|path| (PatchOperation::Add, path))
-            .or_else(|| {
-                line.strip_prefix("*** Update File: ")
-                    .map(|path| (PatchOperation::Update, path))
-            })
-            .or_else(|| {
-                line.strip_prefix("*** Delete File: ")
-                    .map(|path| (PatchOperation::Delete, path))
-            });
-        if let Some((operation, path)) = candidate {
-            target = Some((operation, path.to_owned(), index));
-            break;
-        }
-    }
-
-    let Some((operation, target_path, target_index)) = target else {
-        return Err(RuntimeDecisionError::invalid_arguments(
-            "apply_patch payload target was not found",
-        ));
+    let sections =
+        parse_apply_patch_target_sections(body).map_err(RuntimeDecisionError::invalid_arguments)?;
+    let first = sections
+        .first()
+        .expect("parse_apply_patch_target_sections returns at least one target");
+    let target_path = if sections.len() == 1 {
+        first.preview.target_path.clone()
+    } else {
+        let paths = sections
+            .iter()
+            .map(|section| section.preview.target_path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{} targets: {paths}", sections.len())
     };
-    if !validate_non_empty_plain_string(&target_path) {
-        return Err(RuntimeDecisionError::invalid_arguments(format!(
-            "apply_patch target must be a non-empty path string: {target_path}"
-        )));
-    }
-
-    let additions = count_patch_lines(&lines, '+')?;
-    let deletions = count_patch_lines(&lines, '-')?;
-    if operation == PatchOperation::Update && additions == 0 && deletions == 0 {
-        return Err(RuntimeDecisionError::invalid_arguments(
-            "Update File patch must include at least one added or removed line",
-        ));
-    }
-    validate_apply_patch_operation_body(operation, &lines, target_index)?;
+    let additions = sum_patch_counts(sections.iter().map(|section| section.preview.additions))?;
+    let deletions = sum_patch_counts(sections.iter().map(|section| section.preview.deletions))?;
 
     Ok(ChangePreview {
         payload_id: payload_id.to_owned(),
         target_path,
-        operation,
+        operation: first.preview.operation,
         additions,
         deletions,
         payload_body: body.to_owned(),
     })
 }
 
-fn validate_apply_patch_operation_body(
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PatchTargetSection {
+    preview: ChangeTargetPreview,
+    payload_body: String,
+}
+
+fn parse_apply_patch_target_sections(body: &str) -> Result<Vec<PatchTargetSection>, String> {
+    let lines = body.lines().collect::<Vec<_>>();
+    if lines.first() != Some(&"*** Begin Patch") || lines.last() != Some(&"*** End Patch") {
+        return Err(
+            "apply_patch payload must begin with *** Begin Patch and end with *** End Patch"
+                .to_owned(),
+        );
+    }
+
+    let mut starts = Vec::new();
+    for (index, line) in lines
+        .iter()
+        .enumerate()
+        .take(lines.len().saturating_sub(1))
+        .skip(1)
+    {
+        if parse_target_header(line).is_some() {
+            starts.push(index);
+        }
+    }
+    if starts.is_empty() {
+        return Err("apply_patch payload target was not found".to_owned());
+    }
+
+    let mut seen = HashSet::new();
+    let mut sections = Vec::new();
+    for (position, target_index) in starts.iter().copied().enumerate() {
+        let next_index = starts.get(position + 1).copied().unwrap_or(lines.len() - 1);
+        let (operation, target_path) = parse_target_header(lines[target_index])
+            .expect("target index came from parse_target_header");
+        if !validate_non_empty_plain_string(target_path) {
+            return Err(format!(
+                "apply_patch target must be a non-empty path string: {target_path}"
+            ));
+        }
+        if !seen.insert(target_path.to_owned()) {
+            return Err(format!(
+                "apply_patch target path is duplicated: {target_path}"
+            ));
+        }
+
+        let body_lines = &lines[target_index + 1..next_index];
+        let normalized_body_lines = normalize_target_body_lines(operation, body_lines)?;
+        let normalized_body_refs = normalized_body_lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let count_lines = normalized_body_refs.as_slice();
+        let additions = count_patch_lines(count_lines, '+').map_err(|error| error.message)?;
+        let deletions = count_patch_lines(count_lines, '-').map_err(|error| error.message)?;
+        if operation == PatchOperation::Update && additions == 0 && deletions == 0 {
+            return Err(
+                "Update File patch must include at least one added or removed line".to_owned(),
+            );
+        }
+        if operation == PatchOperation::Delete && !body_lines.is_empty() {
+            return Err("Delete File patch must not include patch body lines".to_owned());
+        }
+
+        let mut payload_lines = vec!["*** Begin Patch".to_owned(), lines[target_index].to_owned()];
+        payload_lines.extend(normalized_body_lines);
+        payload_lines.push("*** End Patch".to_owned());
+        sections.push(PatchTargetSection {
+            preview: ChangeTargetPreview {
+                target_path: target_path.to_owned(),
+                operation,
+                additions,
+                deletions,
+            },
+            payload_body: payload_lines.join("\n"),
+        });
+    }
+
+    Ok(sections)
+}
+
+fn parse_target_header(line: &str) -> Option<(PatchOperation, &str)> {
+    line.strip_prefix("*** Add File: ")
+        .map(|path| (PatchOperation::Add, path))
+        .or_else(|| {
+            line.strip_prefix("*** Update File: ")
+                .map(|path| (PatchOperation::Update, path))
+        })
+        .or_else(|| {
+            line.strip_prefix("*** Delete File: ")
+                .map(|path| (PatchOperation::Delete, path))
+        })
+}
+
+fn normalize_target_body_lines(
     operation: PatchOperation,
-    lines: &[&str],
-    target_index: usize,
-) -> Result<(), RuntimeDecisionError> {
-    if operation != PatchOperation::Delete {
-        return Ok(());
+    body_lines: &[&str],
+) -> Result<Vec<String>, String> {
+    match operation {
+        PatchOperation::Add => body_lines
+            .iter()
+            .map(|line| {
+                if parse_target_header(line).is_some()
+                    || *line == "*** Begin Patch"
+                    || *line == "*** End Patch"
+                {
+                    return Err(format!(
+                        "Add File patch body contains a patch control line: {line}"
+                    ));
+                }
+                Ok(line
+                    .strip_prefix('+')
+                    .map(|content| format!("+{content}"))
+                    .unwrap_or_else(|| format!("+{line}")))
+            })
+            .collect(),
+        PatchOperation::Update | PatchOperation::Delete => {
+            Ok(body_lines.iter().map(|line| (*line).to_owned()).collect())
+        }
     }
-    let body_lines = &lines[target_index + 1..lines.len() - 1];
-    if body_lines.is_empty() {
-        return Ok(());
-    }
-    Err(RuntimeDecisionError::invalid_arguments(
-        "Delete File patch must not include patch body lines",
-    ))
+}
+
+fn sum_patch_counts(mut counts: impl Iterator<Item = u16>) -> Result<u16, RuntimeDecisionError> {
+    counts
+        .try_fold(0u32, |sum, count| Ok(sum + u32::from(count)))
+        .and_then(|sum| {
+            u16::try_from(sum).map_err(|_| {
+                RuntimeDecisionError::invalid_arguments("apply_patch line count too large")
+            })
+        })
 }
 
 fn count_patch_lines(lines: &[&str], marker: char) -> Result<u16, RuntimeDecisionError> {
@@ -448,8 +615,8 @@ mod tests {
 
     use super::{DecisionGate, PatchOperation, RuntimeDecision, RuntimeDecisionErrorKind};
     use crate::llm::response_parser::{
-        Activity, ParsedRuntimeResponse, RuntimeAnswer, RuntimeManifest, RuntimePayload,
-        RuntimeResponse, RuntimeToolCandidate,
+        Activity, ParsedRuntimeResponse, PlanOperation, RuntimeAnswer, RuntimeManifest,
+        RuntimePayload, RuntimePlan, RuntimePlanItem, RuntimeResponse, RuntimeToolCandidate,
     };
 
     fn manifest() -> RuntimeManifest {
@@ -505,6 +672,99 @@ mod tests {
             RuntimeDecision::Answer {
                 summary: "summary".to_owned(),
                 payload_body: Some("```typescript\nconsole.log(\"Hello\");\n```".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_plan_candidate_as_runtime_ledger() {
+        let items = vec![
+            RuntimePlanItem {
+                operation: PlanOperation::Create,
+                target: Some("web/index.html".to_owned()),
+            },
+            RuntimePlanItem {
+                operation: PlanOperation::Create,
+                target: Some("web/app.js".to_owned()),
+            },
+        ];
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Plan(RuntimePlan {
+                activity: Activity::None,
+                message: "planned targets".to_owned(),
+                plan_items: items.clone(),
+                reason: "multi-target request".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("plan should classify");
+
+        assert_eq!(
+            decision,
+            RuntimeDecision::PlanCandidate {
+                message: "planned targets".to_owned(),
+                items,
+                reason: "multi-target request".to_owned(),
+            }
+        );
+        assert_eq!(decision.kind(), "plan_candidate");
+    }
+
+    #[test]
+    fn rejects_non_executable_plan_candidate() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Plan(RuntimePlan {
+                activity: Activity::None,
+                message: "advisory plan".to_owned(),
+                plan_items: vec![
+                    RuntimePlanItem {
+                        operation: PlanOperation::Answer,
+                        target: None,
+                    },
+                    RuntimePlanItem {
+                        operation: PlanOperation::Verify,
+                        target: None,
+                    },
+                ],
+                reason: "advisory request".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let error = DecisionGate::classify(&parsed).expect_err("advisory plan should fail");
+
+        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
+        assert!(error.message.contains("advisory"));
+    }
+
+    #[test]
+    fn classifies_execute_plan_candidate_as_runtime_ledger() {
+        let items = vec![RuntimePlanItem {
+            operation: PlanOperation::Execute,
+            target: None,
+        }];
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Plan(RuntimePlan {
+                activity: Activity::None,
+                message: "planned command".to_owned(),
+                plan_items: items.clone(),
+                reason: "ordered execution".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: Vec::new(),
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("execute plan should classify");
+
+        assert_eq!(
+            decision,
+            RuntimeDecision::PlanCandidate {
+                message: "planned command".to_owned(),
+                items,
+                reason: "ordered execution".to_owned(),
             }
         );
     }
@@ -892,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multi_target_apply_patch_as_repairable_arguments() {
+    fn accepts_multi_target_apply_patch_as_one_change_candidate() {
         let parsed = ParsedRuntimeResponse {
             response: RuntimeResponse::Tool(RuntimeToolCandidate {
                 activity: Activity::Change,
@@ -921,10 +1181,123 @@ mod tests {
             }],
         };
 
-        let error = DecisionGate::classify(&parsed).expect_err("multi target patch should fail");
+        let decision = DecisionGate::classify(&parsed).expect("multi target patch should classify");
 
-        assert_eq!(error.kind, RuntimeDecisionErrorKind::InvalidArguments);
-        assert!(error.message.contains("target count must be exactly one"));
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce preview");
+        };
+        assert_eq!(preview.target_path, "2 targets: src/main.rs, src/lib.rs");
+        assert_eq!(preview.additions, 2);
+        assert_eq!(preview.deletions, 2);
+        assert_eq!(
+            preview.target_summaries().expect("target summaries").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn wraps_multi_target_apply_patch_payload_body_without_outer_markers() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body: concat!(
+                    "*** Add File: web/index.html\n",
+                    "+<script src=\"game.js\"></script>\n",
+                    "*** Add File: web/game.js\n",
+                    "+console.log('ready');"
+                )
+                .to_owned(),
+            }],
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("multi target patch should classify");
+
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce preview");
+        };
+        assert_eq!(
+            preview.target_path,
+            "2 targets: web/index.html, web/game.js"
+        );
+        assert_eq!(preview.additions, 2);
+        assert!(preview.payload_body.starts_with("*** Begin Patch"));
+        assert!(preview.payload_body.ends_with("*** End Patch"));
+    }
+
+    #[test]
+    fn normalizes_add_file_body_lines_without_plus_prefix() {
+        let parsed = ParsedRuntimeResponse {
+            response: RuntimeResponse::Tool(RuntimeToolCandidate {
+                activity: Activity::Change,
+                message: "patch ready".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({"payload_id":"patch_001"}),
+                reason: "change requested".to_owned(),
+                manifest: manifest(),
+            }),
+            payloads: vec![RuntimePayload {
+                id: "patch_001".to_owned(),
+                format: "apply_patch".to_owned(),
+                body: concat!(
+                    "*** Begin Patch\n",
+                    "*** Add File: web/index.html\n",
+                    "<!doctype html>\n",
+                    "<script src=\"game.js\"></script>\n",
+                    "*** Add File: web/game.js\n",
+                    "console.log('ready');\n",
+                    "*** End Patch"
+                )
+                .to_owned(),
+            }],
+        };
+
+        let decision = DecisionGate::classify(&parsed).expect("add body should normalize");
+
+        let RuntimeDecision::ApprovalNeeded {
+            change_preview: Some(preview),
+            ..
+        } = decision
+        else {
+            panic!("change should produce preview");
+        };
+        assert_eq!(preview.additions, 3);
+        let target_previews = preview.split_by_target().expect("split targets");
+        assert_eq!(
+            target_previews[0].payload_body,
+            concat!(
+                "*** Begin Patch\n",
+                "*** Add File: web/index.html\n",
+                "+<!doctype html>\n",
+                "+<script src=\"game.js\"></script>\n",
+                "*** End Patch"
+            )
+        );
+        assert_eq!(
+            target_previews[1].payload_body,
+            concat!(
+                "*** Begin Patch\n",
+                "*** Add File: web/game.js\n",
+                "+console.log('ready');\n",
+                "*** End Patch"
+            )
+        );
     }
 
     #[test]

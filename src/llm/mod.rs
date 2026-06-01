@@ -8,7 +8,8 @@ mod response_parser;
 mod schema_prompt;
 
 pub use decision::{
-    ChangePreview, DecisionGate, PatchOperation, RuntimeDecision, RuntimeDecisionError,
+    ChangePreview, ChangeTargetPreview, DecisionGate, PatchOperation, RuntimeDecision,
+    RuntimeDecisionError,
 };
 pub use diagnostics::{
     LlmDiagnostics, LlmDiagnosticsRuntime, LlmDiagnosticsSnapshot, LlmDiagnosticsState,
@@ -20,8 +21,8 @@ pub use provider::{
 };
 pub use repair::{RepairLimitReached, RepairLoop, RepairRequest};
 pub use response_parser::{
-    parse_runtime_response, Activity, ParsedRuntimeResponse, RuntimeResponseParseError,
-    RuntimeResponseParseErrorKind,
+    parse_runtime_response, Activity, ParsedRuntimeResponse, PlanOperation, RuntimePlanItem,
+    RuntimeResponseParseError, RuntimeResponseParseErrorKind,
 };
 pub use schema_prompt::{attach_schema_prompt, SchemaPrompt, SchemaPromptBuilder};
 pub(crate) use schema_prompt::{

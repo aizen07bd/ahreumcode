@@ -145,6 +145,7 @@ pub enum PersonaTurnOutcomeError {
     PeerMessageOnPass,
     EmptyPeerMessageBody,
     PeerMessageBodyTooLong,
+    ContentBoundaryViolation,
     RequiredSpeakerPassed,
 }
 
@@ -181,6 +182,25 @@ impl PersonaSession {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PersonaTurnKey {
+    task_id: String,
+    speaker: PersonaSpeaker,
+    stage: PersonaRuntimeStage,
+    kind: PersonaTurnKind,
+}
+
+impl PersonaTurnKey {
+    fn from_turn(turn: &PersonaTurn) -> Self {
+        Self {
+            task_id: turn.task_id.clone(),
+            speaker: turn.speaker,
+            stage: turn.stage,
+            kind: turn.kind,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct PersonaRuntime {
     current_task: Option<PersonaTaskRun>,
@@ -188,6 +208,8 @@ pub struct PersonaRuntime {
     pending_turns: VecDeque<PersonaTurn>,
     peer_messages: Vec<PersonaPeerMessage>,
     team_tasks: Vec<PersonaTeamTask>,
+    completed_turns: Vec<PersonaTurnKey>,
+    last_progress_summary: Option<String>,
     next_task_index: u64,
     next_turn_index: u64,
     next_message_index: u64,
@@ -236,6 +258,7 @@ impl PersonaRuntime {
         Some(self.start_kickoff(user_prompt))
     }
 
+    #[cfg(test)]
     pub fn enqueue_completion_for_mode(
         &mut self,
         mode: PersonaRuntimeMode,
@@ -294,6 +317,32 @@ impl PersonaRuntime {
         }
 
         task.task_state_summary = summary;
+        self.task_completed = true;
+        self.remove_pending_lifecycle_turns();
+        true
+    }
+
+    pub fn update_task_state_summary(&mut self, task_state_summary: impl Into<String>) -> bool {
+        let Some(task) = self.current_task.as_mut() else {
+            return false;
+        };
+        task.task_state_summary = task_state_summary.into();
+        self.refresh_pending_stage_summaries(PersonaRuntimeStage::Kickoff);
+        self.refresh_pending_stage_summaries(PersonaRuntimeStage::Progress);
+        self.refresh_pending_stage_summaries(PersonaRuntimeStage::FollowUp);
+        true
+    }
+
+    pub fn complete_without_visible_turn(&mut self, task_state_summary: impl Into<String>) -> bool {
+        let Some(task) = self.current_task.as_mut() else {
+            return false;
+        };
+        task.task_state_summary = task_state_summary.into();
+        self.task_completed = true;
+        self.pending_turns.clear();
+        for session in &mut self.sessions {
+            session.status = PersonaSessionStatus::Idle;
+        }
         true
     }
 
@@ -310,13 +359,22 @@ impl PersonaRuntime {
         if let Some(task) = self.current_task.as_mut() {
             task.task_state_summary = summary;
         }
+        self.refresh_pending_stage_summaries(PersonaRuntimeStage::Progress);
 
-        if let Some(existing) = self.pending_turns.iter_mut().find(|turn| {
-            turn.speaker == PersonaSpeaker::Lead && turn.kind == PersonaTurnKind::ProgressLead
-        }) {
-            if let Some(task) = self.current_task.as_ref() {
-                existing.task_state_summary = task.task_state_summary.clone();
-            }
+        if self.last_progress_summary.as_deref()
+            == self
+                .current_task
+                .as_ref()
+                .map(|task| task.task_state_summary.as_str())
+        {
+            return None;
+        }
+
+        if let Some(existing) = self
+            .pending_turns
+            .iter()
+            .find(|turn| turn.stage == PersonaRuntimeStage::Progress)
+        {
             return Some(existing.clone());
         }
 
@@ -325,6 +383,10 @@ impl PersonaRuntime {
             PersonaRuntimeStage::Progress,
             PersonaTurnKind::ProgressLead,
         );
+        if self.turn_was_completed(&turn) {
+            return None;
+        }
+        self.last_progress_summary = Some(turn.task_state_summary.clone());
         self.mark_session_waiting(PersonaSpeaker::Lead);
         self.pending_turns.push_back(turn.clone());
         Some(turn)
@@ -335,6 +397,19 @@ impl PersonaRuntime {
             turn.stage == PersonaRuntimeStage::Completion
                 && turn.kind == PersonaTurnKind::Completion
         });
+    }
+
+    fn refresh_pending_stage_summaries(&mut self, stage: PersonaRuntimeStage) {
+        let Some(task) = self.current_task.as_ref() else {
+            return;
+        };
+        for turn in self
+            .pending_turns
+            .iter_mut()
+            .filter(|turn| turn.stage == stage && turn.task_id == task.task_id)
+        {
+            turn.task_state_summary = task.task_state_summary.clone();
+        }
     }
 
     pub fn start_follow_up_for_mode(
@@ -360,6 +435,9 @@ impl PersonaRuntime {
         }
         self.pending_turns.clear();
         self.peer_messages.clear();
+        self.team_tasks.clear();
+        self.completed_turns.clear();
+        self.last_progress_summary = None;
         self.follow_up_summary_scheduled = false;
         self.task_completed = false;
         for session in &mut self.sessions {
@@ -380,6 +458,16 @@ impl PersonaRuntime {
         self.pending_turns.pop_front()
     }
 
+    #[cfg(test)]
+    pub fn abandon_turn(&mut self, turn: &PersonaTurn) {
+        if self.current_task.as_ref().map(|task| task.task_id.as_str())
+            != Some(turn.task_id.as_str())
+        {
+            return;
+        }
+        self.mark_session_idle(turn.speaker);
+    }
+
     pub fn record_turn_result(&mut self, turn: &PersonaTurn, result: impl Into<PersonaTurnResult>) {
         let result = result.into();
         let peer_messages = result.peer_messages.clone();
@@ -392,11 +480,13 @@ impl PersonaRuntime {
             && matches!(result.outcome, PersonaTurnOutcome::Passed { .. })
         {
             self.mark_session_idle(speaker);
+            self.mark_turn_completed(turn);
             return;
         }
 
         if self.task_completed && turn.stage != PersonaRuntimeStage::Completion {
             self.mark_session_idle(speaker);
+            self.mark_turn_completed(turn);
             return;
         }
 
@@ -421,6 +511,7 @@ impl PersonaRuntime {
             PersonaTurnOutcome::Spoken(message) => self.record_session_message(message),
             PersonaTurnOutcome::Passed { speaker } => self.mark_session_idle(speaker),
         }
+        self.mark_turn_completed(turn);
         for peer_message in &peer_messages {
             self.register_peer_message(speaker, peer_message.clone());
         }
@@ -551,6 +642,10 @@ impl PersonaRuntime {
         !self.pending_turns.is_empty()
     }
 
+    pub fn has_pending_stage(&self, stage: PersonaRuntimeStage) -> bool {
+        self.pending_turns.iter().any(|turn| turn.stage == stage)
+    }
+
     pub fn build_turn_prompt(
         &self,
         turn: &PersonaTurn,
@@ -574,6 +669,8 @@ impl PersonaRuntime {
         self.pending_turns.clear();
         self.peer_messages.clear();
         self.team_tasks.clear();
+        self.completed_turns.clear();
+        self.last_progress_summary = None;
         self.follow_up_summary_scheduled = false;
         self.task_completed = false;
         for session in &mut self.sessions {
@@ -587,6 +684,8 @@ impl PersonaRuntime {
         self.pending_turns.clear();
         self.peer_messages.clear();
         self.team_tasks.clear();
+        self.completed_turns.clear();
+        self.last_progress_summary = None;
         self.follow_up_summary_scheduled = false;
         self.task_completed = false;
         for session in &mut self.sessions {
@@ -641,6 +740,29 @@ impl PersonaRuntime {
         }
     }
 
+    fn mark_turn_completed(&mut self, turn: &PersonaTurn) {
+        let key = PersonaTurnKey::from_turn(turn);
+        if !self.completed_turns.contains(&key) {
+            self.completed_turns.push(key);
+        }
+    }
+
+    fn turn_was_completed(&self, turn: &PersonaTurn) -> bool {
+        self.completed_turns
+            .contains(&PersonaTurnKey::from_turn(turn))
+    }
+
+    fn completed_member_turn(&self, speaker: PersonaSpeaker, stage: PersonaRuntimeStage) -> bool {
+        self.current_task.as_ref().is_some_and(|task| {
+            self.completed_turns.iter().any(|completed| {
+                completed.task_id == task.task_id
+                    && completed.speaker == speaker
+                    && completed.stage == stage
+                    && completed.kind == PersonaTurnKind::MemberResponse
+            })
+        })
+    }
+
     fn schedule_next_kickoff_turn(
         &mut self,
         turn: &PersonaTurn,
@@ -657,6 +779,7 @@ impl PersonaRuntime {
                 }
             }
             PersonaTurnKind::MemberResponse => {
+                self.schedule_kickoff_members(peer_messages);
                 if !self.pending_turns.iter().any(|pending| {
                     pending.stage == PersonaRuntimeStage::Kickoff
                         && pending.kind == PersonaTurnKind::MemberResponse
@@ -679,11 +802,18 @@ impl PersonaRuntime {
                 break;
             }
         }
-        if scheduled.is_empty() {
-            scheduled.extend(fixed_member_speakers());
-        }
 
         for speaker in scheduled {
+            if self.completed_member_turn(speaker, PersonaRuntimeStage::Kickoff) {
+                continue;
+            }
+            if self.pending_turns.iter().any(|turn| {
+                turn.stage == PersonaRuntimeStage::Kickoff
+                    && turn.kind == PersonaTurnKind::MemberResponse
+                    && turn.speaker == speaker
+            }) {
+                continue;
+            }
             self.claim_open_team_tasks(speaker);
             let turn = self.build_turn(
                 speaker,
@@ -723,6 +853,9 @@ impl PersonaRuntime {
             PersonaRuntimeStage::Kickoff,
             PersonaTurnKind::LeadSummary,
         );
+        if self.turn_was_completed(&turn) {
+            return;
+        }
         self.mark_session_waiting(PersonaSpeaker::Lead);
         self.push_kickoff_turn_before_completion(turn);
     }
@@ -743,6 +876,7 @@ impl PersonaRuntime {
                 }
             }
             PersonaTurnKind::MemberResponse => {
+                self.schedule_progress_members(peer_messages);
                 if !self.pending_turns.iter().any(|pending| {
                     pending.stage == PersonaRuntimeStage::Progress
                         && pending.kind == PersonaTurnKind::MemberResponse
@@ -767,6 +901,16 @@ impl PersonaRuntime {
         }
 
         for speaker in scheduled {
+            if self.completed_member_turn(speaker, PersonaRuntimeStage::Progress) {
+                continue;
+            }
+            if self.pending_turns.iter().any(|turn| {
+                turn.stage == PersonaRuntimeStage::Progress
+                    && turn.kind == PersonaTurnKind::MemberResponse
+                    && turn.speaker == speaker
+            }) {
+                continue;
+            }
             self.claim_open_team_tasks(speaker);
             let turn = self.build_turn(
                 speaker,
@@ -793,6 +937,9 @@ impl PersonaRuntime {
             PersonaRuntimeStage::Progress,
             PersonaTurnKind::LeadSummary,
         );
+        if self.turn_was_completed(&turn) {
+            return;
+        }
         self.mark_session_waiting(PersonaSpeaker::Lead);
         self.pending_turns.push_back(turn);
     }
@@ -810,6 +957,7 @@ impl PersonaRuntime {
                 }
             }
             PersonaTurnKind::MemberResponse => {
+                self.schedule_follow_up_members(peer_messages);
                 if !self.pending_turns.iter().any(|pending| {
                     pending.stage == PersonaRuntimeStage::FollowUp
                         && pending.kind == PersonaTurnKind::MemberResponse
@@ -834,6 +982,16 @@ impl PersonaRuntime {
         }
 
         for speaker in scheduled {
+            if self.completed_member_turn(speaker, PersonaRuntimeStage::FollowUp) {
+                continue;
+            }
+            if self.pending_turns.iter().any(|turn| {
+                turn.stage == PersonaRuntimeStage::FollowUp
+                    && turn.kind == PersonaTurnKind::MemberResponse
+                    && turn.speaker == speaker
+            }) {
+                continue;
+            }
             self.claim_open_team_tasks(speaker);
             let turn = self.build_turn(
                 speaker,
@@ -879,15 +1037,6 @@ impl PersonaRuntime {
     }
 }
 
-fn fixed_member_speakers() -> [PersonaSpeaker; 4] {
-    [
-        PersonaSpeaker::Planning,
-        PersonaSpeaker::Implementation,
-        PersonaSpeaker::Verification,
-        PersonaSpeaker::Documentation,
-    ]
-}
-
 fn fixed_team_sessions() -> Vec<PersonaSession> {
     [
         PersonaSpeaker::Lead,
@@ -926,6 +1075,7 @@ pub fn parse_persona_turn_outcome(
             if body.chars().count() > MAX_PERSONA_MESSAGE_CHARS {
                 return Err(PersonaTurnOutcomeError::BodyTooLong);
             }
+            validate_visible_persona_body_text(body)?;
             Ok(PersonaTurnResult::new(
                 PersonaTurnOutcome::Spoken(PersonaMessage::from_speaker(speaker, body.to_owned())),
                 peer_messages,
@@ -979,6 +1129,7 @@ fn parse_peer_message_drafts(
             if body.chars().count() > MAX_PERSONA_MESSAGE_CHARS {
                 return Err(PersonaTurnOutcomeError::PeerMessageBodyTooLong);
             }
+            validate_visible_persona_text(body)?;
 
             Ok(PersonaPeerMessageDraft {
                 to,
@@ -986,6 +1137,91 @@ fn parse_peer_message_drafts(
             })
         })
         .collect()
+}
+
+fn validate_visible_persona_text(text: &str) -> Result<(), PersonaTurnOutcomeError> {
+    if text.contains("```") || text.contains("<AHREUM") {
+        return Err(PersonaTurnOutcomeError::ContentBoundaryViolation);
+    }
+    for marker in [
+        "main_runtime_status:",
+        "last_observation:",
+        "plan_ledger_status:",
+        "tool_name=",
+        "target_raw=",
+        "error_kind=",
+    ] {
+        if text.contains(marker) {
+            return Err(PersonaTurnOutcomeError::ContentBoundaryViolation);
+        }
+    }
+    for speaker_id in [
+        "lead",
+        "planning",
+        "implementation",
+        "verification",
+        "documentation",
+    ] {
+        if contains_ascii_word(text, speaker_id) {
+            return Err(PersonaTurnOutcomeError::ContentBoundaryViolation);
+        }
+    }
+    for transcript_label in [
+        "팀장:",
+        "지윤:",
+        "지윤(기획/설계):",
+        "민호:",
+        "민호(구현):",
+        "서연:",
+        "서연(검증):",
+        "하준:",
+        "하준(문서):",
+    ] {
+        if text.contains(transcript_label) {
+            return Err(PersonaTurnOutcomeError::ContentBoundaryViolation);
+        }
+    }
+    if text
+        .split_whitespace()
+        .any(|token| token_looks_like_literal_path_or_file(token))
+    {
+        return Err(PersonaTurnOutcomeError::ContentBoundaryViolation);
+    }
+
+    Ok(())
+}
+
+fn validate_visible_persona_body_text(text: &str) -> Result<(), PersonaTurnOutcomeError> {
+    validate_visible_persona_text(text)?;
+    if text.contains('?') || text.contains('？') {
+        return Err(PersonaTurnOutcomeError::ContentBoundaryViolation);
+    }
+
+    Ok(())
+}
+
+fn contains_ascii_word(text: &str, word: &str) -> bool {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|part| part == word)
+}
+
+fn token_looks_like_literal_path_or_file(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | '.' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '"' | '\'' | '`'
+        )
+    });
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return true;
+    }
+    let Some((stem, extension)) = trimmed.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && stem.chars().any(|ch| ch.is_ascii_alphanumeric())
+        && (1..=8).contains(&extension.len())
+        && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
@@ -1128,6 +1364,21 @@ mod tests {
         assert!(prompt.system_prompt.contains("Do not mention tool names"));
         assert!(prompt
             .system_prompt
+            .contains("Never introduce concrete framework"));
+        assert!(prompt
+            .system_prompt
+            .contains("Do not give example technology names"));
+        assert!(prompt
+            .system_prompt
+            .contains("Adapt to main_runtime_status structurally"));
+        assert!(prompt
+            .system_prompt
+            .contains("do not ask the user for direction"));
+        assert!(prompt
+            .system_prompt
+            .contains("Visible body must be a declarative coordination statement"));
+        assert!(prompt
+            .system_prompt
             .contains("Do not expose internal speaker ids"));
         assert!(prompt
             .system_prompt
@@ -1175,6 +1426,29 @@ mod tests {
         );
 
         assert!(runtime.pop_next_turn().is_none());
+    }
+
+    #[test]
+    fn abandon_turn_marks_matching_session_idle_without_recording_message() {
+        let mut runtime = PersonaRuntime::new();
+        let lead = runtime
+            .start_kickoff_for_mode(PersonaRuntimeMode::Full, "task-a")
+            .expect("lead turn");
+
+        assert!(runtime.sessions().iter().any(|session| {
+            session.speaker == PersonaSpeaker::Lead
+                && session.status == PersonaSessionStatus::WaitingForModel
+        }));
+
+        runtime.abandon_turn(&lead);
+
+        let lead_session = runtime
+            .sessions()
+            .iter()
+            .find(|session| session.speaker == PersonaSpeaker::Lead)
+            .expect("lead session");
+        assert_eq!(lead_session.status, PersonaSessionStatus::Idle);
+        assert!(lead_session.history.is_empty());
     }
 
     #[test]
@@ -1338,6 +1612,62 @@ mod tests {
     }
 
     #[test]
+    fn turn_outcome_parser_rejects_visible_boundary_leaks() {
+        let internal_state = parse_persona_turn_outcome(
+            r#"{"speaker":"lead","decision":"speak","body":"main_runtime_status: completed","peer_messages":[]}"#,
+            PersonaSpeaker::Lead,
+        );
+        let transcript = parse_persona_turn_outcome(
+            r#"{"speaker":"lead","decision":"speak","body":"지윤: 의견을 말해줘","peer_messages":[]}"#,
+            PersonaSpeaker::Lead,
+        );
+        let literal_path = parse_persona_turn_outcome(
+            r#"{"speaker":"verification","decision":"speak","body":"src/main.rs를 확인해야 합니다","peer_messages":[]}"#,
+            PersonaSpeaker::Verification,
+        );
+        let peer_leak = parse_persona_turn_outcome(
+            r#"{"speaker":"lead","decision":"speak","body":"조율하겠습니다","peer_messages":[{"to":"민호","body":"target_raw=src/main.rs"}]}"#,
+            PersonaSpeaker::Lead,
+        );
+        let user_question_body = parse_persona_turn_outcome(
+            r#"{"speaker":"planning","decision":"speak","body":"무엇을 먼저 확인할까요?","peer_messages":[]}"#,
+            PersonaSpeaker::Planning,
+        );
+
+        assert_eq!(
+            internal_state,
+            Err(PersonaTurnOutcomeError::ContentBoundaryViolation)
+        );
+        assert_eq!(
+            transcript,
+            Err(PersonaTurnOutcomeError::ContentBoundaryViolation)
+        );
+        assert_eq!(
+            literal_path,
+            Err(PersonaTurnOutcomeError::ContentBoundaryViolation)
+        );
+        assert_eq!(
+            peer_leak,
+            Err(PersonaTurnOutcomeError::ContentBoundaryViolation)
+        );
+        assert_eq!(
+            user_question_body,
+            Err(PersonaTurnOutcomeError::ContentBoundaryViolation)
+        );
+    }
+
+    #[test]
+    fn turn_outcome_parser_allows_questions_only_as_peer_messages() {
+        let result = parse_persona_turn_outcome(
+            r#"{"speaker":"lead","decision":"speak","body":"팀 관점의 확인 범위를 나누겠습니다.","peer_messages":[{"to":"지윤","body":"범위 기준을 먼저 확인할까요?"}]}"#,
+            PersonaSpeaker::Lead,
+        )
+        .expect("peer question should be allowed");
+
+        assert_eq!(result.peer_messages.len(), 1);
+    }
+
+    #[test]
     fn turn_prompt_uses_only_requested_speaker_history_and_addressed_peer_messages() {
         let mut runtime = PersonaRuntime::new();
         let lead = runtime.start_kickoff("task-a");
@@ -1428,6 +1758,29 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_clears_previous_team_tasks() {
+        let mut runtime = PersonaRuntime::new();
+        let lead = runtime.start_kickoff("task-a");
+        assert_eq!(runtime.pop_next_turn(), Some(lead.clone()));
+        runtime.record_turn_result(
+            &lead,
+            outcome_with_peers(
+                PersonaSpeaker::Lead,
+                "body-a",
+                &[(PersonaSpeaker::Planning, "old peer task")],
+            ),
+        );
+        assert_eq!(runtime.team_tasks().len(), 1);
+
+        let follow_up = runtime
+            .start_follow_up_for_mode(PersonaRuntimeMode::Full, "task-b", "status-b")
+            .expect("follow-up turn");
+
+        assert!(runtime.team_tasks().is_empty());
+        assert!(follow_up.team_tasks.is_empty());
+    }
+
+    #[test]
     fn member_reports_team_task_and_lead_summary_closes_it() {
         let mut runtime = PersonaRuntime::new();
         runtime.start_kickoff("task-a");
@@ -1475,6 +1828,46 @@ mod tests {
     }
 
     #[test]
+    fn member_peer_message_schedules_requested_teammate_before_summary() {
+        let mut runtime = PersonaRuntime::new();
+        let lead = runtime.start_kickoff("task-a");
+        runtime.pop_next_turn();
+        runtime.record_turn_result(
+            &lead,
+            outcome_with_peers(
+                PersonaSpeaker::Lead,
+                "body-a",
+                &[(PersonaSpeaker::Planning, "peer-a")],
+            ),
+        );
+        let planning = runtime.pop_next_turn().expect("planning turn");
+        runtime.record_turn_result(
+            &planning,
+            outcome_with_peers(
+                PersonaSpeaker::Planning,
+                "body-b",
+                &[(PersonaSpeaker::Verification, "peer-b")],
+            ),
+        );
+
+        let verification = runtime.pop_next_turn().expect("verification turn");
+        assert_eq!(verification.speaker, PersonaSpeaker::Verification);
+        assert_eq!(verification.kind, PersonaTurnKind::MemberResponse);
+        let prompt = runtime.build_turn_prompt(&verification, &[]);
+        assert!(prompt.user_prompt.contains("peer-b"));
+
+        runtime.record_turn_result(
+            &verification,
+            PersonaTurnOutcome::Passed {
+                speaker: PersonaSpeaker::Verification,
+            },
+        );
+        let summary = runtime.pop_next_turn().expect("summary");
+        assert_eq!(summary.speaker, PersonaSpeaker::Lead);
+        assert_eq!(summary.kind, PersonaTurnKind::LeadSummary);
+    }
+
+    #[test]
     fn member_pass_marks_team_task_as_passed_not_reported() {
         let mut runtime = PersonaRuntime::new();
         let lead = runtime.start_kickoff("task-a");
@@ -1504,6 +1897,28 @@ mod tests {
         let summary = runtime.pop_next_turn().expect("kickoff summary");
         assert_eq!(summary.speaker, PersonaSpeaker::Lead);
         assert_eq!(summary.kind, PersonaTurnKind::LeadSummary);
+        assert!(runtime.pop_next_turn().is_none());
+    }
+
+    #[test]
+    fn progress_update_refreshes_pending_progress_turns_without_new_lead() {
+        let mut runtime = PersonaRuntime::new();
+        runtime.start_kickoff("task-a");
+        runtime.pop_next_turn();
+        let first = runtime
+            .enqueue_progress_for_mode(PersonaRuntimeMode::Full, "main_runtime_status: first")
+            .expect("first progress turn");
+        assert_eq!(first.kind, PersonaTurnKind::ProgressLead);
+
+        let second = runtime
+            .enqueue_progress_for_mode(PersonaRuntimeMode::Full, "main_runtime_status: second")
+            .expect("refreshed progress turn");
+        assert_eq!(second.id, first.id);
+        assert!(second.task_state_summary.contains("second"));
+
+        let popped = runtime.pop_next_turn().expect("pending progress");
+        assert_eq!(popped.id, first.id);
+        assert!(popped.task_state_summary.contains("second"));
         assert!(runtime.pop_next_turn().is_none());
     }
 
@@ -1755,6 +2170,78 @@ mod tests {
     }
 
     #[test]
+    fn progress_update_does_not_repeat_completed_progress_cycle() {
+        let mut runtime = PersonaRuntime::new();
+        runtime
+            .start_kickoff_for_mode(PersonaRuntimeMode::Full, "task-a")
+            .expect("kickoff");
+        runtime.pop_next_turn();
+        let progress = runtime
+            .enqueue_progress_for_mode(PersonaRuntimeMode::Full, "main_runtime_status: repair")
+            .expect("progress turn");
+        assert_eq!(runtime.pop_next_turn(), Some(progress.clone()));
+
+        runtime.record_turn_result(
+            &progress,
+            outcome_with_peers(PersonaSpeaker::Lead, "body-a", &[]),
+        );
+        let summary = runtime.pop_next_turn().expect("summary");
+        runtime.record_turn_result(
+            &summary,
+            outcome_with_peers(PersonaSpeaker::Lead, "body-b", &[]),
+        );
+
+        assert!(runtime
+            .enqueue_progress_for_mode(PersonaRuntimeMode::Full, "main_runtime_status: repair")
+            .is_none());
+        assert!(runtime.pop_next_turn().is_none());
+    }
+
+    #[test]
+    fn completed_member_is_not_rescheduled_by_later_peer_message_in_same_stage() {
+        let mut runtime = PersonaRuntime::new();
+        runtime
+            .start_kickoff_for_mode(PersonaRuntimeMode::Full, "task-a")
+            .expect("kickoff");
+        runtime.pop_next_turn();
+        let progress = runtime
+            .enqueue_progress_for_mode(PersonaRuntimeMode::Full, "main_runtime_status: repair")
+            .expect("progress turn");
+        runtime.pop_next_turn();
+
+        runtime.record_turn_result(
+            &progress,
+            outcome_with_peers(
+                PersonaSpeaker::Lead,
+                "body-a",
+                &[(PersonaSpeaker::Planning, "peer-a")],
+            ),
+        );
+        let planning = runtime.pop_next_turn().expect("planning turn");
+        runtime.record_turn_result(
+            &planning,
+            outcome_with_peers(
+                PersonaSpeaker::Planning,
+                "body-b",
+                &[(PersonaSpeaker::Verification, "peer-b")],
+            ),
+        );
+        let verification = runtime.pop_next_turn().expect("verification turn");
+        runtime.record_turn_result(
+            &verification,
+            outcome_with_peers(
+                PersonaSpeaker::Verification,
+                "body-c",
+                &[(PersonaSpeaker::Planning, "peer-c")],
+            ),
+        );
+
+        let summary = runtime.pop_next_turn().expect("summary");
+        assert_eq!(summary.kind, PersonaTurnKind::LeadSummary);
+        assert_ne!(summary.speaker, PersonaSpeaker::Planning);
+    }
+
+    #[test]
     fn completion_clears_pending_progress_turns_and_runs_final_closure() {
         let mut runtime = PersonaRuntime::new();
         runtime
@@ -1818,7 +2305,7 @@ mod tests {
     }
 
     #[test]
-    fn kickoff_without_member_requests_still_runs_fixed_team_before_summary() {
+    fn kickoff_without_member_requests_closes_with_summary_only() {
         let mut runtime = PersonaRuntime::new();
 
         let lead = runtime.start_kickoff("task-a");
@@ -1828,24 +2315,32 @@ mod tests {
             PersonaTurnOutcome::Spoken(message(PersonaSpeaker::Lead, "body-a")),
         );
 
-        for speaker in [
-            PersonaSpeaker::Planning,
-            PersonaSpeaker::Implementation,
-            PersonaSpeaker::Verification,
-            PersonaSpeaker::Documentation,
-        ] {
-            let member = runtime.pop_next_turn().expect("fixed member turn");
-            assert_eq!(member.speaker, speaker);
-            assert_eq!(member.kind, PersonaTurnKind::MemberResponse);
-            assert_eq!(member.stage, PersonaRuntimeStage::Kickoff);
-            runtime.record_turn_result(&member, PersonaTurnOutcome::Passed { speaker });
-        }
-
         let summary = runtime.pop_next_turn().expect("kickoff summary");
         assert_eq!(summary.speaker, PersonaSpeaker::Lead);
         assert_eq!(summary.kind, PersonaTurnKind::LeadSummary);
         assert_eq!(summary.stage, PersonaRuntimeStage::Kickoff);
         assert!(!runtime.has_pending_turns());
+    }
+
+    #[test]
+    fn absorbing_completion_into_active_summary_marks_task_completed() {
+        let mut runtime = PersonaRuntime::new();
+        let lead = runtime.start_kickoff("task-a");
+        runtime.pop_next_turn();
+        runtime.record_turn_result(
+            &lead,
+            PersonaTurnOutcome::Spoken(message(PersonaSpeaker::Lead, "body-a")),
+        );
+        let summary = runtime.pop_next_turn().expect("summary");
+        assert_eq!(summary.kind, PersonaTurnKind::LeadSummary);
+
+        assert!(runtime.absorb_completion_into_active_closure(
+            Some(&summary),
+            "main_runtime_status: completed",
+        ));
+
+        assert!(runtime.is_task_completed());
+        assert!(runtime.pop_next_turn().is_none());
     }
 
     #[test]
