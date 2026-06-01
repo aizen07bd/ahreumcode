@@ -195,3 +195,7 @@ AhreumCode uses runtime boundaries rather than trusting the model.
 ## Project State
 
 AhreumCode is usable as a local LLM coding-agent runtime, but it is still early software. The current release is focused on macOS Apple Silicon and local LM Studio-style providers.
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.

@@ -201,3 +201,7 @@ cargo run --bin local_llm_bench -- --model qwen3-4b-instruct-2507 --base-url htt
 ## 프로젝트 상태
 
 아름코드는 로컬 LLM 코딩 에이전트 런타임으로 사용할 수 있는 상태지만 아직 초기 소프트웨어입니다. 현재 릴리스는 macOS Apple Silicon과 LM Studio 계열 로컬 provider를 중심으로 검증했습니다.
+
+## 라이선스
+
+MIT License. 자세한 내용은 [LICENSE](LICENSE)를 참고하세요.
