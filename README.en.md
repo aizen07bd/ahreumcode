@@ -1,5 +1,7 @@
 # AhreumCode
 
+![AhreumCode TUI intro screen](images/ahreumcode_intro.png)
+
 English README. Korean version: [README.md](README.md)
 
 AhreumCode is a Rust TUI coding-agent runtime for local LLMs.
