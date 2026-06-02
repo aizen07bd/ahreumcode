@@ -1,5 +1,7 @@
 # 아름코드 AhreumCode
 
+![image](./image/ahreumcode_intro.png)
+
 한국어 README입니다. English README: [README.en.md](README.en.md)
 
 아름코드는 로컬 LLM을 위한 Rust TUI 코딩 에이전트 런타임입니다.
