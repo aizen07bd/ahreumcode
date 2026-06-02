@@ -40,7 +40,7 @@ related:
 
 ```mermaid
 flowchart TD
-  A[/exit or /quit] --> B[request_exit]
+  A["/exit or /quit"] --> B[request_exit]
   B --> C[log exit_requested]
   C --> D[build_epilogue_summary]
   D --> E[log session_summary_created]

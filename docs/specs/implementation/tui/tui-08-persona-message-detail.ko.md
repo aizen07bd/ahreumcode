@@ -37,7 +37,7 @@ persona messenger의 메시지 행을 세부 구현한다. persona는 system log
 
 ```mermaid
 flowchart TD
-  A[/persona full] --> B[check_persona_width]
+  A["/persona full"] --> B[check_persona_width]
   B -->|fail| C[log persona_width_rejected]
   B -->|ok| D[PersonaPanelState::open_full]
   D --> E[log persona_panel_opened]
@@ -45,7 +45,7 @@ flowchart TD
   F --> G[PersonaMessage::from_run_event]
   G --> H[render_persona_message]
   H --> I[log persona_message_rendered]
-  A2[/persona off] --> J[PersonaPanelState::close]
+  A2["/persona off"] --> J[PersonaPanelState::close]
   J --> K[log persona_panel_closed]
 ```
 

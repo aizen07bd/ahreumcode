@@ -36,7 +36,7 @@ LM Studio OpenAI-compatible endpoint에 연결 가능한지 확인한다. `/heal
 
 ```mermaid
 flowchart TD
-  A[/health command] --> B[LlmProviderFactory::from_config]
+  A["/health command"] --> B[LlmProviderFactory::from_config]
   B --> C[LmStudioProvider::health_check]
   C --> D[build_models_request]
   D --> E[send request]
